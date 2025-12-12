@@ -30,16 +30,16 @@ FlowProxyPlugin 是一个基于 proxy.py 框架的自定义插件，用于处理
 ```python
 class FlowProxyPlugin(HttpProxyBasePlugin):
     """Flow LLM Proxy 认证插件主类"""
-    
+
     def __init__(self, *args, **kwargs):
         """初始化插件，加载认证配置"""
-        
+
     def before_upstream_connection(self, request: HttpParser) -> Optional[HttpParser]:
         """在建立上游连接前处理请求"""
-        
+
     def handle_client_request(self, request: HttpParser) -> Optional[HttpParser]:
         """处理客户端请求，添加认证信息"""
-        
+
     def handle_upstream_chunk(self, chunk: memoryview) -> memoryview:
         """处理上游响应数据"""
 ```
@@ -49,13 +49,13 @@ class FlowProxyPlugin(HttpProxyBasePlugin):
 ```python
 class SecretsManager:
     """管理 secrets.json 配置文件的加载和验证"""
-    
+
     def load_secrets(self, file_path: str) -> List[Dict[str, str]]:
         """从文件加载认证信息数组"""
-        
+
     def validate_secrets(self, secrets: List[Dict[str, str]]) -> bool:
         """验证认证信息数组的完整性"""
-        
+
     def validate_single_config(self, config: Dict[str, str]) -> bool:
         """验证单个认证配置的完整性"""
 ```
@@ -65,19 +65,19 @@ class SecretsManager:
 ```python
 class LoadBalancer:
     """实现 Round-robin 负载均衡策略"""
-    
+
     def __init__(self, configs: List[Dict[str, str]], logger: Logger):
         """初始化负载均衡器，设置认证配置列表和日志记录器"""
-        
+
     def get_next_config(self) -> Dict[str, str]:
         """使用 Round-robin 策略获取下一个认证配置并记录配置名称"""
-        
+
     def mark_config_failed(self, config: Dict[str, str]) -> None:
         """标记配置失败，从可用列表中移除并记录"""
-        
+
     def reset_failed_configs(self) -> None:
         """重置失败配置，重新加入可用列表"""
-        
+
     def log_config_usage(self, config: Dict[str, str]) -> None:
         """记录正在使用的认证配置名称"""
 ```
@@ -87,13 +87,13 @@ class LoadBalancer:
 ```python
 class JWTGenerator:
     """生成 Flow LLM Proxy 所需的 JWT 令牌"""
-    
+
     def generate_token(self, config: Dict[str, str]) -> str:
         """根据认证配置生成 JWT 令牌"""
-        
+
     def create_jwt_payload(self, config: Dict[str, str]) -> Dict:
         """创建 JWT 载荷"""
-        
+
     def validate_token(self, token: str) -> bool:
         """验证生成的 JWT 令牌格式"""
 ```
@@ -103,13 +103,13 @@ class JWTGenerator:
 ```python
 class RequestForwarder:
     """处理请求转发到 Flow LLM Proxy"""
-    
+
     def modify_request_headers(self, request: HttpParser, jwt_token: str) -> HttpParser:
         """修改请求头，添加认证信息"""
-        
+
     def get_target_url(self, original_path: str) -> str:
         """获取目标 Flow LLM Proxy URL"""
-        
+
     def handle_forwarding_error(self, error: Exception) -> HttpResponse:
         """处理转发过程中的错误"""
 ```
@@ -129,7 +129,7 @@ class RequestForwarder:
         "tenant": "tenant1"
     },
     {
-        "name": "config2", 
+        "name": "config2",
         "agent": "simple_agent",
         "appToAccess": "llm-api",
         "clientId": "client-id-2",
@@ -194,7 +194,7 @@ Content-Type: application/json
 在编写正确性属性之前，我需要识别和消除冗余：
 
 - 属性 1（配置加载）和属性 5（日志记录）可以合并为一个综合的初始化属性
-- 属性 2（请求处理）和属性 3（token 生成）可以合并为一个端到端的认证属性  
+- 属性 2（请求处理）和属性 3（token 生成）可以合并为一个端到端的认证属性
 - 属性 4（请求转发）和属性 6（HTTP 方法支持）可以合并为一个综合的代理属性
 - 日志相关的多个属性可以合并为一个综合的日志属性
 
@@ -240,7 +240,7 @@ Content-Type: application/json
 
 ### 配置错误处理
 - **文件不存在**: 返回启动错误，记录详细日志
-- **JSON 格式错误**: 返回配置错误，记录解析失败信息  
+- **JSON 格式错误**: 返回配置错误，记录解析失败信息
 - **缺少必需字段**: 返回验证错误，记录缺失字段列表
 
 ### 运行时错误处理

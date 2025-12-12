@@ -1,6 +1,6 @@
 # 实施计划
 
-- [ ] 1. 设置项目结构和核心接口
+- [x] 1. 设置项目结构和核心接口
   - 创建 FlowProxyPlugin 项目目录结构
   - 使用 Poetry 初始化项目 (pyproject.toml)
   - 配置 Poetry 依赖管理和虚拟环境
@@ -8,7 +8,7 @@
   - 配置开发环境和依赖项
   - _需求: 1.1, 1.5_
 
-- [ ] 1.1 配置代码质量和提交规范工具
+- [x] 1.1 配置代码质量和提交规范工具
   - 配置 astral-sh/ruff-pre-commit 代码格式化和 linting
   - 配置 pre-commit/mirrors-mypy 类型检查
   - 配置 pylint-dev/pylint 代码质量检查

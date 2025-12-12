@@ -1,0 +1,90 @@
+[tool.poetry]
+name = "flow-proxy-plugin"
+version = "0.1.0"
+description = "A proxy.py plugin for Flow LLM Proxy authentication and request forwarding with load balancing"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "flow_proxy_plugin"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+proxy-py = "^2.4.10"
+pyjwt = "^2.10.0"
+requests = "^2.31.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-cov = "^4.1.0"
+hypothesis = "^6.88.0"
+ruff = "^0.1.0"
+mypy = "^1.6.0"
+pylint = "^3.0.0"
+commitizen = "^3.12.0"
+pre-commit = "^3.5.0"
+
+[tool.poetry.scripts]
+flow-proxy = "flow_proxy_plugin.cli:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "UP", # pyupgrade
+]
+ignore = [
+    "E501",  # line too long, handled by black
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = false
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = false
+strict_equality = true
+ignore_missing_imports = true
+
+[tool.pylint.messages_control]
+max-line-length = 88
+disable = [
+    "C0103",  # invalid-name
+    "C0114",  # missing-module-docstring
+    "R0903",  # too-few-public-methods
+]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version = "0.1.0"
+tag_format = "v$version"
+version_files = [
+    "pyproject.toml:version"
+]
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = [
+    "tests",
+]
