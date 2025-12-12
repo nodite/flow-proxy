@@ -5,6 +5,7 @@ load-plugins=
 disable=
     C0103,  # invalid-name
     C0114,  # missing-module-docstring
+    C0301,  # line-too-long (handled by ruff)
     R0903,  # too-few-public-methods
     R0913,  # too-many-arguments
     W0613,  # unused-argument
