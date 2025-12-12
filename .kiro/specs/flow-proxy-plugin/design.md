@@ -92,10 +92,10 @@ class JWTGenerator:
         """根据认证配置生成 JWT 令牌"""
 
     def create_jwt_payload(self, config: Dict[str, str]) -> Dict:
-        """创建 JWT 载荷"""
+        """创建 JWT 载荷，仅包含 clientId、clientSecret 和 tenant"""
 
-    def validate_token(self, token: str) -> bool:
-        """验证生成的 JWT 令牌格式"""
+    def validate_token(self, token: str, secret: str) -> bool:
+        """验证生成的 JWT 令牌格式和签名"""
 ```
 
 ### 5. RequestForwarder 请求转发器
@@ -120,24 +120,26 @@ class RequestForwarder:
 
 ```json
 [
-    {
-        "name": "config1",
-        "agent": "simple_agent",
-        "appToAccess": "llm-api",
-        "clientId": "client-id-1",
-        "clientSecret": "client-secret-1",
-        "tenant": "tenant1"
-    },
-    {
-        "name": "config2",
-        "agent": "simple_agent",
-        "appToAccess": "llm-api",
-        "clientId": "client-id-2",
-        "clientSecret": "client-secret-2",
-        "tenant": "tenant2"
-    }
+  {
+    "name": "config1",
+    "agent": "simple_agent",
+    "appToAccess": "llm-api",
+    "clientId": "client-id-1",
+    "clientSecret": "client-secret-1",
+    "tenant": "tenant1"
+  },
+  {
+    "name": "config2",
+    "agent": "simple_agent",
+    "appToAccess": "llm-api",
+    "clientId": "client-id-2",
+    "clientSecret": "client-secret-2",
+    "tenant": "tenant2"
+  }
 ]
 ```
+
+**注意**: `name`、`agent` 和 `appToAccess` 字段是可选的配置字段，用于日志记录和配置管理，但不会包含在生成的 JWT 令牌中。JWT 令牌只包含 `clientId`、`clientSecret` 和 `tenant` 三个必需字段。
 
 ### Round-robin 负载均衡状态
 
@@ -152,25 +154,28 @@ class RoundRobinState:
 ### JWT 令牌结构
 
 **Header:**
+
 ```json
 {
-    "alg": "HS256",
-    "typ": "JWT"
+  "alg": "HS256",
+  "typ": "JWT"
 }
 ```
 
 **Payload:**
+
 ```json
 {
-    "clientId": "your-client-id",
-    "clientSecret": "your-client-secret",
-    "tenant": "your-tenant"
+  "clientId": "your-client-id",
+  "clientSecret": "your-client-secret",
+  "tenant": "your-tenant"
 }
 ```
 
 ### HTTP 请求流程
 
 **原始客户端请求:**
+
 ```
 GET /v1/models HTTP/1.1
 Host: localhost:8899
@@ -178,6 +183,7 @@ Content-Type: application/json
 ```
 
 **转发到 Flow LLM Proxy 的请求:**
+
 ```
 GET /v1/models HTTP/1.1
 Host: flow.ciandt.com
@@ -187,7 +193,7 @@ Content-Type: application/json
 
 ## 正确性属性
 
-*属性是一个特征或行为，应该在系统的所有有效执行中保持为真——本质上，是关于系统应该做什么的正式声明。属性作为人类可读规范和机器可验证正确性保证之间的桥梁。*
+_属性是一个特征或行为，应该在系统的所有有效执行中保持为真——本质上，是关于系统应该做什么的正式声明。属性作为人类可读规范和机器可验证正确性保证之间的桥梁。_
 
 ### 属性反思
 
@@ -201,59 +207,62 @@ Content-Type: application/json
 ### 核心正确性属性
 
 **属性 1: 配置数组加载和初始化**
-*对于任何* 有效的 secrets.json 数组文件，插件初始化应该成功加载所有认证配置并初始化负载均衡器
+_对于任何_ 有效的 secrets.json 数组文件，插件初始化应该成功加载所有认证配置并初始化负载均衡器
 **验证需求: 需求 1.1, 1.5**
 
 **属性 2: Round-robin 负载均衡循环性**
-*对于任何* 连续的请求序列，Round-robin 策略应该按顺序循环使用所有可用的认证配置
+_对于任何_ 连续的请求序列，Round-robin 策略应该按顺序循环使用所有可用的认证配置
 **验证需求: 需求 6.1, 6.2**
 
 **属性 3: JWT 令牌生成往返**
-*对于任何* 有效的认证配置，生成 JWT 令牌然后解析应该产生相同的 clientId、clientSecret 和 tenant 值
+_对于任何_ 有效的认证配置，生成 JWT 令牌然后解析应该产生相同的 clientId、clientSecret 和 tenant 值
 **验证需求: 需求 3.1, 3.2**
 
 **属性 4: 配置失败转移**
-*对于任何* 认证配置失败的情况，系统应该自动切换到下一个可用配置并继续处理请求
+_对于任何_ 认证配置失败的情况，系统应该自动切换到下一个可用配置并继续处理请求
 **验证需求: 需求 3.3, 6.3**
 
 **属性 5: 请求代理保持性**
-*对于任何* 有效的 HTTP 请求，代理后的请求应该保留原始请求的所有内容（除认证信息外），并添加正确的 Flow 认证 token
+_对于任何_ 有效的 HTTP 请求，代理后的请求应该保留原始请求的所有内容（除认证信息外），并添加正确的 Flow 认证 token
 **验证需求: 需求 4.1, 4.2, 4.3**
 
 **属性 6: 响应透明传递**
-*对于任何* Flow LLM Proxy 的响应，系统应该将响应原样返回给客户端，不修改内容或状态码
+_对于任何_ Flow LLM Proxy 的响应，系统应该将响应原样返回给客户端，不修改内容或状态码
 **验证需求: 需求 4.4**
 
 **属性 7: HTTP 方法支持完整性**
-*对于任何* 支持的 HTTP 方法（GET、POST、OPTIONS），系统应该正确处理请求并保留请求体内容
+_对于任何_ 支持的 HTTP 方法（GET、POST、OPTIONS），系统应该正确处理请求并保留请求体内容
 **验证需求: 需求 7.1, 7.2, 7.3, 7.5**
 
 **属性 8: 错误处理一致性**
-*对于任何* 错误情况（配置错误、网络错误、token 生成失败），系统应该返回适当的 HTTP 状态码并记录详细错误信息
+_对于任何_ 错误情况（配置错误、网络错误、token 生成失败），系统应该返回适当的 HTTP 状态码并记录详细错误信息
 **验证需求: 需求 1.2, 1.3, 1.4, 3.5, 4.5**
 
 **属性 9: 日志记录完整性**
-*对于任何* 系统操作（初始化、请求处理、错误处理、负载均衡），系统应该记录相应的日志信息包含时间戳、配置名称和相关上下文
+_对于任何_ 系统操作（初始化、请求处理、错误处理、负载均衡），系统应该记录相应的日志信息包含时间戳、配置名称和相关上下文
 **验证需求: 需求 5.1, 5.2, 5.3, 5.4, 5.5, 5.6**
 
 ## 错误处理
 
 ### 配置错误处理
+
 - **文件不存在**: 返回启动错误，记录详细日志
 - **JSON 格式错误**: 返回配置错误，记录解析失败信息
 - **缺少必需字段**: 返回验证错误，记录缺失字段列表
 
 ### 运行时错误处理
+
 - **JWT 生成失败**: 返回 500 Internal Server Error
 - **网络连接失败**: 返回 502 Bad Gateway
 - **无效请求格式**: 返回 400 Bad Request
 
 ### 错误响应格式
+
 ```json
 {
-    "error": "error_code",
-    "message": "详细错误描述",
-    "timestamp": "2024-01-01T00:00:00Z"
+  "error": "error_code",
+  "message": "详细错误描述",
+  "timestamp": "2024-01-01T00:00:00Z"
 }
 ```
 
