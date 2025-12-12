@@ -30,8 +30,8 @@ class FlowProxyPlugin(HttpProtocolHandlerPlugin):
         self.configs = self.secrets_manager.load_secrets("secrets.json")
 
         self.load_balancer = LoadBalancer(self.configs, self.logger)
-        self.jwt_generator = JWTGenerator()
-        self.request_forwarder = RequestForwarder()
+        self.jwt_generator = JWTGenerator(self.logger)
+        self.request_forwarder = RequestForwarder(self.logger)
 
         self.logger.info(
             f"FlowProxyPlugin initialized with {len(self.configs)} configurations"
@@ -47,24 +47,38 @@ class FlowProxyPlugin(HttpProtocolHandlerPlugin):
             Modified request with authentication or None if request should be rejected
         """
         try:
+            # Validate request before processing
+            if not self.request_forwarder.validate_request(request):
+                self.logger.error("Request validation failed")
+                return None
+
             # Get next configuration using round-robin
             config = self.load_balancer.get_next_config()
+            config_name = config.get("name", config.get("clientId", "unknown"))
 
             # Generate JWT token
             jwt_token = self.jwt_generator.generate_token(config)
 
             # Modify request headers and target
             modified_request = self.request_forwarder.modify_request_headers(
-                request, jwt_token
+                request, jwt_token, config_name
             )
 
             self.logger.info(
-                f"Request processed with config: {config.get('name', 'unknown')}"
+                f"Request processed successfully with config: {config_name}"
             )
             return modified_request
 
+        except RuntimeError as e:
+            # No available configurations
+            self.logger.error(f"No available configurations: {str(e)}")
+            return None
+        except ValueError as e:
+            # Invalid request or token generation failed
+            self.logger.error(f"Request processing failed: {str(e)}")
+            return None
         except Exception as e:
-            self.logger.error(f"Error processing request: {str(e)}")
+            self.logger.error(f"Unexpected error processing request: {str(e)}")
             return None
 
     def handle_client_request(self, request: HttpParser) -> HttpParser | None:
@@ -81,10 +95,13 @@ class FlowProxyPlugin(HttpProtocolHandlerPlugin):
     def handle_upstream_chunk(self, chunk: memoryview) -> memoryview:
         """Handle upstream response data.
 
+        This method supports transparent response forwarding and streaming responses.
+
         Args:
             chunk: Response data chunk from upstream
 
         Returns:
             Unmodified chunk (transparent pass-through)
         """
-        return chunk
+        # Use request forwarder to handle response with transparent pass-through
+        return self.request_forwarder.handle_response_chunk(chunk)
