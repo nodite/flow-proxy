@@ -1,7 +1,6 @@
 """Load balancer for distributing requests across multiple authentication configurations."""
 
 import logging
-from typing import Any
 
 
 class LoadBalancer:
