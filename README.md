@@ -20,17 +20,20 @@ A proxy.py plugin for Flow LLM Proxy authentication and request forwarding with 
 ### Setup
 
 1. Clone the repository:
+
 ```bash
 git clone <repository-url>
 cd flow-proxy-plugin
 ```
 
 2. Install dependencies using Poetry:
+
 ```bash
 poetry install
 ```
 
 3. Activate the virtual environment:
+
 ```bash
 poetry shell
 ```
@@ -41,45 +44,67 @@ Create a `secrets.json` file in the project root with your authentication config
 
 ```json
 [
-    {
-        "name": "config1",
-        "agent": "simple_agent",
-        "appToAccess": "llm-api",
-        "clientId": "your-client-id-1",
-        "clientSecret": "your-client-secret-1",
-        "tenant": "your-tenant-1"
-    },
-    {
-        "name": "config2",
-        "agent": "simple_agent",
-        "appToAccess": "llm-api",
-        "clientId": "your-client-id-2",
-        "clientSecret": "your-client-secret-2",
-        "tenant": "your-tenant-2"
-    }
+  {
+    "name": "config1",
+    "agent": "simple_agent",
+    "appToAccess": "llm-api",
+    "clientId": "your-client-id-1",
+    "clientSecret": "your-client-secret-1",
+    "tenant": "your-tenant-1"
+  },
+  {
+    "name": "config2",
+    "agent": "simple_agent",
+    "appToAccess": "llm-api",
+    "clientId": "your-client-id-2",
+    "clientSecret": "your-client-secret-2",
+    "tenant": "your-tenant-2"
+  }
 ]
 ```
 
 ## Usage
 
-### Using Poetry Script
+### Basic Usage
+
+Start with default settings:
 
 ```bash
-poetry run flow-proxy --port 8899 --host 127.0.0.1
+poetry run flow-proxy
 ```
 
-### Using CLI Module
+### Custom Configuration
+
+Using command-line arguments:
 
 ```bash
-python -m flow_proxy_plugin.cli --port 8899 --log-level INFO
+poetry run flow-proxy --port 9000 --host 0.0.0.0 --log-level DEBUG
+```
+
+Using environment variables:
+
+```bash
+export FLOW_PROXY_PORT=9000
+export FLOW_PROXY_HOST=0.0.0.0
+export FLOW_PROXY_LOG_LEVEL=DEBUG
+poetry run flow-proxy
+```
+
+Using .env file:
+
+```bash
+cp .env.example .env
+# Edit .env with your settings
+poetry run flow-proxy
 ```
 
 ### Command Line Options
 
-- `--port`: Port to listen on (default: 8899)
-- `--host`: Host to bind to (default: 127.0.0.1)
-- `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR)
-- `--secrets-file`: Path to secrets.json file (default: secrets.json)
+- `--port`: Port to listen on (default: 8899, env: FLOW_PROXY_PORT)
+- `--host`: Host to bind to (default: 127.0.0.1, env: FLOW_PROXY_HOST)
+- `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR, env: FLOW_PROXY_LOG_LEVEL)
+- `--secrets-file`: Path to secrets.json file (default: secrets.json, env: FLOW_PROXY_SECRETS_FILE)
+- `--log-file`: Path to log file (default: flow_proxy_plugin.log, env: FLOW_PROXY_LOG_FILE)
 
 ## Development
 
