@@ -170,3 +170,4 @@ secrets.json
 flow_proxy_plugin.log
 *.log
 /tmp
+.DS_Store

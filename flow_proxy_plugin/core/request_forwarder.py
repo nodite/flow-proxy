@@ -1,6 +1,7 @@
 """Request forwarder for handling HTTP requests to Flow LLM Proxy."""
 
 import logging
+import os
 
 from proxy.http.parser import HttpParser
 
@@ -15,11 +16,22 @@ class RequestForwarder:
             logger: Optional logger instance (creates new one if not provided)
         """
         self.logger = logger or logging.getLogger(__name__)
+
+        # Set up colored logging if logger was created and in subprocess
+        # Only set up if no handlers exist (to avoid interfering with test fixtures)
+        if logger is None and not self.logger.handlers:
+            log_level_str = os.getenv("FLOW_PROXY_LOG_LEVEL", "INFO")
+            if log_level_str:
+                from ..utils.logging import setup_colored_logger
+
+                # In tests, allow propagation so caplog can capture logs
+                setup_colored_logger(self.logger, log_level_str, propagate=True)
+
         self.target_base_url = "https://flow.ciandt.com/flow-llm-proxy"
         self.target_host = "flow.ciandt.com"
 
         self.logger.info(
-            f"RequestForwarder initialized with target: {self.target_base_url}"
+            "RequestForwarder initialized with target: %s", self.target_base_url
         )
 
     def modify_request_headers(
@@ -72,10 +84,11 @@ class RequestForwarder:
         # Update Host header to target host
         request.headers[b"Host"] = (self.target_host.encode(), b"")
 
-        config_info = f" (config: {config_name})" if config_name else ""
+        config_info = " (config: %s)" % config_name if config_name else ""
         self.logger.info(
-            f"Modified request headers with JWT token{config_info}, "
-            f"target host: {self.target_host}"
+            "Modified request headers with JWT token%s, target host: %s",
+            config_info,
+            self.target_host,
         )
 
         return request
@@ -102,7 +115,7 @@ class RequestForwarder:
             original_path = f"/{original_path}"
 
         target_url = f"{self.target_base_url}{original_path}"
-        self.logger.debug(f"Target URL: {target_url}")
+        self.logger.debug("Target URL: %s", target_url)
 
         return target_url
 
@@ -149,7 +162,7 @@ class RequestForwarder:
             Error response as memoryview
         """
         error_msg = str(error)
-        self.logger.error(f"Forwarding error ({error_type}): {error_msg}")
+        self.logger.error("Forwarding error (%s): %s", error_type, error_msg)
 
         # Determine appropriate status code and message
         if error_type == "network" or isinstance(error, ConnectionError):
@@ -195,6 +208,15 @@ class RequestForwarder:
 
         if not hasattr(request, "method") or request.method is None:
             self.logger.error("Request validation failed: missing method")
+            return False
+
+        # CONNECT requests (for HTTPS tunneling) don't have a path in the same way
+        # For CONNECT, we should reject them as this proxy is designed for HTTP forwarding
+        if request.method == b"CONNECT":
+            self.logger.error(
+                "Request validation failed: CONNECT method not supported. "
+                "Please use HTTP URLs (not HTTPS) when using this proxy."
+            )
             return False
 
         if not hasattr(request, "path") or request.path is None:

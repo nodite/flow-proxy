@@ -1,6 +1,7 @@
 """Load balancer for distributing requests across multiple authentication configurations."""
 
 import logging
+import os
 
 
 class LoadBalancer:
@@ -22,6 +23,17 @@ class LoadBalancer:
             raise ValueError("Cannot initialize LoadBalancer with empty configs list")
 
         self.logger = logger or logging.getLogger(__name__)
+
+        # Set up colored logging if logger was created and in subprocess
+        # Only set up if no handlers exist (to avoid interfering with test fixtures)
+        if logger is None and not self.logger.handlers:
+            log_level_str = os.getenv("FLOW_PROXY_LOG_LEVEL", "INFO")
+            if log_level_str:
+                from ..utils.logging import setup_colored_logger
+
+                # In tests, allow propagation so caplog can capture logs
+                setup_colored_logger(self.logger, log_level_str, propagate=True)
+
         self._all_configs = configs.copy()
         self._available_configs = configs.copy()
         self._failed_configs: list[dict[str, str]] = []
@@ -29,7 +41,8 @@ class LoadBalancer:
         self._total_requests = 0
 
         self.logger.info(
-            f"LoadBalancer initialized with {len(self._all_configs)} authentication configurations"
+            "LoadBalancer initialized with %d authentication configurations",
+            len(self._all_configs),
         )
 
     def get_next_config(self) -> dict[str, str]:
@@ -68,7 +81,8 @@ class LoadBalancer:
         """
         if config not in self._available_configs:
             self.logger.warning(
-                f"Attempted to mark already-failed config as failed: {self._get_config_name(config)}"
+                "Attempted to mark already-failed config as failed: %s",
+                self._get_config_name(config),
             )
             return
 
@@ -78,8 +92,10 @@ class LoadBalancer:
 
         config_name = self._get_config_name(config)
         self.logger.error(
-            f"Configuration '{config_name}' marked as failed. "
-            f"Remaining available configs: {len(self._available_configs)}/{len(self._all_configs)}"
+            "Configuration '%s' marked as failed. Remaining available configs: %d/%d",
+            config_name,
+            len(self._available_configs),
+            len(self._all_configs),
         )
 
         # Adjust current index if necessary
@@ -101,8 +117,9 @@ class LoadBalancer:
         self._current_index = 0
 
         self.logger.info(
-            f"Reset {failed_count} failed configurations. "
-            f"Total available configs: {len(self._available_configs)}"
+            "Reset %d failed configurations. Total available configs: %d",
+            failed_count,
+            len(self._available_configs),
         )
 
     def log_config_usage(self, config: dict[str, str]) -> None:
@@ -113,8 +130,10 @@ class LoadBalancer:
         """
         config_name = self._get_config_name(config)
         self.logger.info(
-            f"Using authentication configuration: '{config_name}' "
-            f"(request #{self._total_requests}, index {self._current_index})"
+            "Using authentication configuration: '%s' (request #%d, index %d)",
+            config_name,
+            self._total_requests,
+            self._current_index,
         )
 
     def _get_config_name(self, config: dict[str, str]) -> str:
@@ -132,10 +151,10 @@ class LoadBalancer:
 
         # Fallback to clientId if name is not available
         if "clientId" in config:
-            return f"config-{config['clientId'][:8]}..."
+            return "config-%s..." % config["clientId"][:8]
 
         # Last resort: use object id
-        return f"config-{id(config)}"
+        return "config-%d" % id(config)
 
     @property
     def available_count(self) -> int:

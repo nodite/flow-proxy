@@ -56,6 +56,12 @@ poetry run flow-proxy --port 9000 --host 0.0.0.0 --log-level INFO
 
 ### 测试
 
+插件支持两种使用模式：
+
+#### 模式 1: 反向代理模式（推荐）
+
+直接访问代理服务器，无需配置代理设置。代理会自动转发请求到 Flow LLM Proxy 并添加认证。
+
 ```bash
 # 测试 GET 请求
 curl http://localhost:8899/v1/models
@@ -64,7 +70,34 @@ curl http://localhost:8899/v1/models
 curl -X POST http://localhost:8899/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}'
+
+# 测试流式响应
+curl -X POST http://localhost:8899/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
+
+#### 模式 2: 正向代理模式
+
+使用 `-x` 参数配置代理，适合需要代理其他服务的场景。
+
+```bash
+# 使用代理访问（注意：URL 使用 http://，代理会转发到 HTTPS）
+curl -x http://localhost:8899 http://flow.ciandt.com/flow-llm-proxy/v1/models
+
+# 或者设置环境变量
+export HTTP_PROXY=http://localhost:8899
+curl http://flow.ciandt.com/flow-llm-proxy/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+**注意**:
+- **反向代理模式**：直接访问 `http://localhost:8899/v1/...`，无需指定完整 URL
+- **正向代理模式**：需要使用 `-x` 参数，URL 使用 `http://`（不是 `https://`）
+- 代理会自动添加 JWT 认证令牌到请求头
+- 代理会自动将请求转发到 `https://flow.ciandt.com/flow-llm-proxy`
+
 
 ## 配置示例
 
@@ -258,6 +291,7 @@ poetry run cz commit
 - **[使用指南](docs/使用指南.md)** - 完整的用户使用指南，包括安装、配置、使用和故障排除
 - **[开发指南](docs/开发指南.md)** - 开发者文档，包括 API 文档、架构说明和扩展指南
 - **[部署运维](docs/部署运维.md)** - 生产环境部署和运维指南
+- **[Flow LLM Proxy 官方文档](https://flow.ciandt.com/help/en/help/articles/8421153-overview-and-configuration)** - Flow LLM Proxy 概述与配置
 
 ## 许可证
 

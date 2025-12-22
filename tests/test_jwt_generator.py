@@ -3,7 +3,7 @@
 import jwt
 import pytest
 
-from flow_proxy_plugin.jwt_generator import JWTGenerator
+from flow_proxy_plugin.core.jwt_generator import JWTGenerator
 
 
 class TestJWTGenerator:

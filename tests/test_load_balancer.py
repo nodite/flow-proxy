@@ -4,7 +4,7 @@ import logging
 
 import pytest
 
-from flow_proxy_plugin.load_balancer import LoadBalancer
+from flow_proxy_plugin.core.load_balancer import LoadBalancer
 
 
 class TestLoadBalancer:

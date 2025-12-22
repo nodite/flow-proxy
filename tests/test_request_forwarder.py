@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from proxy.http.parser import HttpParser
 
-from flow_proxy_plugin.request_forwarder import RequestForwarder
+from flow_proxy_plugin.core.request_forwarder import RequestForwarder
 
 
 @pytest.fixture

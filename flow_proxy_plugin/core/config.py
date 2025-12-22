@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,16 @@ class SecretsManager:
         """Initialize SecretsManager."""
         self.logger = logging.getLogger(__name__)
         self._validation_errors: list[str] = []
+
+        # Set up colored logging if in subprocess
+        # Only set up if no handlers exist (to avoid interfering with test fixtures)
+        if not self.logger.handlers:
+            log_level_str = os.getenv("FLOW_PROXY_LOG_LEVEL", "INFO")
+            if log_level_str:
+                from ..utils.logging import setup_colored_logger
+
+                # In tests, allow propagation so caplog can capture logs
+                setup_colored_logger(self.logger, log_level_str, propagate=True)
 
     def load_secrets(self, file_path: str) -> list[dict[str, str]]:
         """Load authentication information array from file.
@@ -32,19 +43,19 @@ class SecretsManager:
             resolved_path = self._resolve_config_path(file_path)
 
             if not resolved_path.exists():
-                error_msg = f"Secrets file not found at resolved path: {resolved_path} (original: {file_path})"
-                self.logger.error(error_msg)
-                raise FileNotFoundError(error_msg)
+                error_msg = "Secrets file not found at resolved path: %s (original: %s)"
+                self.logger.error(error_msg, resolved_path, file_path)
+                raise FileNotFoundError(error_msg % (resolved_path, file_path))
 
-            self.logger.info(f"Loading secrets from: {resolved_path}")
+            self.logger.info("Loading secrets from: %s", resolved_path)
 
             with open(resolved_path, encoding="utf-8") as f:
                 secrets_data = json.load(f)
 
             if not isinstance(secrets_data, list):
-                error_msg = f"Secrets file must contain an array, got {type(secrets_data).__name__}"
-                self.logger.error(error_msg)
-                raise ValueError(error_msg)
+                error_msg = "Secrets file must contain an array, got %s"
+                self.logger.error(error_msg, type(secrets_data).__name__)
+                raise ValueError(error_msg % type(secrets_data).__name__)
 
             if not secrets_data:
                 error_msg = "Secrets array cannot be empty - at least one authentication configuration is required"
@@ -58,20 +69,23 @@ class SecretsManager:
                 raise ValueError(error_msg)
 
             self.logger.info(
-                f"Successfully loaded and validated {len(secrets_data)} authentication configurations from {resolved_path}"
+                "Successfully loaded and validated %d authentication configurations from %s",
+                len(secrets_data),
+                resolved_path,
             )
             return secrets_data
 
         except json.JSONDecodeError as e:
-            error_msg = f"Invalid JSON format in secrets file {resolved_path if 'resolved_path' in locals() else file_path}: {str(e)}"
-            self.logger.error(error_msg)
-            raise ValueError(error_msg) from e
+            error_msg = "Invalid JSON format in secrets file %s: %s"
+            resolved = resolved_path if "resolved_path" in locals() else file_path
+            self.logger.error(error_msg, resolved, str(e))
+            raise ValueError(error_msg % (resolved, str(e))) from e
         except Exception as e:
             if isinstance(e, FileNotFoundError | ValueError):
                 raise
-            error_msg = f"Unexpected error loading secrets file {file_path}: {str(e)}"
-            self.logger.error(error_msg)
-            raise ValueError(error_msg) from e
+            error_msg = "Unexpected error loading secrets file %s: %s"
+            self.logger.error(error_msg, file_path, str(e))
+            raise ValueError(error_msg % (file_path, str(e))) from e
 
     def validate_secrets(self, secrets: list[dict[str, Any]]) -> bool:
         """Validate authentication information array integrity.
@@ -87,8 +101,8 @@ class SecretsManager:
 
         for i, config in enumerate(secrets):
             if not self.validate_single_config(config):
-                error_msg = f"Invalid configuration at index {i}: {', '.join(self._validation_errors)}"
-                self.logger.error(error_msg)
+                error_msg = "Invalid configuration at index %d: %s"
+                self.logger.error(error_msg, i, ", ".join(self._validation_errors))
                 is_valid = False
                 self._validation_errors.clear()  # Clear for next config
 
@@ -107,30 +121,28 @@ class SecretsManager:
         self._validation_errors.clear()
 
         if not isinstance(config, dict):
-            error_msg = (
-                f"Configuration must be a dictionary, got {type(config).__name__}"
-            )
-            self._validation_errors.append(error_msg)
+            error_msg = "Configuration must be a dictionary, got %s"
+            self._validation_errors.append(error_msg % type(config).__name__)
             return False
 
         # Check for missing required fields
         missing_fields = [field for field in required_fields if field not in config]
         if missing_fields:
-            error_msg = f"Missing required fields: {', '.join(missing_fields)}"
-            self._validation_errors.append(error_msg)
+            error_msg = "Missing required fields: %s"
+            self._validation_errors.append(error_msg % ", ".join(missing_fields))
 
         # Check for empty or invalid field values
         for field in required_fields:
             if field in config:
                 value = config[field]
                 if not isinstance(value, str):
-                    error_msg = (
-                        f"Field '{field}' must be a string, got {type(value).__name__}"
+                    error_msg = "Field '%s' must be a string, got %s"
+                    self._validation_errors.append(
+                        error_msg % (field, type(value).__name__)
                     )
-                    self._validation_errors.append(error_msg)
                 elif not value.strip():
-                    error_msg = f"Field '{field}' cannot be empty or whitespace-only"
-                    self._validation_errors.append(error_msg)
+                    error_msg = "Field '%s' cannot be empty or whitespace-only"
+                    self._validation_errors.append(error_msg % field)
 
         # Log detailed validation errors
         if self._validation_errors:

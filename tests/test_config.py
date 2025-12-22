@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from flow_proxy_plugin.config import SecretsManager
+from flow_proxy_plugin.core.config import SecretsManager
 
 
 class TestSecretsManager:

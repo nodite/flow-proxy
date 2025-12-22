@@ -1,22 +1,22 @@
 """Main FlowProxyPlugin class implementation."""
 
 import logging
+import os
 from typing import Any
 
 from proxy.http.parser import HttpParser
 from proxy.http.proxy import HttpProxyBasePlugin
 
-from .config import SecretsManager
-from .jwt_generator import JWTGenerator
-from .load_balancer import LoadBalancer
-from .request_forwarder import RequestForwarder
+from ..utils.logging import setup_colored_logger
+from ..utils.plugin_base import initialize_plugin_components
 
 
 class FlowProxyPlugin(HttpProxyBasePlugin):
-    """Flow LLM Proxy authentication plugin main class.
+    """Flow LLM Proxy authentication plugin for forward proxy mode.
 
     This plugin handles authentication token generation and request forwarding
-    to Flow LLM Proxy service with round-robin load balancing.
+    to Flow LLM Proxy service with round-robin load balancing when used with
+    proxy mode (curl -x).
 
     Inherits from HttpProxyBasePlugin to integrate with proxy.py framework.
     """
@@ -36,21 +36,30 @@ class FlowProxyPlugin(HttpProxyBasePlugin):
 
         # Set up logging
         self.logger = logging.getLogger(__name__)
+
+        # Set log level from environment variable (set by CLI) or flags
+        log_level_str = os.getenv("FLOW_PROXY_LOG_LEVEL", "INFO")
+
+        if hasattr(self, "flags") and hasattr(self.flags, "log_level"):
+            flags_level = getattr(self.flags, "log_level", None)
+            # Only use flags if env var is not set
+            if not os.getenv("FLOW_PROXY_LOG_LEVEL") and isinstance(flags_level, str):
+                log_level_str = flags_level
+
+        if isinstance(log_level_str, str):
+            setup_colored_logger(self.logger, log_level_str)
+
         self.logger.info("Initializing FlowProxyPlugin...")
 
         try:
-            # Initialize SecretsManager and load configurations
-            self.secrets_manager = SecretsManager()
-            self.configs = self.secrets_manager.load_secrets("secrets.json")
-
-            # Initialize LoadBalancer with loaded configurations
-            self.load_balancer = LoadBalancer(self.configs, self.logger)
-
-            # Initialize JWTGenerator for token generation
-            self.jwt_generator = JWTGenerator(self.logger)
-
-            # Initialize RequestForwarder for request handling
-            self.request_forwarder = RequestForwarder(self.logger)
+            # Initialize components
+            (
+                self.secrets_manager,
+                self.configs,
+                self.load_balancer,
+                self.jwt_generator,
+                self.request_forwarder,
+            ) = initialize_plugin_components(self.logger)
 
             self.logger.info(
                 f"FlowProxyPlugin successfully initialized with {len(self.configs)} authentication configurations"
@@ -71,9 +80,11 @@ class FlowProxyPlugin(HttpProxyBasePlugin):
         This method is called by proxy.py before establishing a connection to the
         upstream server. It implements the core request interception logic:
         1. Validates the incoming request
-        2. Selects next authentication configuration using round-robin load balancing
-        3. Generates JWT token for the selected configuration
-        4. Modifies request headers to include authentication
+        2. Converts reverse proxy requests to forward proxy format
+        3. Selects next authentication configuration using round-robin load balancing
+        4. Generates JWT token for the selected configuration
+        5. Modifies request headers to include authentication
+        6. Redirects request to Flow LLM Proxy HTTPS endpoint
 
         Args:
             request: The incoming HTTP request from the client
@@ -85,6 +96,22 @@ class FlowProxyPlugin(HttpProxyBasePlugin):
             Returning None prevents upstream connection establishment and rejects the request.
         """
         try:
+            # First, handle reverse proxy mode by converting path-only requests to full URLs
+            # This must be done BEFORE validation
+            if (
+                request.path
+                and not request.path.startswith(b"http://")
+                and not request.path.startswith(b"https://")
+            ):
+                # This is a reverse proxy request (path only, no full URL)
+                # Convert it to forward proxy format by prepending the target base URL
+                original_path = request.path.decode()
+                target_url = f"{self.request_forwarder.target_base_url}{original_path}"
+                request.set_url(target_url.encode())
+                self.logger.debug(
+                    f"Converted reverse proxy request: {original_path} -> {target_url}"
+                )
+
             # Validate request before processing
             if not self.request_forwarder.validate_request(request):
                 self.logger.error("Request validation failed - rejecting request")
@@ -128,8 +155,10 @@ class FlowProxyPlugin(HttpProxyBasePlugin):
                 request, jwt_token, config_name
             )
 
+            target_url = request.path.decode() if request.path else "unknown"
             self.logger.info(
-                f"Request processed successfully with config: '{config_name}'"
+                f"Request processed successfully with config: '{config_name}', "
+                f"forwarding to: {target_url}"
             )
             return modified_request
 

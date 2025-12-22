@@ -10,6 +10,13 @@ __email__ = "your.email@example.com"
 
 from .error_handler import ErrorCode, ErrorHandler
 from .network_error_handler import NetworkErrorHandler
-from .plugin import FlowProxyPlugin
+from .plugins.proxy_plugin import FlowProxyPlugin
+from .plugins.web_server_plugin import FlowProxyWebServerPlugin
 
-__all__ = ["FlowProxyPlugin", "ErrorHandler", "ErrorCode", "NetworkErrorHandler"]
+__all__ = [
+    "FlowProxyPlugin",
+    "FlowProxyWebServerPlugin",
+    "ErrorHandler",
+    "ErrorCode",
+    "NetworkErrorHandler",
+]

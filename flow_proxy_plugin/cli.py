@@ -6,24 +6,9 @@ import os
 import sys
 from pathlib import Path
 
-from proxy.proxy import Proxy
+from proxy.proxy import Proxy, sleep_loop
 
-
-def setup_logging(level: str = "INFO", log_file: str = "flow_proxy_plugin.log") -> None:
-    """Setup logging configuration.
-
-    Args:
-        level: Logging level (DEBUG, INFO, WARNING, ERROR)
-        log_file: Path to log file
-    """
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file),
-        ],
-    )
+from .utils.logging import setup_logging
 
 
 def main() -> None:
@@ -84,17 +69,24 @@ def main() -> None:
     logger.info(f"Log level: {args.log_level}")
     logger.info(f"Log file: {args.log_file}")
 
-    # Store secrets file path in environment for plugin to access
+    # Store secrets file path and log level in environment for plugin to access
     os.environ["FLOW_PROXY_SECRETS_FILE"] = args.secrets_file
+    os.environ["FLOW_PROXY_LOG_LEVEL"] = args.log_level
 
     # Start proxy with plugin
     try:
         with Proxy(
-            hostname=args.host,
-            port=args.port,
-            plugins=["flow_proxy_plugin.plugin.FlowProxyPlugin"],
+            input_args=[
+                "--hostname",
+                args.host,
+                "--port",
+                str(args.port),
+                "--plugins",
+                "flow_proxy_plugin.plugins.proxy_plugin.FlowProxyPlugin,flow_proxy_plugin.plugins.web_server_plugin.FlowProxyWebServerPlugin",
+                "--enable-web-server",  # Enable web server mode for reverse proxy
+            ]
         ) as proxy:
-            proxy.accept_forever()
+            sleep_loop(proxy)
     except KeyboardInterrupt:
         logger.info("Shutting down Flow Proxy Plugin")
     except Exception as e:

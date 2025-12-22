@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import pytest
 from proxy.http.parser import HttpParser
 
-from flow_proxy_plugin.plugin import FlowProxyPlugin
+from flow_proxy_plugin.plugins.proxy_plugin import FlowProxyPlugin
 
 
 @pytest.fixture
@@ -40,6 +40,7 @@ def mock_plugin_args() -> dict[str, Any]:
     flags.ca_signing_key_file = None
     flags.ca_cert_file = None
     flags.ca_key_file = None
+    flags.log_level = "INFO"  # Add log_level attribute
 
     client = Mock()
     event_queue = Mock()
@@ -59,7 +60,9 @@ class TestFlowProxyPluginInitialization:
         self, mock_secrets_file: str, mock_plugin_args: dict[str, Any]
     ) -> None:
         """Test successful plugin initialization with valid configuration."""
-        with patch("flow_proxy_plugin.plugin.SecretsManager.load_secrets") as mock_load:
+        with patch(
+            "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
+        ) as mock_load:
             mock_load.return_value = [
                 {
                     "name": "test-config-1",
@@ -82,7 +85,9 @@ class TestFlowProxyPluginInitialization:
         self, mock_plugin_args: dict[str, Any]
     ) -> None:
         """Test plugin initialization fails when secrets.json is missing."""
-        with patch("flow_proxy_plugin.plugin.SecretsManager.load_secrets") as mock_load:
+        with patch(
+            "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
+        ) as mock_load:
             mock_load.side_effect = FileNotFoundError("Secrets file not found")
 
             with pytest.raises(FileNotFoundError):
@@ -92,7 +97,9 @@ class TestFlowProxyPluginInitialization:
         self, mock_plugin_args: dict[str, Any]
     ) -> None:
         """Test plugin initialization fails with invalid configuration."""
-        with patch("flow_proxy_plugin.plugin.SecretsManager.load_secrets") as mock_load:
+        with patch(
+            "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
+        ) as mock_load:
             mock_load.side_effect = ValueError("Invalid configuration")
 
             with pytest.raises(ValueError):
@@ -105,7 +112,9 @@ class TestFlowProxyPluginRequestProcessing:
     @pytest.fixture
     def plugin(self, mock_plugin_args: dict[str, Any]) -> FlowProxyPlugin:
         """Create a plugin instance for testing."""
-        with patch("flow_proxy_plugin.plugin.SecretsManager.load_secrets") as mock_load:
+        with patch(
+            "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
+        ) as mock_load:
             mock_load.return_value = [
                 {
                     "name": "test-config-1",
@@ -221,7 +230,9 @@ class TestFlowProxyPluginResponseProcessing:
     @pytest.fixture
     def plugin(self, mock_plugin_args: dict[str, Any]) -> FlowProxyPlugin:
         """Create a plugin instance for testing."""
-        with patch("flow_proxy_plugin.plugin.SecretsManager.load_secrets") as mock_load:
+        with patch(
+            "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
+        ) as mock_load:
             mock_load.return_value = [
                 {
                     "name": "test-config-1",
