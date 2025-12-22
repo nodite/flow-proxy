@@ -122,43 +122,6 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin):
         self.logger.debug("Response status: %d", response.status_code)
         self.logger.debug("Response headers: %s", dict(response.headers))
 
-        # In DEBUG mode, log response body
-        if self.logger.isEnabledFor(logging.DEBUG):
-            try:
-                # Read the response content once
-                response_body = response.content
-                response_text = response_body.decode("utf-8", errors="replace")
-
-                # Truncate if too long
-                if len(response_text) > 2000:
-                    self.logger.debug(
-                        "Response body (%d bytes, truncated): %s...",
-                        len(response_body),
-                        response_text[:2000],
-                    )
-                else:
-                    self.logger.debug(
-                        "Response body (%d bytes): %s",
-                        len(response_body),
-                        response_text,
-                    )
-            except Exception as e:
-                self.logger.debug("Could not decode response body: %s", e)
-
-        # For error responses, log the body at error level
-        if response.status_code >= 400:
-            try:
-                response_body = (
-                    response.content if hasattr(response, "content") else response.text
-                )
-                if isinstance(response_body, bytes):
-                    response_text = response_body.decode("utf-8", errors="replace")
-                else:
-                    response_text = str(response_body)
-                self.logger.error("  Error: %s", response_text.strip())
-            except Exception as e:
-                self.logger.error("  Could not read error response: %s", e)
-
         # Send status line
         response_line = f"HTTP/1.1 {response.status_code} {response.reason}\r\n"
         self.client.queue(response_line.encode())
@@ -170,15 +133,16 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin):
 
         self.client.queue(b"\r\n")
 
-        # Send body - use the already-read content if available
-        if hasattr(response, "_content") and response._content is not None:
-            # Content was already read for logging
-            self.client.queue(response._content)
-        else:
-            # Stream the content
+        # Stream the content without buffering
+        try:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     self.client.queue(chunk)
+                    # Flush immediately for streaming responses
+                    if hasattr(self.client, "flush"):
+                        self.client.flush()
+        except Exception as e:
+            self.logger.error("Error streaming response: %s", e)
 
     def _send_error(
         self, status_code: int = 500, message: str = "Internal server error"

@@ -67,6 +67,25 @@ def setup_colored_logger(
         ColoredFormatter(fmt="%(levelname)s %(name)s - %(message)s", datefmt="%H:%M:%S")
     )
     logger.addHandler(console_handler)
+
+    # Add file handler (get log file from environment)
+    import os
+
+    log_file = os.getenv("FLOW_PROXY_LOG_FILE", "flow_proxy_plugin.log")
+    try:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(level)
+        file_handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s - pid:%(process)d - %(name)s - %(levelname)s - %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logger.addHandler(file_handler)
+    except Exception as e:
+        # If file handler fails, just log to console
+        logger.warning(f"Could not setup file handler: {e}")
+
     logger.propagate = propagate  # Allow control of propagation
 
 

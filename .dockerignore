@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+
+# 测试和覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# 缓存
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 文档
+docs/
+
+# 日志
+*.log
+flow_proxy_plugin.log
+
+# 配置文件（敏感信息）
+secrets.json
+.env
+
+# 临时文件
+tmp/
+temp/
+
+# 开发工具配置
+.pre-commit-config.yaml
+.pylintrc
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# 测试
+tests/

@@ -1,0 +1,35 @@
+version: "3.8"
+
+services:
+  flow-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flow-proxy-plugin
+    ports:
+      - "8899:8899"
+    volumes:
+      # 挂载配置文件（必需）
+      - ./secrets.json:/app/secrets.json:ro
+      # 挂载日志文件（可选）
+      - ./logs:/app/logs
+    environment:
+      # 可以通过环境变量覆盖默认配置
+      - FLOW_PROXY_PORT=8899
+      - FLOW_PROXY_HOST=0.0.0.0
+      - FLOW_PROXY_LOG_LEVEL=INFO
+      - FLOW_PROXY_SECRETS_FILE=/app/secrets.json
+      - FLOW_PROXY_LOG_FILE=/app/logs/flow_proxy_plugin.log
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8899/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    networks:
+      - flow-proxy-network
+
+networks:
+  flow-proxy-network:
+    driver: bridge
