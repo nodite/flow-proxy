@@ -11,7 +11,7 @@ python = "^3.10"
 proxy-py = "^2.4.10"
 pyjwt = "^2.10.0"
 requests = "^2.31.0"
-json5 = "^0.12.1"
+json5 = "^0.13.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.0"
