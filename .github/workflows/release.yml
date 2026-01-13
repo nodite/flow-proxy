@@ -41,3 +41,14 @@ jobs:
         draft: false
         prerelease: false
         generate_release_notes: true
+
+    - name: Create PR to sync release to main
+      run: |
+        gh pr create \
+          --base main \
+          --head release \
+          --title "Sync release to main after release" \
+          --body "Auto-generated PR to sync release branch changes back to main after release." \
+          || echo "PR already exists or no changes to sync"
+      env:
+        GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
