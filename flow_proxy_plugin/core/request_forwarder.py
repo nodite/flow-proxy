@@ -36,7 +36,7 @@ class RequestForwarder:
 
     def modify_request_headers(
         self,
-        request: HttpParser,
+        request: HttpParser | None,
         jwt_token: str,
         config_name: str | None = None,
     ) -> HttpParser:
