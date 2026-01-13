@@ -7,7 +7,7 @@ readme = "README.md"
 packages = [{include = "flow_proxy_plugin"}]
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = "^3.12"
 proxy-py = "^2"
 pyjwt = "^2"
 requests = "^2"

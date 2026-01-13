@@ -948,10 +948,7 @@ files = [
 [package.dependencies]
 astroid = ">=4.0.2,<=4.1.dev0"
 colorama = {version = ">=0.4.5", markers = "sys_platform == \"win32\""}
-dill = [
-    {version = ">=0.3.7", markers = "python_version >= \"3.12\""},
-    {version = ">=0.3.6", markers = "python_version == \"3.11\""},
-]
+dill = {version = ">=0.3.7", markers = "python_version >= \"3.12\""}
 isort = ">=5,<5.13 || >5.13,<8"
 mccabe = ">=0.6,<0.8"
 platformdirs = ">=2.2"
@@ -1391,5 +1388,5 @@ dev = ["pytest", "setuptools"]
 
 [metadata]
 lock-version = "2.1"
-python-versions = "^3.11"
-content-hash = "1fa1f69e21832c76273daa234a59b60d8ce87687d965f1f14dd52fc9060ded55"
+python-versions = "^3.12"
+content-hash = "47303f2ba5d831a54691e2bbaa80f015ca7686430e686ddb2d7670599eace8e0"
