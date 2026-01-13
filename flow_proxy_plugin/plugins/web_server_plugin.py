@@ -124,20 +124,22 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin):
 
         # Send status line
         response_line = f"HTTP/1.1 {response.status_code} {response.reason}\r\n"
-        self.client.queue(response_line.encode())
+        self.client.queue(memoryview(response_line.encode()))
 
         # Send headers
         for header_name, header_value in response.headers.items():
             if header_name.lower() not in ["connection", "transfer-encoding"]:
-                self.client.queue(f"{header_name}: {header_value}\r\n".encode())
+                self.client.queue(
+                    memoryview(f"{header_name}: {header_value}\r\n".encode())
+                )
 
-        self.client.queue(b"\r\n")
+        self.client.queue(memoryview(b"\r\n"))
 
         # Stream the content without buffering
         try:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
-                    self.client.queue(chunk)
+                    self.client.queue(memoryview(chunk))
                     # Flush immediately for streaming responses
                     if hasattr(self.client, "flush"):
                         self.client.flush()
@@ -160,7 +162,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin):
             f"\r\n"
             f'{{"error": "{message}"}}'
         )
-        self.client.queue(error_response.encode())
+        self.client.queue(memoryview(error_response.encode()))
 
     def handle_request(self, request: HttpParser) -> None:
         """Handle web server request."""
@@ -186,7 +188,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin):
             body = None
             if hasattr(request, "body"):
                 body = request.body
-            elif hasattr(request, "buffer"):
+            elif hasattr(request, "buffer") and request.buffer is not None:
                 body = bytes(request.buffer)
 
             # In DEBUG mode, log request details

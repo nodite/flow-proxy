@@ -7,21 +7,22 @@ readme = "README.md"
 packages = [{include = "flow_proxy_plugin"}]
 
 [tool.poetry.dependencies]
-python = "^3.10"
-proxy-py = "^2.4.10"
-pyjwt = "^2.10.0"
-requests = "^2.31.0"
-json5 = "^0.13.0"
+python = "^3.12"
+proxy-py = "^2"
+pyjwt = "^2"
+requests = "^2"
+json5 = "^0"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^9.0.2"
-pytest-cov = "^7.0.0"
-hypothesis = "^6.150.0"
-ruff = "^0.14.10"
-mypy = "^1.19.1"
-pylint = "^4.0.4"
-commitizen = "^4.11.0"
-pre-commit = "^4.5.1"
+pytest = "^9"
+pytest-cov = "^7"
+hypothesis = "^6"
+ruff = "^0"
+mypy = "^1"
+pylint = "^4"
+commitizen = "^4"
+pre-commit = "^4"
+types-requests = "^2"
 
 [tool.poetry.scripts]
 flow-proxy = "flow_proxy_plugin.cli:main"
@@ -33,6 +34,8 @@ build-backend = "poetry.core.masonry.api"
 [tool.ruff]
 target-version = "py310"
 line-length = 88
+
+[tool.ruff.lint]
 select = [
     "E",  # pycodestyle errors
     "W",  # pycodestyle warnings
@@ -48,7 +51,7 @@ ignore = [
     "C901",  # too complex
 ]
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 
 [tool.mypy]

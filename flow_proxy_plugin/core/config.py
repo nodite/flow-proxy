@@ -1,11 +1,12 @@
 """Configuration management for secrets.json file."""
 
+import json
 import logging
 import os
 from pathlib import Path
 from typing import Any
 
-import json5 as json
+import json5
 
 
 class SecretsManager:
@@ -50,8 +51,16 @@ class SecretsManager:
 
             self.logger.info("Loading secrets from: %s", resolved_path)
 
-            with open(resolved_path, encoding="utf-8") as f:
-                secrets_data = json.load(f)
+            try:
+                with open(resolved_path, encoding="utf-8") as f:
+                    secrets_data = json5.load(f)
+            except ValueError as json_error:
+                # json5 raises ValueError for parse errors
+                error_msg = "Invalid JSON format in secrets file %s: %s"
+                self.logger.error(error_msg, resolved_path, str(json_error))
+                raise ValueError(
+                    error_msg % (resolved_path, str(json_error))
+                ) from json_error
 
             if not isinstance(secrets_data, list):
                 error_msg = "Secrets file must contain an array, got %s"

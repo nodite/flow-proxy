@@ -44,6 +44,7 @@ def test_modify_request_headers_adds_authorization(
     )
 
     assert modified_request is mock_request
+    assert modified_request.headers is not None
     assert b"Authorization" in modified_request.headers
     auth_value = modified_request.headers[b"Authorization"]
     assert auth_value[0] == b"Bearer test_token_123"
@@ -57,6 +58,7 @@ def test_modify_request_headers_updates_host(
 
     modified_request = request_forwarder.modify_request_headers(mock_request, jwt_token)
 
+    assert modified_request.headers is not None
     assert b"Host" in modified_request.headers
     host_value = modified_request.headers[b"Host"]
     assert host_value[0] == b"flow.ciandt.com"
@@ -72,6 +74,7 @@ def test_modify_request_headers_removes_existing_auth(
     modified_request = request_forwarder.modify_request_headers(mock_request, jwt_token)
 
     # Should have new Authorization header
+    assert modified_request.headers is not None
     assert b"Authorization" in modified_request.headers
     auth_value = modified_request.headers[b"Authorization"]
     assert auth_value[0] == b"Bearer new_token"

@@ -151,10 +151,10 @@ class LoadBalancer:
 
         # Fallback to clientId if name is not available
         if "clientId" in config:
-            return "config-%s..." % config["clientId"][:8]
+            return f"config-{config['clientId'][:8]}..."
 
         # Last resort: use object id
-        return "config-%d" % id(config)
+        return f"config-{id(config)}"
 
     @property
     def available_count(self) -> int:

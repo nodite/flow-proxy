@@ -36,7 +36,7 @@ class RequestForwarder:
 
     def modify_request_headers(
         self,
-        request: HttpParser,
+        request: HttpParser | None,
         jwt_token: str,
         config_name: str | None = None,
     ) -> HttpParser:
@@ -84,7 +84,7 @@ class RequestForwarder:
         # Update Host header to target host
         request.headers[b"Host"] = (self.target_host.encode(), b"")
 
-        config_info = " (config: %s)" % config_name if config_name else ""
+        config_info = f" (config: {config_name})" if config_name else ""
         self.logger.info(
             "Modified request headers with JWT token%s, target host: %s",
             config_info,
