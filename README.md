@@ -54,6 +54,23 @@ poetry run flow-proxy
 poetry run flow-proxy --port 9000 --host 0.0.0.0 --log-level INFO
 ```
 
+## Docker Compose 部署
+
+```bash
+# 1. 准备配置文件
+cp secrets.json.template secrets.json
+vim secrets.json  # 编辑填入认证信息
+
+# 2. 启动服务
+docker-compose up -d
+
+# 3. 查看日志
+docker-compose logs -f
+
+# 4. 停止服务
+docker-compose down
+```
+
 ### 测试
 
 插件支持两种使用模式：
