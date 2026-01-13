@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "flow-proxy-plugin"
-version = "0.1.0"
+version = "0.1.1"
 description = "A proxy.py plugin for Flow LLM Proxy authentication and request forwarding with load balancing"
 authors = ["Your Name <your.email@example.com>"]
 readme = "README.md"
