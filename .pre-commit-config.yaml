@@ -1,29 +1,37 @@
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.11
+  - repo: local
     hooks:
-      - id: ruff
-        args: [--fix, --exit-non-zero-on-fix]
-      - id: ruff-format
+      - id: ruff-check
+        name: ruff check
+        entry: poetry run ruff check
+        language: system
+        types: [python]
+        args: [flow_proxy_plugin, tests]
+        pass_filenames: false
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.19.1
-    hooks:
       - id: mypy
-        additional_dependencies: [types-requests]
-        args: [--ignore-missing-imports]
+        name: mypy
+        entry: poetry run mypy
+        language: system
+        types: [python]
+        args: [flow_proxy_plugin, tests]
+        pass_filenames: false
 
-  - repo: https://github.com/pylint-dev/pylint
-    rev: v4.0.4
-    hooks:
       - id: pylint
-        args: [--rcfile=.pylintrc]
+        name: pylint
+        entry: poetry run pylint
+        language: system
+        types: [python]
+        args: [flow_proxy_plugin]
+        pass_filenames: false
 
-  - repo: https://github.com/commitizen-tools/commitizen
-    rev: v4.11.2
-    hooks:
       - id: commitizen
+        name: commitizen check
+        entry: poetry run cz check
+        language: system
         stages: [commit-msg]
+        args: [--commit-msg-file]
+        pass_filenames: true
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
