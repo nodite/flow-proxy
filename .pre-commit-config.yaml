@@ -3,27 +3,24 @@ repos:
     hooks:
       - id: ruff-check
         name: ruff check
-        entry: poetry run ruff check
+        entry: poetry run ruff check flow_proxy_plugin tests
         language: system
-        types: [python]
-        args: [flow_proxy_plugin, tests]
         pass_filenames: false
+        always_run: true
 
       - id: mypy
         name: mypy
-        entry: poetry run mypy
+        entry: poetry run mypy flow_proxy_plugin tests
         language: system
-        types: [python]
-        args: [flow_proxy_plugin, tests]
         pass_filenames: false
+        always_run: true
 
       - id: pylint
         name: pylint
-        entry: poetry run pylint
+        entry: poetry run pylint flow_proxy_plugin
         language: system
-        types: [python]
-        args: [flow_proxy_plugin]
         pass_filenames: false
+        always_run: true
 
       - id: commitizen
         name: commitizen check
