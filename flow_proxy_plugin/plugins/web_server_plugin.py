@@ -112,8 +112,22 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin):
 
         return headers
 
+    def _is_client_connected(self) -> bool:
+        """Check if client connection is still active.
+
+        Returns:
+            True if client appears to be connected, False otherwise
+        """
+        try:
+            return (
+                hasattr(self.client, "connection")
+                and self.client.connection is not None
+            )
+        except Exception:
+            return False
+
     def _send_response(self, response: requests.Response) -> None:
-        """Send response back to client.
+        """Send response back to client with graceful error handling.
 
         Args:
             response: Response from upstream server
@@ -122,29 +136,100 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin):
         self.logger.debug("Response status: %d", response.status_code)
         self.logger.debug("Response headers: %s", dict(response.headers))
 
-        # Send status line
-        response_line = f"HTTP/1.1 {response.status_code} {response.reason}\r\n"
-        self.client.queue(memoryview(response_line.encode()))
+        bytes_sent = 0
+        chunks_sent = 0
 
-        # Send headers
-        for header_name, header_value in response.headers.items():
-            if header_name.lower() not in ["connection", "transfer-encoding"]:
-                self.client.queue(
-                    memoryview(f"{header_name}: {header_value}\r\n".encode())
-                )
-
-        self.client.queue(memoryview(b"\r\n"))
-
-        # Stream the content without buffering
         try:
+            # Send status line
+            response_line = f"HTTP/1.1 {response.status_code} {response.reason}\r\n"
+            self.client.queue(memoryview(response_line.encode()))
+
+            # Send headers
+            for header_name, header_value in response.headers.items():
+                if header_name.lower() not in ["connection", "transfer-encoding"]:
+                    self.client.queue(
+                        memoryview(f"{header_name}: {header_value}\r\n".encode())
+                    )
+
+            self.client.queue(memoryview(b"\r\n"))
+
+            # Stream the content without buffering
             for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
+                if not chunk:
+                    continue
+
+                # Check if client is still connected before sending
+                if not self._is_client_connected():
+                    self.logger.debug(
+                        "Client disconnected, stopping response streaming "
+                        "(sent %d bytes in %d chunks)",
+                        bytes_sent,
+                        chunks_sent,
+                    )
+                    break
+
+                try:
                     self.client.queue(memoryview(chunk))
+                    bytes_sent += len(chunk)
+                    chunks_sent += 1
+
                     # Flush immediately for streaming responses
                     if hasattr(self.client, "flush"):
                         self.client.flush()
+
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    # Client disconnected - this is normal for streaming responses
+                    # Especially common when client has received all needed data
+                    self.logger.debug(
+                        "Client disconnected during streaming (%s) - sent %d bytes in %d chunks",
+                        type(e).__name__,
+                        bytes_sent,
+                        chunks_sent,
+                    )
+                    break
+                except OSError as e:
+                    # Other OS-level errors (e.g., EPIPE)
+                    if e.errno == 32:  # Broken pipe
+                        self.logger.debug(
+                            "Broken pipe during streaming - sent %d bytes in %d chunks",
+                            bytes_sent,
+                            chunks_sent,
+                        )
+                    else:
+                        self.logger.warning(
+                            "OS error during streaming: %s - sent %d bytes",
+                            e,
+                            bytes_sent,
+                        )
+                    break
+
+            # Log successful completion
+            if chunks_sent > 0:
+                self.logger.debug(
+                    "Response streaming completed: %d bytes in %d chunks",
+                    bytes_sent,
+                    chunks_sent,
+                )
+
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # Connection lost during header sending
+            self.logger.debug(
+                "Client disconnected during response headers (%s)", type(e).__name__
+            )
         except Exception as e:
-            self.logger.error("Error streaming response: %s", e)
+            # Unexpected errors should still be logged as errors
+            self.logger.error(
+                "Unexpected error streaming response: %s (sent %d bytes)",
+                e,
+                bytes_sent,
+                exc_info=True,
+            )
+        finally:
+            # Cleanup response resources
+            try:
+                response.close()
+            except Exception:
+                pass  # Ignore cleanup errors
 
     def _send_error(
         self, status_code: int = 500, message: str = "Internal server error"
@@ -226,14 +311,18 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin):
                 else:
                     self.logger.debug("  Request body: None")
 
-            # Forward request
+            # Forward request with appropriate timeout settings
+            # (connect_timeout, read_timeout) - longer read timeout for streaming
             response = requests.request(
                 method=method,
                 url=target_url,
                 headers=headers,
                 data=body,
                 stream=True,
-                timeout=300,
+                timeout=(
+                    30,
+                    600,
+                ),  # 30s connect, 600s read for long streaming responses
             )
 
             # Send response
