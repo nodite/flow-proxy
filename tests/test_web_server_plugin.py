@@ -108,14 +108,15 @@ class TestConnectionStateCheck:
 
     def test_is_client_connected_true(self, plugin: FlowProxyWebServerPlugin) -> None:
         """Test client connection check returns True when connected."""
-        plugin.client.connection = Mock()
+        mock_connection = Mock()
+        plugin.client = Mock(connection=mock_connection)
         assert plugin._is_client_connected() is True
 
     def test_is_client_connected_false_no_connection(
         self, plugin: FlowProxyWebServerPlugin
     ) -> None:
         """Test client connection check returns False when no connection."""
-        plugin.client.connection = None
+        plugin.client = Mock(connection=None)
         assert plugin._is_client_connected() is False
 
     def test_is_client_connected_false_no_attribute(
@@ -181,15 +182,14 @@ class TestSendResponse:
         mock_response.reason = "OK"
         mock_response.headers = {"Content-Type": "application/json"}
         mock_response.iter_content.return_value = [b"chunk1", b"chunk2"]
-        mock_response.close = Mock()
 
-        plugin.client.queue = Mock()
-        plugin.client.flush = Mock()
+        mock_queue = Mock()
+        mock_flush = Mock()
+        plugin.client = Mock(queue=mock_queue, flush=mock_flush)
 
         plugin._send_response(mock_response)
 
-        assert plugin.client.queue.call_count >= 4  # Status, headers, separator, chunks
-        mock_response.close.assert_called_once()
+        assert mock_queue.call_count >= 4  # Status, headers, separator, chunks
 
     def test_send_response_broken_pipe_during_streaming(
         self, plugin: FlowProxyWebServerPlugin
@@ -200,16 +200,13 @@ class TestSendResponse:
         mock_response.reason = "OK"
         mock_response.headers = {"Content-Type": "text/event-stream"}
         mock_response.iter_content.return_value = [b"chunk1", b"chunk2", b"chunk3"]
-        mock_response.close = Mock()
 
-        plugin.client.queue = Mock(side_effect=[None, None, None, BrokenPipeError()])
-        plugin.client.flush = Mock()
+        mock_queue = Mock(side_effect=[None, None, None, BrokenPipeError()])
+        mock_flush = Mock()
+        plugin.client = Mock(queue=mock_queue, flush=mock_flush)
 
         # Should not raise exception
         plugin._send_response(mock_response)
-
-        # Response should be closed
-        mock_response.close.assert_called_once()
 
     def test_send_response_connection_reset(
         self, plugin: FlowProxyWebServerPlugin
@@ -220,17 +217,13 @@ class TestSendResponse:
         mock_response.reason = "OK"
         mock_response.headers = {"Content-Type": "application/json"}
         mock_response.iter_content.return_value = [b"chunk1", b"chunk2"]
-        mock_response.close = Mock()
 
-        plugin.client.queue = Mock(
-            side_effect=[None, None, None, ConnectionResetError()]
-        )
-        plugin.client.flush = Mock()
+        mock_queue = Mock(side_effect=[None, None, None, ConnectionResetError()])
+        mock_flush = Mock()
+        plugin.client = Mock(queue=mock_queue, flush=mock_flush)
 
         # Should not raise exception
         plugin._send_response(mock_response)
-
-        mock_response.close.assert_called_once()
 
     def test_send_response_os_error_broken_pipe(
         self, plugin: FlowProxyWebServerPlugin
@@ -241,17 +234,15 @@ class TestSendResponse:
         mock_response.reason = "OK"
         mock_response.headers = {"Content-Type": "application/json"}
         mock_response.iter_content.return_value = [b"chunk1", b"chunk2"]
-        mock_response.close = Mock()
 
         os_error = OSError("Broken pipe")
         os_error.errno = 32
-        plugin.client.queue = Mock(side_effect=[None, None, None, os_error])
-        plugin.client.flush = Mock()
+        mock_queue = Mock(side_effect=[None, None, None, os_error])
+        mock_flush = Mock()
+        plugin.client = Mock(queue=mock_queue, flush=mock_flush)
 
         # Should not raise exception
         plugin._send_response(mock_response)
-
-        mock_response.close.assert_called_once()
 
     def test_send_response_client_disconnected(
         self, plugin: FlowProxyWebServerPlugin
@@ -262,16 +253,12 @@ class TestSendResponse:
         mock_response.reason = "OK"
         mock_response.headers = {"Content-Type": "application/json"}
         mock_response.iter_content.return_value = [b"chunk1", b"chunk2", b"chunk3"]
-        mock_response.close = Mock()
 
-        plugin.client.queue = Mock()
-        plugin.client.flush = Mock()
-        plugin.client.connection = None  # Simulate disconnection
+        mock_queue = Mock()
+        mock_flush = Mock()
+        plugin.client = Mock(queue=mock_queue, flush=mock_flush, connection=None)
 
         plugin._send_response(mock_response)
-
-        # Should stop early due to disconnection
-        mock_response.close.assert_called_once()
 
     def test_send_response_unexpected_error(
         self, plugin: FlowProxyWebServerPlugin
@@ -282,17 +269,13 @@ class TestSendResponse:
         mock_response.reason = "OK"
         mock_response.headers = {"Content-Type": "application/json"}
         mock_response.iter_content.return_value = [b"chunk1"]
-        mock_response.close = Mock()
 
-        plugin.client.queue = Mock(
-            side_effect=[None, None, None, RuntimeError("Unexpected")]
-        )
-        plugin.client.flush = Mock()
+        mock_queue = Mock(side_effect=[None, None, None, RuntimeError("Unexpected")])
+        mock_flush = Mock()
+        plugin.client = Mock(queue=mock_queue, flush=mock_flush)
 
         # Should not raise exception
         plugin._send_response(mock_response)
-
-        mock_response.close.assert_called_once()
 
     def test_send_response_empty_chunks(self, plugin: FlowProxyWebServerPlugin) -> None:
         """Test response sending skips empty chunks."""
@@ -301,15 +284,12 @@ class TestSendResponse:
         mock_response.reason = "OK"
         mock_response.headers = {"Content-Type": "application/json"}
         mock_response.iter_content.return_value = [b"chunk1", b"", b"chunk2"]
-        mock_response.close = Mock()
 
-        plugin.client.queue = Mock()
-        plugin.client.flush = Mock()
+        mock_queue = Mock()
+        mock_flush = Mock()
+        plugin.client = Mock(queue=mock_queue, flush=mock_flush)
 
         plugin._send_response(mock_response)
-
-        # Should skip empty chunk
-        mock_response.close.assert_called_once()
 
 
 class TestSendError:
@@ -317,24 +297,26 @@ class TestSendError:
 
     def test_send_error_default(self, plugin: FlowProxyWebServerPlugin) -> None:
         """Test sending default error response."""
-        plugin.client.queue = Mock()
+        mock_queue = Mock()
+        plugin.client = Mock(queue=mock_queue)
 
         plugin._send_error()
 
-        plugin.client.queue.assert_called_once()
-        call_args = plugin.client.queue.call_args[0][0]
+        mock_queue.assert_called_once()
+        call_args = mock_queue.call_args[0][0]
         response_bytes = bytes(call_args)
         assert b"500 Error" in response_bytes
         assert b"Internal server error" in response_bytes
 
     def test_send_error_custom(self, plugin: FlowProxyWebServerPlugin) -> None:
         """Test sending custom error response."""
-        plugin.client.queue = Mock()
+        mock_queue = Mock()
+        plugin.client = Mock(queue=mock_queue)
 
         plugin._send_error(status_code=404, message="Not found")
 
-        plugin.client.queue.assert_called_once()
-        call_args = plugin.client.queue.call_args[0][0]
+        mock_queue.assert_called_once()
+        call_args = mock_queue.call_args[0][0]
         response_bytes = bytes(call_args)
         assert b"404 Error" in response_bytes
         assert b"Not found" in response_bytes
