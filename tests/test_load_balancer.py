@@ -120,7 +120,7 @@ class TestLoadBalancer:
         lb = LoadBalancer(sample_secrets_config)
 
         lb.get_next_config()
-        assert "Using authentication configuration: 'config1'" in caplog.text
+        assert "Using config 'config1'" in caplog.text
 
     def test_mark_already_failed_config(
         self,
@@ -135,7 +135,7 @@ class TestLoadBalancer:
         lb.mark_config_failed(config)
         lb.mark_config_failed(config)  # Try to mark again
 
-        assert "Attempted to mark already-failed config as failed" in caplog.text
+        assert "already marked as failed" in caplog.text
 
     def test_config_without_name_field(self) -> None:
         """Test handling configs without 'name' field."""
