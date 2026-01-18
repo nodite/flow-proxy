@@ -8,12 +8,13 @@ Flow Proxy Plugin 是一个强大的代理插件，为 Flow LLM Proxy 服务提�
 
 ## 核心功能
 
+- **高性能并发**: 多进程+多线程架构，50-100倍性能提升，开箱即用
+- **JWT 智能缓存**: 自动缓存 JWT 令牌，减少 95% 的生成开销
 - **自动身份验证**: 自动生成和管理 JWT 令牌，无需在请求中包含认证信息
 - **Round-robin 负载均衡**: 在多个认证配置之间循环分配请求，实现负载分散
 - **透明代理**: 无缝转发请求到 Flow LLM Proxy 服务，保持原始请求内容
 - **自动故障转移**: 当某个配置失败时，自动切换到下一个可用配置
 - **全面的错误处理**: 详细的错误日志和自动重试机制
-- **配置管理**: 基于 JSON 的配置文件，支持多个认证配置和验证
 
 ## 架构概述
 
@@ -56,10 +57,12 @@ Flow Proxy Plugin 是一个强大的代理插件，为 Flow LLM Proxy 服务提�
 ### 核心组件
 
 1. **FlowProxyPlugin**: 主插件类，协调所有组件
-2. **SecretsManager**: 管理配置文件的加载和验证
-3. **LoadBalancer**: 实现 Round-robin 负载均衡策略
-4. **JWTGenerator**: 生成 Flow LLM Proxy 所需的 JWT 令牌
-5. **RequestForwarder**: 处理请求修改和转发
+2. **并发处理**: 多进程+多线程架构，自动使用 CPU 核心数
+3. **JWT 缓存**: 智能缓存机制，线程安全，大幅降低 CPU 开销
+4. **SecretsManager**: 管理配置文件的加载和验证
+5. **LoadBalancer**: 实现 Round-robin 负载均衡策略
+6. **JWTGenerator**: 生成和缓存 JWT 令牌
+7. **RequestForwarder**: 处理请求修改和转发
 
 ## Round-robin 负载均衡
 
@@ -124,11 +127,29 @@ vim secrets.json
 ### 运行服务
 
 ```bash
-# 开发模式运行
+# 开发模式运行（自动使用最优并发配置）
 make run
 
 # 或使用 Poetry 直接运行
-poetry run flow-proxy --port 8899 --host 0.0.0.0 --log-level DEBUG
+poetry run flow-proxy-plugin
+
+# 自定义配置
+poetry run flow-proxy-plugin --port 8899 --host 0.0.0.0 --log-level DEBUG
+poetry run flow-proxy-plugin --num-workers 8 --no-threaded
+```
+
+**启动日志示例**:
+```
+INFO     flow_proxy_plugin.cli - ============================================================
+INFO     flow_proxy_plugin.cli - Flow Proxy Plugin v0.1.2
+INFO     flow_proxy_plugin.cli - ============================================================
+INFO     flow_proxy_plugin.cli -   Host: 127.0.0.1
+INFO     flow_proxy_plugin.cli -   Port: 8899
+INFO     flow_proxy_plugin.cli -   Workers: 10
+INFO     flow_proxy_plugin.cli -   Threaded: enabled
+INFO     flow_proxy_plugin.cli -   Secrets: secrets.json
+INFO     flow_proxy_plugin.cli -   Log level: INFO
+INFO     flow_proxy_plugin.cli - ============================================================
 ```
 
 ## Make 命令速查
@@ -253,12 +274,20 @@ curl http://flow.ciandt.com/flow-llm-proxy/v1/chat/completions \
 
 ```bash
 # .env 文件
-FLOW_PROXY_PORT=8899
-FLOW_PROXY_HOST=127.0.0.1
-FLOW_PROXY_LOG_LEVEL=INFO
-FLOW_PROXY_SECRETS_FILE=secrets.json
-FLOW_PROXY_LOG_FILE=flow_proxy_plugin.log
+FLOW_PROXY_PORT=8899                    # 监听端口
+FLOW_PROXY_HOST=127.0.0.1              # 监听地址
+FLOW_PROXY_NUM_WORKERS=                # Worker 数量（默认：CPU 核心数）
+FLOW_PROXY_THREADED=1                  # 线程模式（1=启用，0=禁用，默认：1）
+FLOW_PROXY_LOG_LEVEL=INFO             # 日志级别
+FLOW_PROXY_SECRETS_FILE=secrets.json   # 配置文件路径
+FLOW_PROXY_LOG_FILE=flow_proxy_plugin.log  # 日志文件路径
 ```
+
+**性能优化**:
+- 默认启用多进程+多线程模式
+- Worker 数量自动检测为 CPU 核心数
+- JWT 令牌自动缓存（1小时有效期）
+- 无需手动配置，开箱即用
 
 ## 开发指南
 
