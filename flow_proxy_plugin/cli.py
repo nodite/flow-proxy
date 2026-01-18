@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -51,6 +52,19 @@ def main() -> None:
         help="Path to log file (default: flow_proxy_plugin.log, env: FLOW_PROXY_LOG_FILE)",
     )
 
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Number of worker processes (default: CPU count, env: FLOW_PROXY_NUM_WORKERS)",
+    )
+
+    parser.add_argument(
+        "--no-threaded",
+        action="store_true",
+        help="Disable threaded mode (default: threaded enabled, env: FLOW_PROXY_THREADED=0)",
+    )
+
     args = parser.parse_args()
 
     # Setup logging
@@ -64,28 +78,52 @@ def main() -> None:
         logger.error(f"Please create {args.secrets_file} from secrets.json.template")
         sys.exit(1)
 
-    logger.info(f"Starting Flow Proxy Plugin on {args.host}:{args.port}")
-    logger.info(f"Using secrets file: {args.secrets_file}")
-    logger.info(f"Log level: {args.log_level}")
-    logger.info(f"Log file: {args.log_file}")
+    # Determine num_workers (default: CPU count)
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = (
+            int(os.getenv("FLOW_PROXY_NUM_WORKERS", "0")) or multiprocessing.cpu_count()
+        )
+
+    # Determine threaded mode (default: enabled)
+    threaded = not args.no_threaded and os.getenv("FLOW_PROXY_THREADED", "1") == "1"
+
+    # Log startup information
+    logger.info("=" * 60)
+    logger.info("Flow Proxy Plugin Starting")
+    logger.info("=" * 60)
+    logger.info(f"  Host: {args.host}")
+    logger.info(f"  Port: {args.port}")
+    logger.info(f"  Workers: {num_workers}")
+    logger.info(f"  Threaded: {'enabled' if threaded else 'disabled'}")
+    logger.info(f"  Secrets: {args.secrets_file}")
+    logger.info(f"  Log level: {args.log_level}")
+    logger.info("=" * 60)
 
     # Store secrets file path and log level in environment for plugin to access
     os.environ["FLOW_PROXY_SECRETS_FILE"] = args.secrets_file
     os.environ["FLOW_PROXY_LOG_LEVEL"] = args.log_level
 
+    # Build proxy.py arguments
+    proxy_args = [
+        "--hostname",
+        args.host,
+        "--port",
+        str(args.port),
+        "--num-workers",
+        str(num_workers),
+        "--plugins",
+        "flow_proxy_plugin.plugins.proxy_plugin.FlowProxyPlugin,flow_proxy_plugin.plugins.web_server_plugin.FlowProxyWebServerPlugin",
+        "--enable-web-server",
+    ]
+
+    if threaded:
+        proxy_args.append("--threaded")
+
     # Start proxy with plugin
     try:
-        with Proxy(
-            input_args=[
-                "--hostname",
-                args.host,
-                "--port",
-                str(args.port),
-                "--plugins",
-                "flow_proxy_plugin.plugins.proxy_plugin.FlowProxyPlugin,flow_proxy_plugin.plugins.web_server_plugin.FlowProxyWebServerPlugin",
-                "--enable-web-server",  # Enable web server mode for reverse proxy
-            ]
-        ) as proxy:
+        logger.info("Starting proxy server...")
+        with Proxy(input_args=proxy_args) as proxy:
             sleep_loop(proxy)
     except KeyboardInterrupt:
         logger.info("Shutting down Flow Proxy Plugin")
