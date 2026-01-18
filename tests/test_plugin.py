@@ -60,6 +60,11 @@ class TestFlowProxyPluginInitialization:
         self, mock_secrets_file: str, mock_plugin_args: dict[str, Any]
     ) -> None:
         """Test successful plugin initialization with valid configuration."""
+        # Clear shared state before test
+        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+
+        SharedComponentManager().reset()
+
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
         ) as mock_load:
@@ -85,6 +90,11 @@ class TestFlowProxyPluginInitialization:
         self, mock_plugin_args: dict[str, Any]
     ) -> None:
         """Test plugin initialization fails when secrets.json is missing."""
+        # Clear shared state before test
+        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+
+        SharedComponentManager().reset()
+
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
         ) as mock_load:
@@ -97,6 +107,11 @@ class TestFlowProxyPluginInitialization:
         self, mock_plugin_args: dict[str, Any]
     ) -> None:
         """Test plugin initialization fails with invalid configuration."""
+        # Clear shared state before test
+        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+
+        SharedComponentManager().reset()
+
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
         ) as mock_load:
@@ -112,6 +127,11 @@ class TestFlowProxyPluginRequestProcessing:
     @pytest.fixture
     def plugin(self, mock_plugin_args: dict[str, Any]) -> FlowProxyPlugin:
         """Create a plugin instance for testing."""
+        # Clear shared state before test
+        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+
+        SharedComponentManager().reset()
+
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
         ) as mock_load:
@@ -141,13 +161,17 @@ class TestFlowProxyPluginRequestProcessing:
         request.headers = {}
 
         # Mock validation, JWT generation, and header modification
-        with patch.object(
-            plugin.request_forwarder, "validate_request", return_value=True
-        ), patch.object(
-            plugin.jwt_generator, "generate_token", return_value="test-jwt-token"
-        ) as mock_gen, patch.object(
-            plugin.request_forwarder, "modify_request_headers", return_value=request
-        ) as mock_modify:
+        with (
+            patch.object(
+                plugin.request_forwarder, "validate_request", return_value=True
+            ),
+            patch.object(
+                plugin.jwt_generator, "generate_token", return_value="test-jwt-token"
+            ) as mock_gen,
+            patch.object(
+                plugin.request_forwarder, "modify_request_headers", return_value=request
+            ) as mock_modify,
+        ):
             result = plugin.before_upstream_connection(request)
 
             assert result is not None
@@ -177,12 +201,15 @@ class TestFlowProxyPluginRequestProcessing:
         request.headers = {}
 
         # Mock validation and JWT generation failure
-        with patch.object(
-            plugin.request_forwarder, "validate_request", return_value=True
-        ), patch.object(
-            plugin.jwt_generator,
-            "generate_token",
-            side_effect=ValueError("Token generation failed"),
+        with (
+            patch.object(
+                plugin.request_forwarder, "validate_request", return_value=True
+            ),
+            patch.object(
+                plugin.jwt_generator,
+                "generate_token",
+                side_effect=ValueError("Token generation failed"),
+            ),
         ):
             result = plugin.before_upstream_connection(request)
             # Should return None when all configs fail
@@ -196,14 +223,18 @@ class TestFlowProxyPluginRequestProcessing:
         request.headers = {}
 
         # Mock validation, JWT generation with failover, and header modification
-        with patch.object(
-            plugin.request_forwarder, "validate_request", return_value=True
-        ), patch.object(
-            plugin.jwt_generator,
-            "generate_token",
-            side_effect=[ValueError("Token generation failed"), "test-jwt-token"],
-        ) as mock_gen, patch.object(
-            plugin.request_forwarder, "modify_request_headers", return_value=request
+        with (
+            patch.object(
+                plugin.request_forwarder, "validate_request", return_value=True
+            ),
+            patch.object(
+                plugin.jwt_generator,
+                "generate_token",
+                side_effect=[ValueError("Token generation failed"), "test-jwt-token"],
+            ) as mock_gen,
+            patch.object(
+                plugin.request_forwarder, "modify_request_headers", return_value=request
+            ),
         ):
             result = plugin.before_upstream_connection(request)
 
@@ -230,6 +261,11 @@ class TestFlowProxyPluginResponseProcessing:
     @pytest.fixture
     def plugin(self, mock_plugin_args: dict[str, Any]) -> FlowProxyPlugin:
         """Create a plugin instance for testing."""
+        # Clear shared state before test
+        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+
+        SharedComponentManager().reset()
+
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
         ) as mock_load:

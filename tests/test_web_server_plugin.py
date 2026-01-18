@@ -35,6 +35,11 @@ def mock_plugin_args() -> dict[str, Any]:
 @pytest.fixture
 def plugin(mock_plugin_args: dict[str, Any]) -> FlowProxyWebServerPlugin:
     """Create a plugin instance for testing."""
+    # Clear shared state before test
+    from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+
+    SharedComponentManager().reset()
+
     with patch(
         "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
     ) as mock_load:
@@ -63,6 +68,11 @@ class TestFlowProxyWebServerPluginInitialization:
         self, mock_plugin_args: dict[str, Any]
     ) -> None:
         """Test successful plugin initialization."""
+        # Clear shared state before test
+        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+
+        SharedComponentManager().reset()
+
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
         ) as mock_load:
@@ -88,6 +98,11 @@ class TestFlowProxyWebServerPluginInitialization:
         self, mock_plugin_args: dict[str, Any]
     ) -> None:
         """Test plugin initialization failure."""
+        # Clear shared state before test
+        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+
+        SharedComponentManager().reset()
+
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
         ) as mock_load:
