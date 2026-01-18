@@ -20,6 +20,7 @@ class SharedComponentManager:
 
     _instance: Optional["SharedComponentManager"] = None
     _lock = threading.Lock()
+    _initialized: bool
 
     def __new__(cls) -> "SharedComponentManager":
         """Create or return the singleton instance (thread-safe)."""
@@ -32,17 +33,17 @@ class SharedComponentManager:
 
     def __init__(self) -> None:
         """Initialize the manager (only once)."""
-        if self._initialized:
+        if hasattr(self, "_initialized") and self._initialized:
             return
 
         with self._lock:
-            if self._initialized:
+            if hasattr(self, "_initialized") and self._initialized:
                 return
 
             self._secrets_manager: SecretsManager | None = None
             self._configs: list | None = None
             self._load_balancer: LoadBalancer | None = None
-            self._initialized = True
+            self._initialized: bool = True
 
     def get_or_create_components(
         self, logger: logging.Logger
@@ -60,14 +61,22 @@ class SharedComponentManager:
             ValueError: If configuration is invalid or empty
         """
         # Fast path: components already initialized
-        if self._load_balancer is not None and self._configs is not None:
+        if (
+            self._load_balancer is not None
+            and self._configs is not None
+            and self._secrets_manager is not None
+        ):
             logger.debug("Reusing existing shared plugin components")
             return self._secrets_manager, self._configs, self._load_balancer
 
         # Slow path: initialize components with lock
         with self._lock:
             # Double-check after acquiring lock
-            if self._load_balancer is not None and self._configs is not None:
+            if (
+                self._load_balancer is not None
+                and self._configs is not None
+                and self._secrets_manager is not None
+            ):
                 return self._secrets_manager, self._configs, self._load_balancer
 
             logger.info("Initializing shared plugin components for the first time")

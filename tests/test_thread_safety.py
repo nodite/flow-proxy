@@ -17,7 +17,7 @@ class TestLoadBalancerThreadSafety:
         results = []
         lock = threading.Lock()
 
-        def get_config():
+        def get_config() -> None:
             """Get next config and append to results."""
             config = lb.get_next_config()
             with lock:
@@ -58,7 +58,7 @@ class TestLoadBalancerThreadSafety:
         results = []
         lock = threading.Lock()
 
-        def mark_failed(config):
+        def mark_failed(config: dict) -> None:
             """Mark config as failed and record result."""
             try:
                 lb.mark_config_failed(config)
@@ -101,7 +101,7 @@ class TestLoadBalancerThreadSafety:
         assert lb.failed_count == 1
         assert lb.available_count == 1
 
-        def reset_configs():
+        def reset_configs() -> None:
             """Reset failed configs."""
             lb.reset_failed_configs()
 
@@ -129,7 +129,7 @@ class TestLoadBalancerThreadSafety:
         results = {"get": 0, "mark": 0, "reset": 0}
         lock = threading.Lock()
 
-        def get_operation():
+        def get_operation() -> None:
             """Perform get_next_config operation."""
             try:
                 lb.get_next_config()
@@ -139,7 +139,7 @@ class TestLoadBalancerThreadSafety:
                 # May fail if all configs are marked as failed
                 pass
 
-        def mark_operation():
+        def mark_operation() -> None:
             """Perform mark_config_failed operation."""
             try:
                 config = lb.get_next_config()
@@ -150,7 +150,7 @@ class TestLoadBalancerThreadSafety:
                 # May fail if no configs available
                 pass
 
-        def reset_operation():
+        def reset_operation() -> None:
             """Perform reset_failed_configs operation."""
             lb.reset_failed_configs()
             with lock:
@@ -190,7 +190,7 @@ class TestLoadBalancerThreadSafety:
         configs_obtained = []
         lock = threading.Lock()
 
-        def worker():
+        def worker() -> None:
             """Worker thread that gets configs."""
             for _ in range(10):
                 try:

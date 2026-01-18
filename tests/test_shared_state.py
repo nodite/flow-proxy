@@ -1,6 +1,7 @@
 """Tests for shared state across plugin instances."""
 
 import logging
+from typing import Any
 
 from flow_proxy_plugin.utils.plugin_base import (
     SharedComponentManager,
@@ -12,7 +13,7 @@ class TestSharedState:
     """Test suite for shared state functionality."""
 
     def test_shared_load_balancer_across_instances(
-        self, sample_secrets_config: list[dict[str, str]], tmp_path
+        self, sample_secrets_config: list[dict[str, str]], tmp_path: Any
     ) -> None:
         """Test that LoadBalancer state is shared across multiple plugin instances."""
         import json
@@ -75,7 +76,7 @@ class TestSharedState:
             manager.reset()
 
     def test_independent_jwt_generators(
-        self, sample_secrets_config: list[dict[str, str]], tmp_path
+        self, sample_secrets_config: list[dict[str, str]], tmp_path: Any
     ) -> None:
         """Test that JWTGenerator instances are independent."""
         import json
