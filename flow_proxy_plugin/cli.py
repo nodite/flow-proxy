@@ -11,6 +11,12 @@ from proxy.proxy import Proxy, sleep_loop
 
 from .utils.logging import setup_logging
 
+try:
+    from importlib.metadata import version
+    __version__ = version("flow-proxy-plugin")
+except Exception:
+    __version__ = "unknown"
+
 
 def main() -> None:
     """Main entry point for the CLI."""
@@ -90,7 +96,7 @@ def main() -> None:
 
     # Log startup information
     logger.info("=" * 60)
-    logger.info("Flow Proxy Plugin Starting")
+    logger.info(f"Flow Proxy Plugin v{__version__}")
     logger.info("=" * 60)
     logger.info(f"  Host: {args.host}")
     logger.info(f"  Port: {args.port}")

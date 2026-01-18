@@ -209,3 +209,41 @@ class TestCLI:
             main()
 
         assert exc_info.value.code == 1
+
+    def test_version_display(self) -> None:
+        """Test that version is displayed in startup logs."""
+        from flow_proxy_plugin.cli import __version__, main
+
+        with (
+            patch("flow_proxy_plugin.cli.Proxy"),
+            patch("flow_proxy_plugin.cli.sleep_loop"),
+            patch("flow_proxy_plugin.cli.Path.exists", return_value=True),
+            patch("sys.argv", ["flow-proxy-plugin"]),
+            patch("flow_proxy_plugin.cli.logging.getLogger") as mock_logger,
+        ):
+            mock_log = MagicMock()
+            mock_logger.return_value = mock_log
+
+            try:
+                main()
+            except SystemExit:
+                pass
+
+            # Check that version was logged
+            calls = [str(call) for call in mock_log.info.call_args_list]
+            version_logged = any(f"v{__version__}" in str(call) for call in calls)
+            assert version_logged, f"Version not found in logs. __version__={__version__}"
+
+    def test_version_format(self) -> None:
+        """Test that version is in correct format."""
+        from flow_proxy_plugin.cli import __version__
+
+        # Version should be either a valid version string or 'unknown'
+        assert isinstance(__version__, str)
+        assert len(__version__) > 0
+
+        # If not 'unknown', should match semantic versioning pattern
+        if __version__ != "unknown":
+            # Should contain at least major.minor
+            parts = __version__.split(".")
+            assert len(parts) >= 2, f"Invalid version format: {__version__}"
