@@ -4,12 +4,9 @@ import logging
 import os
 from typing import Any
 
-from ..core.config import SecretsManager
-from ..core.jwt_generator import JWTGenerator
-from ..core.load_balancer import LoadBalancer
-from ..core.request_forwarder import RequestForwarder
 from ..utils.log_filter import setup_proxy_log_filters
 from ..utils.logging import setup_colored_logger
+from ..utils.plugin_base import initialize_plugin_components
 
 
 class BaseFlowProxyPlugin:
@@ -31,20 +28,20 @@ class BaseFlowProxyPlugin:
         setup_proxy_log_filters(suppress_broken_pipe=True, suppress_proxy_noise=True)
 
     def _initialize_components(self) -> None:
-        """Initialize core components for request processing."""
+        """Initialize core components for request processing.
+
+        Uses SharedComponentManager to maintain state across plugin instances.
+        This is essential for LoadBalancer to work correctly in multi-threaded/multi-process mode.
+        """
         try:
-            self.secrets_manager = SecretsManager()
-
-            # Load secrets from default location
-            secrets_file = os.getenv("FLOW_PROXY_SECRETS_FILE", "secrets.json")
-            self.configs = self.secrets_manager.load_secrets(secrets_file)
-
-            if not self.configs:
-                raise ValueError("No authentication configurations found")
-
-            self.load_balancer = LoadBalancer(self.configs, logger=self.logger)
-            self.jwt_generator = JWTGenerator(logger=self.logger)
-            self.request_forwarder = RequestForwarder(logger=self.logger)
+            # Use existing SharedComponentManager for thread-safe shared state
+            (
+                self.secrets_manager,
+                self.configs,
+                self.load_balancer,
+                self.jwt_generator,
+                self.request_forwarder,
+            ) = initialize_plugin_components(self.logger)
 
             self.logger.info("✓ Plugin ready with %d configs", len(self.configs))
 
