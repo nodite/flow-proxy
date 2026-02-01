@@ -68,46 +68,26 @@ def setup_colored_logger(
     )
     logger.addHandler(console_handler)
 
-    # Add file handler (get log file from environment)
-    import os
-
-    log_file = os.getenv("FLOW_PROXY_LOG_FILE", "flow_proxy_plugin.log")
-    try:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(level)
-        file_handler.setFormatter(
-            logging.Formatter(
-                fmt="%(asctime)s - pid:%(process)d - %(name)s - %(levelname)s - %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-        )
-        logger.addHandler(file_handler)
-    except Exception as e:
-        # If file handler fails, just log to console
-        logger.warning(f"Could not setup file handler: {e}")
-
     logger.propagate = propagate  # Allow control of propagation
 
 
-def setup_logging(level: str = "INFO", log_file: str = "flow_proxy_plugin.log") -> None:
+def setup_logging(level: str = "INFO", log_dir: str = "logs") -> None:
     """Setup logging configuration for the application.
 
     Args:
         level: Logging level (DEBUG, INFO, WARNING, ERROR)
-        log_file: Path to log file
+        log_dir: Log directory path
     """
     import os
     from logging.handlers import TimedRotatingFileHandler
     from pathlib import Path
 
     # Ensure log directory exists
-    log_path = Path(log_file)
-    log_dir = log_path.parent if log_path.parent != Path('.') else Path('logs')
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir_path = Path(log_dir)
+    log_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # If log_file is just a filename, put it in logs directory
-    if log_path.parent == Path('.'):
-        log_file = str(log_dir / log_path.name)
+    # Fixed log file name
+    log_file = str(log_dir_path / "flow_proxy_plugin.log")
 
     # Console handler with colors
     console_handler = logging.StreamHandler(sys.stdout)
@@ -149,7 +129,7 @@ def setup_logging(level: str = "INFO", log_file: str = "flow_proxy_plugin.log") 
 
     # Initialize the log cleaner
     init_log_cleaner(
-        log_dir=log_dir,
+        log_dir=log_dir_path,
         retention_days=retention_days,
         cleanup_interval_hours=cleanup_interval,
         max_size_mb=max_size_mb,

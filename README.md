@@ -281,7 +281,7 @@ FLOW_PROXY_NUM_WORKERS=                # Worker 数量（默认：CPU 核心数�
 FLOW_PROXY_THREADED=1                  # 线程模式（1=启用，0=禁用，默认：1）
 FLOW_PROXY_LOG_LEVEL=INFO             # 日志级别
 FLOW_PROXY_SECRETS_FILE=secrets.json   # 配置文件路径
-FLOW_PROXY_LOG_FILE=flow_proxy_plugin.log  # 日志文件路径
+FLOW_PROXY_LOG_DIR=logs                     # 日志目录路径
 
 # 日志清理配置（可选，详见 docs/log-cleanup.md）
 FLOW_PROXY_LOG_CLEANUP_ENABLED=true        # 是否启用自动清理（默认：true）
