@@ -260,3 +260,39 @@ def setup_colored_logger(
     logger.addHandler(console_handler)
 
     logger.propagate = propagate
+
+
+def setup_file_handler_for_child_process(
+    logger: logging.Logger,
+    log_level: str = "INFO",
+    log_dir: str = "logs",
+) -> None:
+    """Setup file handler for logger in child process.
+
+    This function creates a NEW file handler in the child process,
+    which is necessary because file handlers from the parent process
+    don't work correctly after fork() due to file descriptor issues.
+
+    Args:
+        logger: Logger instance to add file handler to
+        log_level: Log level string (DEBUG, INFO, WARNING, ERROR)
+        log_dir: Log directory path
+
+    Example:
+        >>> # In child process after fork
+        >>> logger = logging.getLogger(__name__)
+        >>> setup_file_handler_for_child_process(logger, "DEBUG", "logs")
+    """
+    # Create new config for child process
+    config = LogConfig.from_env(level=log_level, log_dir=log_dir)
+
+    # Create NEW file handler (not copy from parent)
+    file_handler = LoggerFactory.create_file_handler(config)
+    file_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+    # Add file handler to logger (avoid duplicates)
+    for handler in logger.handlers:
+        if isinstance(handler, TimedRotatingFileHandler):
+            logger.removeHandler(handler)
+
+    logger.addHandler(file_handler)
