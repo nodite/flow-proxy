@@ -24,7 +24,8 @@ class BaseFlowProxyPlugin:
             if not os.getenv("FLOW_PROXY_LOG_LEVEL") and isinstance(flags_level, str):
                 log_level = flags_level
 
-        setup_colored_logger(self.logger, log_level)
+        # Setup logger with console output and propagation to root logger (for file logging)
+        setup_colored_logger(self.logger, log_level, propagate=True)
         setup_proxy_log_filters(suppress_broken_pipe=True, suppress_proxy_noise=True)
 
     def _initialize_components(self) -> None:
