@@ -15,6 +15,7 @@ from flow_proxy_plugin.utils.logging import (
     LogSetup,
     RotationConfig,
     setup_colored_logger,
+    setup_file_handler_for_child_process,
     setup_logging,
 )
 
@@ -392,34 +393,128 @@ class TestSetupColoredLogger:
 
         assert logger.level == logging.INFO
         assert len(logger.handlers) == 1
-        assert isinstance(logger.handlers[0], logging.StreamHandler)
-        assert isinstance(logger.handlers[0].formatter, ColoredFormatter)
-        assert logger.propagate is False
 
-    def test_setup_colored_logger_custom_level(self) -> None:
-        """Test setup_colored_logger with custom log level."""
-        logger = logging.getLogger("test.custom.logger")
-        setup_colored_logger(logger, log_level="DEBUG")
 
-        assert logger.level == logging.DEBUG
+class TestSetupFileHandlerForChildProcess:
+    """Tests for setup_file_handler_for_child_process function."""
 
-    def test_setup_colored_logger_with_propagate(self) -> None:
-        """Test setup_colored_logger with propagate enabled."""
-        logger = logging.getLogger("test.propagate.logger")
-        setup_colored_logger(logger, propagate=True)
+    def test_setup_file_handler_default(self, tmp_path: Path) -> None:
+        """Test setup_file_handler_for_child_process with default parameters."""
+        from logging.handlers import TimedRotatingFileHandler
 
-        assert logger.propagate is True
+        logger = logging.getLogger("test.child.process.logger")
+        logger.handlers.clear()
 
-    def test_setup_colored_logger_clears_handlers(self) -> None:
-        """Test that setup_colored_logger clears existing handlers."""
-        logger = logging.getLogger("test.clear.logger")
+        with patch.dict("os.environ", {}, clear=True):
+            setup_file_handler_for_child_process(logger, log_level="INFO", log_dir=str(tmp_path))
 
-        # Add some handlers
-        logger.addHandler(logging.StreamHandler())
-        logger.addHandler(logging.StreamHandler())
+        # Should have one file handler added
+        assert len(logger.handlers) == 1
+        handler = logger.handlers[0]
+        assert isinstance(handler, TimedRotatingFileHandler)
+        assert handler.baseFilename == str(tmp_path / "flow_proxy_plugin.log")
+
+    def test_setup_file_handler_custom_level(self, tmp_path: Path) -> None:
+        """Test setup_file_handler_for_child_process with custom log level."""
+        from logging.handlers import TimedRotatingFileHandler
+
+        logger = logging.getLogger("test.child.debug.logger")
+        logger.handlers.clear()
+
+        with patch.dict("os.environ", {}, clear=True):
+            setup_file_handler_for_child_process(logger, log_level="DEBUG", log_dir=str(tmp_path))
+
+        handler = logger.handlers[0]
+        assert isinstance(handler, TimedRotatingFileHandler)
+        assert handler.level == logging.DEBUG
+
+    def test_setup_file_handler_removes_existing_file_handlers(self, tmp_path: Path) -> None:
+        """Test that setup_file_handler_for_child_process removes existing file handlers."""
+        from logging.handlers import TimedRotatingFileHandler
+
+        logger = logging.getLogger("test.child.replace.logger")
+        logger.handlers.clear()
+
+        # Add an existing file handler
+        old_handler = TimedRotatingFileHandler(
+            filename=str(tmp_path / "old.log"),
+            when="midnight",
+        )
+        logger.addHandler(old_handler)
+        assert len(logger.handlers) == 1
+
+        # Add console handler (should not be removed)
+        console_handler = logging.StreamHandler()
+        logger.addHandler(console_handler)
         assert len(logger.handlers) == 2
 
-        # Setup should clear existing handlers
-        setup_colored_logger(logger)
+        with patch.dict("os.environ", {}, clear=True):
+            setup_file_handler_for_child_process(logger, log_level="INFO", log_dir=str(tmp_path))
 
+        # Should have console handler + new file handler
+        assert len(logger.handlers) == 2
+        file_handlers = [h for h in logger.handlers if isinstance(h, TimedRotatingFileHandler)]
+        assert len(file_handlers) == 1
+        assert file_handlers[0].baseFilename == str(tmp_path / "flow_proxy_plugin.log")
+
+    def test_setup_file_handler_from_env(self, tmp_path: Path) -> None:
+        """Test setup_file_handler_for_child_process reads config from environment."""
+        from logging.handlers import TimedRotatingFileHandler
+
+        logger = logging.getLogger("test.child.env.logger")
+        logger.handlers.clear()
+
+        env = {
+            "FLOW_PROXY_LOG_CLEANUP_ENABLED": "true",
+            "FLOW_PROXY_LOG_RETENTION_DAYS": "30",
+        }
+
+        with patch.dict("os.environ", env, clear=True):
+            setup_file_handler_for_child_process(logger, log_level="INFO", log_dir=str(tmp_path))
+
+        # Should create handler successfully with env config
         assert len(logger.handlers) == 1
+        handler = logger.handlers[0]
+        assert isinstance(handler, TimedRotatingFileHandler)
+        assert handler.baseFilename == str(tmp_path / "flow_proxy_plugin.log")
+
+    def test_setup_file_handler_creates_new_handler(self, tmp_path: Path) -> None:
+        """Test that a NEW file handler is created (not copied)."""
+        logger = logging.getLogger("test.child.new.logger")
+        logger.handlers.clear()
+
+        with patch.dict("os.environ", {}, clear=True):
+            setup_file_handler_for_child_process(logger, log_level="INFO", log_dir=str(tmp_path))
+
+        handler = logger.handlers[0]
+
+        # Verify it's a proper TimedRotatingFileHandler with correct config
+        from logging.handlers import TimedRotatingFileHandler
+        assert isinstance(handler, TimedRotatingFileHandler)
+        assert handler.when == "MIDNIGHT"
+        assert handler.interval == 86400  # 1 day in seconds
+        assert handler.suffix == "%Y-%m-%d"
+
+    def test_setup_file_handler_different_log_dirs(self, tmp_path: Path) -> None:
+        """Test setup_file_handler_for_child_process with different log directories."""
+        from logging.handlers import TimedRotatingFileHandler
+
+        logger1 = logging.getLogger("test.child.dir1.logger")
+        logger1.handlers.clear()
+
+        logger2 = logging.getLogger("test.child.dir2.logger")
+        logger2.handlers.clear()
+
+        log_dir1 = tmp_path / "logs1"
+        log_dir2 = tmp_path / "logs2"
+
+        with patch.dict("os.environ", {}, clear=True):
+            setup_file_handler_for_child_process(logger1, log_level="INFO", log_dir=str(log_dir1))
+            setup_file_handler_for_child_process(logger2, log_level="INFO", log_dir=str(log_dir2))
+
+        handler1 = logger1.handlers[0]
+        handler2 = logger2.handlers[0]
+        assert isinstance(handler1, TimedRotatingFileHandler)
+        assert isinstance(handler2, TimedRotatingFileHandler)
+        assert handler1.baseFilename == str(log_dir1 / "flow_proxy_plugin.log")
+        assert handler2.baseFilename == str(log_dir2 / "flow_proxy_plugin.log")

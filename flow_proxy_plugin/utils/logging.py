@@ -286,6 +286,9 @@ def setup_file_handler_for_child_process(
     # Create new config for child process
     config = LogConfig.from_env(level=log_level, log_dir=log_dir)
 
+    # Ensure log directory exists
+    config.log_dir_path.mkdir(parents=True, exist_ok=True)
+
     # Create NEW file handler (not copy from parent)
     file_handler = LoggerFactory.create_file_handler(config)
     file_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
