@@ -86,8 +86,8 @@ def setup_logging(level: str = "INFO", log_dir: str = "logs") -> None:
     log_dir_path = Path(log_dir)
     log_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Fixed log file name
-    log_file = str(log_dir_path / "flow_proxy_plugin.log")
+    # Base log file path (TimedRotatingFileHandler will add date suffix for daily rotation)
+    base_log_file = log_dir_path / "flow_proxy_plugin.log"
 
     # Console handler with colors
     console_handler = logging.StreamHandler(sys.stdout)
@@ -95,16 +95,17 @@ def setup_logging(level: str = "INFO", log_dir: str = "logs") -> None:
         ColoredFormatter(fmt="%(levelname)s %(name)s - %(message)s", datefmt="%H:%M:%S")
     )
 
-    # Timed rotating file handler - rotates at midnight and keeps daily logs
-    # File naming: flow_proxy_plugin.log, flow_proxy_plugin.log.2026-02-01, etc.
+    # Timed rotating file handler - automatically creates daily log files
+    # Current log: flow_proxy_plugin.log
+    # Daily archives: flow_proxy_plugin.log.2026-02-01, flow_proxy_plugin.log.2026-01-31, etc.
     file_handler = TimedRotatingFileHandler(
-        log_file,
-        when='midnight',
-        interval=1,
-        backupCount=0,  # Keep all files, let log_cleaner handle cleanup
+        filename=str(base_log_file),
+        when='midnight',        # Rotate at midnight
+        interval=1,             # Every 1 day
+        backupCount=0,          # Keep all files, let log_cleaner handle cleanup
         encoding='utf-8',
     )
-    file_handler.suffix = "%Y-%m-%d"  # Date format for backup files
+    file_handler.suffix = "%Y-%m-%d"  # Date suffix format for rotated files
     file_handler.setFormatter(
         logging.Formatter(
             fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
