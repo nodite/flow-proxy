@@ -14,8 +14,9 @@ logger = logging.getLogger(__name__)
 class LogCleaner:
     """日志清理器，负责定期清理过期的日志文件。"""
 
-    def __init__(  # pylint: disable=too-many-positional-arguments
+    def __init__(
         self,
+        *,
         log_dir: Path,
         retention_days: int = 7,
         cleanup_interval_hours: int = 24,
@@ -224,8 +225,15 @@ class LogCleaner:
         }
 
 
-# 全局日志清理器实例
-_log_cleaner: LogCleaner | None = None
+class _LogCleanerState:
+    """日志清理器状态管理类，避免使用 global 语句。"""
+
+    def __init__(self) -> None:
+        self.cleaner: LogCleaner | None = None
+
+
+# 全局日志清理器状态实例
+_state = _LogCleanerState()
 
 
 def init_log_cleaner(
@@ -247,20 +255,18 @@ def init_log_cleaner(
     Returns:
         日志清理器实例
     """
-    global _log_cleaner  # pylint: disable=global-statement
+    if _state.cleaner is not None:
+        _state.cleaner.stop()
 
-    if _log_cleaner is not None:
-        _log_cleaner.stop()
-
-    _log_cleaner = LogCleaner(
+    _state.cleaner = LogCleaner(
         log_dir=log_dir,
         retention_days=retention_days,
         cleanup_interval_hours=cleanup_interval_hours,
         max_size_mb=max_size_mb,
         enabled=enabled,
     )
-    _log_cleaner.start()
-    return _log_cleaner
+    _state.cleaner.start()
+    return _state.cleaner
 
 
 def get_log_cleaner() -> LogCleaner | None:
@@ -269,12 +275,11 @@ def get_log_cleaner() -> LogCleaner | None:
     Returns:
         日志清理器实例，如果未初始化则返回 None
     """
-    return _log_cleaner
+    return _state.cleaner
 
 
 def stop_log_cleaner() -> None:
     """停止全局日志清理器。"""
-    global _log_cleaner  # pylint: disable=global-statement
-    if _log_cleaner is not None:
-        _log_cleaner.stop()
-        _log_cleaner = None
+    if _state.cleaner is not None:
+        _state.cleaner.stop()
+        _state.cleaner = None
