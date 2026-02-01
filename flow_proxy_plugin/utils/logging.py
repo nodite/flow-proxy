@@ -96,6 +96,18 @@ def setup_logging(level: str = "INFO", log_file: str = "flow_proxy_plugin.log") 
         level: Logging level (DEBUG, INFO, WARNING, ERROR)
         log_file: Path to log file
     """
+    import os
+    from pathlib import Path
+
+    # Ensure log directory exists
+    log_path = Path(log_file)
+    log_dir = log_path.parent if log_path.parent != Path('.') else Path('logs')
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # If log_file is just a filename, put it in logs directory
+    if log_path.parent == Path('.'):
+        log_file = str(log_dir / log_path.name)
+
     # Console handler with colors
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(
@@ -115,4 +127,22 @@ def setup_logging(level: str = "INFO", log_file: str = "flow_proxy_plugin.log") 
     logging.basicConfig(
         level=getattr(logging, level.upper()),
         handlers=[console_handler, file_handler],
+    )
+
+    # Initialize log cleaner
+    from .log_cleaner import init_log_cleaner
+
+    # Get cleanup settings from environment
+    cleanup_enabled = os.getenv("FLOW_PROXY_LOG_CLEANUP_ENABLED", "true").lower() == "true"
+    retention_days = int(os.getenv("FLOW_PROXY_LOG_RETENTION_DAYS", "7"))
+    cleanup_interval = int(os.getenv("FLOW_PROXY_LOG_CLEANUP_INTERVAL_HOURS", "24"))
+    max_size_mb = int(os.getenv("FLOW_PROXY_LOG_MAX_SIZE_MB", "100"))
+
+    # Initialize the log cleaner
+    init_log_cleaner(
+        log_dir=log_dir,
+        retention_days=retention_days,
+        cleanup_interval_hours=cleanup_interval,
+        max_size_mb=max_size_mb,
+        enabled=cleanup_enabled,
     )
