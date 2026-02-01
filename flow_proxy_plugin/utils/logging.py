@@ -97,6 +97,7 @@ def setup_logging(level: str = "INFO", log_file: str = "flow_proxy_plugin.log") 
         log_file: Path to log file
     """
     import os
+    from logging.handlers import TimedRotatingFileHandler
     from pathlib import Path
 
     # Ensure log directory exists
@@ -114,8 +115,16 @@ def setup_logging(level: str = "INFO", log_file: str = "flow_proxy_plugin.log") 
         ColoredFormatter(fmt="%(levelname)s %(name)s - %(message)s", datefmt="%H:%M:%S")
     )
 
-    # File handler without colors
-    file_handler = logging.FileHandler(log_file)
+    # Timed rotating file handler - rotates at midnight and keeps daily logs
+    # File naming: flow_proxy_plugin.log, flow_proxy_plugin.log.2026-02-01, etc.
+    file_handler = TimedRotatingFileHandler(
+        log_file,
+        when='midnight',
+        interval=1,
+        backupCount=0,  # Keep all files, let log_cleaner handle cleanup
+        encoding='utf-8',
+    )
+    file_handler.suffix = "%Y-%m-%d"  # Date format for backup files
     file_handler.setFormatter(
         logging.Formatter(
             fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
