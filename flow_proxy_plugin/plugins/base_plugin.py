@@ -24,8 +24,19 @@ class BaseFlowProxyPlugin:
             if not os.getenv("FLOW_PROXY_LOG_LEVEL") and isinstance(flags_level, str):
                 log_level = flags_level
 
-        # Setup logger with console output and propagation to root logger (for file logging)
-        setup_colored_logger(self.logger, log_level, propagate=True)
+        # Setup logger with console output only (no propagation to avoid duplicate logs)
+        setup_colored_logger(self.logger, log_level, propagate=False)
+
+        # In multi-process environment, add root logger's file handler to plugin logger
+        # This ensures logs are written to file even in worker processes
+        root_logger = logging.getLogger()
+        for handler in root_logger.handlers:
+            # Only add file handlers, not console handlers (to avoid duplicates)
+            if not isinstance(handler, logging.StreamHandler) or hasattr(handler, 'baseFilename'):
+                # This is a file handler - add it to plugin logger
+                if handler not in self.logger.handlers:
+                    self.logger.addHandler(handler)
+
         setup_proxy_log_filters(suppress_broken_pipe=True, suppress_proxy_noise=True)
 
     def _initialize_components(self) -> None:
