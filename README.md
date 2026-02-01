@@ -15,6 +15,7 @@ Flow Proxy Plugin 是一个强大的代理插件，为 Flow LLM Proxy 服务提�
 - **透明代理**: 无缝转发请求到 Flow LLM Proxy 服务，保持原始请求内容
 - **自动故障转移**: 当某个配置失败时，自动切换到下一个可用配置
 - **全面的错误处理**: 详细的错误日志和自动重试机制
+- **日志自动清理**: 自动清理过期日志文件，管理磁盘空间
 
 ## 架构概述
 
@@ -280,7 +281,13 @@ FLOW_PROXY_NUM_WORKERS=                # Worker 数量（默认：CPU 核心数�
 FLOW_PROXY_THREADED=1                  # 线程模式（1=启用，0=禁用，默认：1）
 FLOW_PROXY_LOG_LEVEL=INFO             # 日志级别
 FLOW_PROXY_SECRETS_FILE=secrets.json   # 配置文件路径
-FLOW_PROXY_LOG_FILE=flow_proxy_plugin.log  # 日志文件路径
+FLOW_PROXY_LOG_DIR=logs                     # 日志目录路径
+
+# 日志清理配置（可选，详见 docs/log-cleanup.md）
+FLOW_PROXY_LOG_CLEANUP_ENABLED=true        # 是否启用自动清理（默认：true）
+FLOW_PROXY_LOG_RETENTION_DAYS=7            # 日志保留天数（默认：7）
+FLOW_PROXY_LOG_CLEANUP_INTERVAL_HOURS=24   # 清理间隔小时数（默认：24）
+FLOW_PROXY_LOG_MAX_SIZE_MB=100             # 日志目录最大大小MB（默认：100）
 ```
 
 **性能优化**:
@@ -327,9 +334,11 @@ git commit -m "feat: add new feature"
 
 ## 文档
 
-- **[使用指南](docs/使用指南.md)** - 完整的用户使用指南，包括安装、配置、使用和故障排除
-- **[开发指南](docs/开发指南.md)** - 开发者文档，包括 API 文档、架构说明和扩展指南
-- **[部署运维](docs/部署运维.md)** - 生产环境部署和运维指南
+### 功能文档
+- **[日志自动清理](docs/log-cleanup.md)** - 自动清理过期日志文件的功能说明
+- **[日志过滤](docs/log-filtering.md)** - 日志输出过滤和级别控制
+
+### 外部资源
 - **[Flow LLM Proxy 官方文档](https://flow.ciandt.com/help/en/help/articles/8421153-overview-and-configuration)** - Flow LLM Proxy 概述与配置
 
 ## 许可证

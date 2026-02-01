@@ -18,7 +18,7 @@ services:
       - FLOW_PROXY_HOST=0.0.0.0
       - FLOW_PROXY_LOG_LEVEL=INFO
       - FLOW_PROXY_SECRETS_FILE=/app/secrets.json
-      - FLOW_PROXY_LOG_FILE=/app/logs/flow_proxy_plugin.log
+      - FLOW_PROXY_LOG_DIR=/app/logs/
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8899/"]

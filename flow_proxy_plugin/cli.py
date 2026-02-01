@@ -52,10 +52,10 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--log-file",
+        "--log-dir",
         type=str,
-        default=os.getenv("FLOW_PROXY_LOG_FILE", "flow_proxy_plugin.log"),
-        help="Path to log file (default: flow_proxy_plugin.log, env: FLOW_PROXY_LOG_FILE)",
+        default=os.getenv("FLOW_PROXY_LOG_DIR", "logs"),
+        help="Log directory path (default: logs, env: FLOW_PROXY_LOG_DIR)",
     )
 
     parser.add_argument(
@@ -74,7 +74,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # Setup logging
-    setup_logging(args.log_level, args.log_file)
+    setup_logging(args.log_level, args.log_dir)
     logger = logging.getLogger(__name__)
 
     # Check if secrets file exists
@@ -106,9 +106,10 @@ def main() -> None:
     logger.info(f"  Log level: {args.log_level}")
     logger.info("=" * 60)
 
-    # Store secrets file path and log level in environment for plugin to access
+    # Store secrets file path, log level, and log dir in environment for plugin to access
     os.environ["FLOW_PROXY_SECRETS_FILE"] = args.secrets_file
     os.environ["FLOW_PROXY_LOG_LEVEL"] = args.log_level
+    os.environ["FLOW_PROXY_LOG_DIR"] = args.log_dir
 
     # Build proxy.py arguments
     proxy_args = [

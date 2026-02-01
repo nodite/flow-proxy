@@ -5,7 +5,7 @@ import os
 from typing import Any
 
 from ..utils.log_filter import setup_proxy_log_filters
-from ..utils.logging import setup_colored_logger
+from ..utils.logging import setup_colored_logger, setup_file_handler_for_child_process
 from ..utils.plugin_base import initialize_plugin_components
 
 
@@ -24,7 +24,14 @@ class BaseFlowProxyPlugin:
             if not os.getenv("FLOW_PROXY_LOG_LEVEL") and isinstance(flags_level, str):
                 log_level = flags_level
 
-        setup_colored_logger(self.logger, log_level)
+        # Setup logger with console output only (no propagation to avoid duplicate logs)
+        setup_colored_logger(self.logger, log_level, propagate=False)
+
+        # In multi-process environment, CREATE NEW file handler in child process
+        # This is necessary because file handlers from parent process don't work after fork()
+        log_dir = os.getenv("FLOW_PROXY_LOG_DIR", "logs")
+        setup_file_handler_for_child_process(self.logger, log_level, log_dir)
+
         setup_proxy_log_filters(suppress_broken_pipe=True, suppress_proxy_noise=True)
 
     def _initialize_components(self) -> None:
