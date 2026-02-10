@@ -4,9 +4,7 @@
       "command": "npx",
       "args": [
         "@playwright/mcp@latest"
-      ],
-      "disabled": false,
-      "autoApprove": []
+      ]
     }
   }
 }
