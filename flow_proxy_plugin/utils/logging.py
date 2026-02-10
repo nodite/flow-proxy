@@ -57,7 +57,7 @@ class RotationConfig:
 
     when: str = "midnight"
     interval: int = 1
-    backup_count: int = 0
+    backup_count: int = 7  # 保留 7 天备份，防止日志无限增长
     suffix: str = "%Y-%m-%d"
     encoding: str = "utf-8"
 

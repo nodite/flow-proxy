@@ -19,7 +19,24 @@ services:
       - FLOW_PROXY_LOG_LEVEL=INFO
       - FLOW_PROXY_SECRETS_FILE=/app/secrets.json
       - FLOW_PROXY_LOG_DIR=/app/logs/
+      # Worker 数量（减少内存占用）
+      - FLOW_PROXY_NUM_WORKERS=2
+      # 日志清理配置（更积极的清理策略）
+      - FLOW_PROXY_LOG_RETENTION_DAYS=7
+      - FLOW_PROXY_LOG_CLEANUP_INTERVAL_HOURS=6
+      - FLOW_PROXY_LOG_MAX_SIZE_MB=50
+    # 内存限制配置（防止内存无限增长）
+    mem_limit: 512m
+    memswap_limit: 512m
+    # CPU 限制（可选，防止 CPU 占用过高）
+    cpus: '2.0'
     restart: unless-stopped
+    # Docker 日志配置（限制日志文件大小）
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8899/"]
       interval: 30s
