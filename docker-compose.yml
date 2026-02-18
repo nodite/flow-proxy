@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: oscaner/flow-proxy-plugin:latest
+    image: docker.gh-proxy.org/docker.io/oscaner/flow-proxy-plugin:latest
     container_name: flow-proxy-plugin
     ports:
       - "8899:8899"
