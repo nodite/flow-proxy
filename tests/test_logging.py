@@ -119,7 +119,7 @@ class TestRotationConfig:
 
         assert config.when == "midnight"
         assert config.interval == 1
-        assert config.backup_count == 0
+        assert config.backup_count == 7
         assert config.suffix == "%Y-%m-%d"
         assert config.encoding == "utf-8"
 
@@ -278,7 +278,7 @@ class TestLoggerFactory:
         assert handler.when == "MIDNIGHT"
         # For 'midnight', interval is converted to seconds in a day
         assert handler.interval == 86400
-        assert handler.backupCount == 0
+        assert handler.backupCount == 7
         assert handler.suffix == "%Y-%m-%d"
         assert isinstance(handler.formatter, logging.Formatter)
 
