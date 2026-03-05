@@ -167,7 +167,7 @@ cython_debug/
 
 # Flow Proxy Plugin specific
 secrets.json
-flow_proxy_plugin.log
 *.log
+/logs
 /tmp
 .DS_Store

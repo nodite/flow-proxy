@@ -200,6 +200,15 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
     def _send_response(self, response: requests.Response) -> None:
         """Send response back to client with graceful error handling."""
+        # Always log backend response status for debugging
+        self.logger.info(
+            "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
+            response.status_code,
+            response.reason,
+            response.headers.get("Transfer-Encoding", "none"),
+            response.headers.get("Content-Length", "none"),
+        )
+
         if self.logger.isEnabledFor(logging.DEBUG):
             self._log_response_details(response)
 
@@ -209,6 +218,9 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         try:
             # Send status line and headers
             self._send_response_headers(response)
+
+            # Log before attempting to stream body
+            self.logger.debug("Starting to stream response body...")
 
             # Stream response body
             bytes_sent, chunks_sent = self._stream_response_body(response)
@@ -223,6 +235,21 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         except (BrokenPipeError, ConnectionResetError) as e:
             self.logger.debug(
                 "Client disconnected (%s) - sent %d bytes", type(e).__name__, bytes_sent
+            )
+        except requests.exceptions.ChunkedEncodingError as e:
+            # Backend closed connection during chunked transfer
+            self.logger.error(
+                "Backend streaming failed (ChunkedEncodingError): %s | "
+                "Backend status: %d %s | Transfer-Encoding: %s | "
+                "Content-Length: %s | Bytes sent to client: %d | Chunks sent: %d",
+                str(e),
+                response.status_code,
+                response.reason,
+                response.headers.get("Transfer-Encoding", "none"),
+                response.headers.get("Content-Length", "none"),
+                bytes_sent,
+                chunks_sent,
+                exc_info=True,
             )
         except Exception as e:
             self.logger.error(
@@ -287,12 +314,34 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         bytes_sent = 0
         chunks_sent = 0
 
-        for chunk in response.iter_content(chunk_size=8192):
+        try:
+            chunk_iterator = response.iter_content(chunk_size=8192)
+            self.logger.debug("Created chunk iterator, starting to read chunks...")
+        except Exception as e:
+            self.logger.error(
+                "Failed to create chunk iterator: %s | Response status: %d",
+                str(e),
+                response.status_code,
+            )
+            raise
+
+        for chunk in chunk_iterator:
             if not chunk:
                 continue
 
+            # Log first chunk receipt for debugging
+            if chunks_sent == 0:
+                self.logger.info(
+                    "Received first chunk from backend: %d bytes", len(chunk)
+                )
+
             # Check client connection
-            if not self._is_client_connected():
+            client_connected = self._is_client_connected()
+            if chunks_sent == 0:
+                self.logger.debug(
+                    "Client connection check (first chunk): %s", client_connected
+                )
+            if not client_connected:
                 self.logger.debug(
                     "Client disconnected - stopping (sent %d bytes in %d chunks)",
                     bytes_sent,
@@ -323,11 +372,20 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
     def _is_client_connected(self) -> bool:
         """Check if client connection is still active."""
         try:
-            return (
-                hasattr(self.client, "connection")
-                and self.client.connection is not None
+            has_connection_attr = hasattr(self.client, "connection")
+            if not has_connection_attr:
+                self.logger.debug("Client has no 'connection' attribute")
+                return False
+
+            connection_not_none = self.client.connection is not None
+            self.logger.debug(
+                "Client connection check: has_attr=%s, not_none=%s",
+                has_connection_attr,
+                connection_not_none,
             )
-        except Exception:
+            return connection_not_none
+        except Exception as e:
+            self.logger.debug("Client connection check exception: %s", e)
             return False
 
     def _send_error(
