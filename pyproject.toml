@@ -12,6 +12,7 @@ proxy-py = "^2"
 pyjwt = "^2"
 requests = "^2"
 json5 = "^0"
+nested-property = "^1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9"
@@ -23,6 +24,11 @@ pylint = "^4"
 commitizen = "^4"
 pre-commit = "^4"
 types-requests = "^2"
+
+[[tool.poetry.source]]
+name = "mirrors"
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/"
+priority = "primary"
 
 [tool.poetry.scripts]
 flow-proxy = "flow_proxy_plugin.cli:main"
