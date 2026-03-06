@@ -52,11 +52,11 @@ class RequestFilter:
             FilterRule(
                 name="Anthropic Messages API",
                 matcher=self._is_anthropic_messages_request,
-                # body_params_to_remove=[
-                #     "context_management",
-                #     "tools.0.custom.defer_loading",  # explicit index (nested-property)
-                #     "tools.*.custom.defer_loading",  # all tools
-                # ],
+                body_params_to_remove=[
+                    "context_management",
+                    # "tools.0.custom.defer_loading",  # explicit index (nested-property)
+                    # "tools.*.custom.defer_loading",  # all tools
+                ],
                 headers_to_remove=["anthropic-beta"],
             )
         ]
