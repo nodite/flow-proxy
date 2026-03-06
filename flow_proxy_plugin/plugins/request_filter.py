@@ -5,6 +5,9 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from nested_property import delete as nested_delete
+from nested_property import get as nested_get
+from nested_property import has as nested_has
 from proxy.http.parser import HttpParser
 
 
@@ -49,7 +52,11 @@ class RequestFilter:
             FilterRule(
                 name="Anthropic Messages API",
                 matcher=self._is_anthropic_messages_request,
-                body_params_to_remove=["context_management"],
+                body_params_to_remove=[
+                    "context_management",
+                    # "tools.0.custom.defer_loading",  # explicit index (nested-property)
+                    # "tools.*.custom.defer_loading",  # all tools
+                ],
                 headers_to_remove=["anthropic-beta"],
             )
         ]
@@ -134,14 +141,66 @@ class RequestFilter:
 
         return filtered_path
 
+    def _delete_nested_param(self, data: dict | list, path: str) -> bool:
+        """Delete a parameter by dotted path using nested-property.
+
+        Supports:
+        - Explicit index: tools.0.custom.defer_loading (numeric segment = list index)
+        - Wildcard: tools.*.custom.defer_loading (remove from every element in tools)
+
+        Args:
+            data: Root dict or list (modified in place)
+            path: Dotted path, e.g. tools.0.custom.defer_loading or tools.*.custom.defer_loading
+
+        Returns:
+            True if at least one deletion was performed
+        """
+        if ".*." in path:
+            return self._delete_nested_param_wildcard(data, path)
+        if not nested_has(data, path):
+            return False
+        try:
+            nested_delete(data, path)
+            return True
+        except (KeyError, IndexError, TypeError):
+            return False
+
+    def _delete_nested_param_wildcard(self, data: dict | list, path: str) -> bool:
+        """Delete from each element of an array using nested-property.
+
+        E.g. tools.*.custom.defer_loading: get list at "tools", then for each
+        item call nested_property delete(item, "custom.defer_loading").
+        """
+        prefix, _, suffix = path.partition(".*.")
+        if not prefix or not suffix:
+            return False
+        try:
+            parent = nested_get(data, prefix)
+        except (KeyError, IndexError, TypeError):
+            return False
+        if not isinstance(parent, list):
+            return False
+        any_removed = False
+        for item in parent:
+            if nested_has(item, suffix):
+                try:
+                    nested_delete(item, suffix)
+                    any_removed = True
+                except (KeyError, IndexError, TypeError):
+                    pass
+        return any_removed
+
     def filter_body_params(
         self, body: bytes | None, params_to_remove: list[str]
     ) -> bytes | None:
         """Filter parameters from JSON request body.
 
+        Supports top-level keys, dotted paths (e.g. tools.0.custom.defer_loading),
+        and wildcard paths (e.g. tools.*.custom.defer_loading for every tool).
+
         Args:
             body: Original request body
-            params_to_remove: List of parameter names to remove
+            params_to_remove: List of parameter names or dotted paths to remove
 
         Returns:
             Filtered request body
@@ -154,10 +213,14 @@ class RequestFilter:
             body_str = body.decode("utf-8")
             data = json.loads(body_str)
 
-            # Remove parameters
+            # Remove parameters (top-level or nested via dotted path)
             filtered = False
             for param in params_to_remove:
-                if param in data:
+                if "." in param:
+                    if self._delete_nested_param(data, param):
+                        filtered = True
+                        self.logger.debug("Filtered body parameter: %s", param)
+                elif param in data:
                     del data[param]
                     filtered = True
                     self.logger.debug("Filtered body parameter: %s", param)
