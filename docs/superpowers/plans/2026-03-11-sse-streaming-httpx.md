@@ -1,68 +1,319 @@
+# SSE 实时流式传输（httpx 替换 requests）实施计划
+
+> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 将 Reverse Proxy 模式的 HTTP 客户端从 `requests` 替换为 `httpx`，消除 SSE 流式响应的缓冲延迟和中断问题。
+
+**Architecture:** 修改 `FlowProxyWebServerPlugin`，用 `httpx.Client().stream()` 上下文管理器替换 `requests.request(..., stream=True)`，使用 `iter_bytes()` 零缓冲透传响应体，并修复 SSE 响应头缺失问题。
+
+**Tech Stack:** Python 3.12+, httpx ^0.28, proxy-py ^2, pytest
+
+---
+
+## Chunk 1: 依赖变更与基础迁移
+
+> **执行顺序**：先执行 Task 1（依赖），然后执行 Chunk 2 的 Task 3 Steps 1–4（写测试/确认红灯），再回来执行 Task 2（生产代码），最后执行 Task 3 Steps 5–7（确认绿灯）。
+
+### Task 1: 替换 pyproject.toml 依赖
+
+**Files:**
+- Modify: `pyproject.toml`
+
+- [ ] **Step 1: 更新 pyproject.toml**
+
+在 `[tool.poetry.dependencies]` 中用 `httpx` 替换 `requests`，在 `[tool.poetry.group.dev.dependencies]` 中移除 `types-requests`：
+
+```toml
+[tool.poetry.dependencies]
+python = "^3.12"
+proxy-py = "^2"
+pyjwt = "^2"
+httpx = "^0.28"
+json5 = "^0"
+nested-property = "^1"
+```
+
+dev 依赖中删除这一行：
+```toml
+types-requests = "^2"
+```
+
+- [ ] **Step 2: 安装新依赖**
+
+```bash
+poetry add httpx
+poetry remove requests
+poetry remove --group dev types-requests
+```
+
+预期输出：`httpx` 已添加，`requests` 和 `types-requests` 各自移除，`poetry.lock` 已更新。
+
+- [ ] **Step 3: 确认安装**
+
+```bash
+poetry run python -c "import httpx; print(httpx.__version__)"
+```
+
+预期：打印出 httpx 版本号（如 `0.28.x`）。
+
+---
+
+### Task 2: 重写 `web_server_plugin.py` 核心逻辑
+
+**Files:**
+- Modify: `flow_proxy_plugin/plugins/web_server_plugin.py`
+
+这是本次改动的主体。逐步替换，保持测试通过。
+
+- [ ] **Step 1: 替换 import**
+
+将文件顶部的：
+```python
+import requests
+```
+替换为：
+```python
+import httpx
+```
+
+同时将方法签名中所有 `requests.Response` 类型注解替换为 `httpx.Response`（涉及 `_send_response`、`_log_response_details`、`_send_response_headers`、`_stream_response_body`、`_log_request_details` 的 `body` 参数类型不变）。
+
+- [ ] **Step 2: 重写 `_forward_request` 和 `handle_request`**
+
+将 `_forward_request` 的返回值从 `requests.Response` 改为不再返回 response 对象，而是将整个流式转发逻辑内联到 `handle_request` 中，通过 `with httpx.Client() as client: with client.stream(...)` 包裹。
+
+新的 `handle_request`：
+
+```python
+def handle_request(self, request: HttpParser) -> None:
+    """Handle web server request."""
+    method = self._decode_bytes(request.method) if request.method else "GET"
+    path = self._decode_bytes(request.path) if request.path else "/"
+
+    self.logger.info("→ %s %s", method, path)
+
+    try:
+        _, config_name, jwt_token = self._get_config_and_token()
+
+        # Build request params
+        filter_rule = self.request_filter.find_matching_rule(request, path)
+        if filter_rule:
+            path = self.request_filter.filter_query_params(
+                path, filter_rule.query_params_to_remove
+            )
+
+        target_url = f"{self.request_forwarder.target_base_url}{path}"
+        headers = self._build_headers(request, jwt_token, filter_rule)
+        body = self._get_request_body(request, filter_rule)
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self._log_request_details(method, path, target_url, headers, body)
+
+        self.logger.info("Sending request to backend: %s", target_url)
+
+        timeout = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
+
+        with httpx.Client() as client:
+            with client.stream(
+                method=method,
+                url=target_url,
+                headers=headers,
+                content=body,
+                timeout=timeout,
+            ) as response:
+                self.logger.info(
+                    "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
+                    response.status_code,
+                    response.reason_phrase,
+                    response.headers.get("transfer-encoding", "none"),
+                    response.headers.get("content-length", "none"),
+                )
+
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self._log_response_details(response)
+
+                self._send_response_headers(response)
+                self._stream_response_body(response)
+
+                log_func = (
+                    self.logger.info
+                    if response.status_code < 400
+                    else self.logger.warning
+                )
+                log_func(
+                    "← %d %s [%s]",
+                    response.status_code,
+                    response.reason_phrase,
+                    config_name,
+                )
+
+    except (BrokenPipeError, ConnectionResetError) as e:
+        self.logger.debug("Client disconnected (%s)", type(e).__name__)
+    except httpx.RemoteProtocolError as e:
+        self.logger.error(
+            "Backend streaming failed (RemoteProtocolError): %s",
+            str(e),
+            exc_info=True,
+        )
+    except Exception as e:
+        self.logger.error("✗ Request failed: %s", str(e), exc_info=True)
+        self._send_error()
+```
+
+删除 `_forward_request` 方法（逻辑已内联）。
+
+- [ ] **Step 3: 重写 `_send_response_headers`**
+
+接收 `httpx.Response`，修复 SSE 响应头：
+
+```python
+def _send_response_headers(self, response: httpx.Response) -> None:
+    """Send HTTP status line and headers."""
+    is_sse = "text/event-stream" in response.headers.get("content-type", "")
+
+    # Status line
+    status_line = f"HTTP/1.1 {response.status_code} {response.reason_phrase}\r\n"
+    self.client.queue(memoryview(status_line.encode()))
+
+    # Headers
+    skip_headers = {"connection"}
+    if not is_sse:
+        skip_headers.add("transfer-encoding")
+
+    for name, value in response.headers.items():
+        if name.lower() not in skip_headers:
+            self.client.queue(memoryview(f"{name}: {value}\r\n".encode()))
+
+    # SSE-specific headers to prevent intermediate proxy buffering
+    if is_sse:
+        self.client.queue(memoryview(b"Cache-Control: no-cache\r\n"))
+        self.client.queue(memoryview(b"X-Accel-Buffering: no\r\n"))
+
+    # End of headers
+    self.client.queue(memoryview(b"\r\n"))
+```
+
+- [ ] **Step 4: 重写 `_stream_response_body`**
+
+使用 `httpx.Response` 和 `iter_bytes()` 零缓冲透传：
+
+```python
+def _stream_response_body(self, response: httpx.Response) -> tuple[int, int]:
+    """Stream response body to client.
+
+    Returns:
+        Tuple of (bytes_sent, chunks_sent)
+    """
+    bytes_sent = 0
+    chunks_sent = 0
+
+    for chunk in response.iter_bytes():
+        if not chunk:
+            continue
+
+        if chunks_sent == 0:
+            self.logger.info(
+                "Received first chunk from backend: %d bytes", len(chunk)
+            )
+
+        if not self._is_client_connected():
+            self.logger.debug(
+                "Client disconnected - stopping (sent %d bytes in %d chunks)",
+                bytes_sent,
+                chunks_sent,
+            )
+            break
+
+        try:
+            self.client.queue(memoryview(chunk))
+            bytes_sent += len(chunk)
+            chunks_sent += 1
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            if isinstance(e, OSError) and e.errno != 32:
+                self.logger.warning("OS error during streaming: %s", e)
+            else:
+                self.logger.debug(
+                    "Client disconnected during streaming - sent %d bytes",
+                    bytes_sent,
+                )
+            break
+
+    if chunks_sent > 0:
+        self.logger.debug(
+            "Streaming completed: %d bytes in %d chunks", bytes_sent, chunks_sent
+        )
+
+    return bytes_sent, chunks_sent
+```
+
+注意：移除 `flush()` 调用，移除 `finally: response.close()`（httpx 上下文管理器自动处理）。
+
+- [ ] **Step 5: 重写 `_log_response_details`**
+
+更新类型注解，`response.reason` → `response.reason_phrase`：
+
+```python
+def _log_response_details(self, response: httpx.Response) -> None:
+    """Log detailed response information in DEBUG mode."""
+    self.logger.debug("Response: %d %s", response.status_code, response.reason_phrase)
+    self.logger.debug("  Response Headers: %s", dict(response.headers))
+
+    content_type = response.headers.get("content-type", "unknown")
+    if "text/event-stream" in content_type:
+        self.logger.debug("  Response Body: <SSE streaming response>")
+    else:
+        content_length = response.headers.get("content-length", "unknown")
+        self.logger.debug(
+            "  Response Body: Content-Type=%s, Content-Length=%s",
+            content_type,
+            content_length,
+        )
+```
+
+- [ ] **Step 6: 删除已废弃的 `_send_response` 方法**
+
+`_send_response` 方法的逻辑已拆分到 `handle_request`（头部日志）、`_send_response_headers`、`_stream_response_body` 中，删除原方法。
+
+- [ ] **Step 7: 运行 linter 检查**
+
+```bash
+cd /Users/kang/Projects/flow-proxy && poetry run ruff check flow_proxy_plugin/plugins/web_server_plugin.py
+```
+
+预期：无错误。如有 import 顺序问题，运行 `poetry run ruff format flow_proxy_plugin/plugins/web_server_plugin.py`。
+
+---
+
+## Chunk 2: TDD — 先写测试，再实现
+
+**TDD 原则**：先写新测试（会失败），再实现生产代码使其通过。
+
+### Task 3: 重写 `test_web_server_plugin.py`
+
+**Files:**
+- Modify: `tests/test_web_server_plugin.py`
+
+- [ ] **Step 1: 替换 import 和添加公共测试工具函数**
+
+将文件顶部替换为：
+
+```python
 """Unit tests for FlowProxyWebServerPlugin."""
 
-from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any
-from unittest.mock import MagicMock, Mock, patch
+from typing import Any, Generator
+from unittest.mock import Mock, patch
 
 import httpx
 import pytest
 from proxy.http.parser import HttpParser
 
 from flow_proxy_plugin.plugins.web_server_plugin import FlowProxyWebServerPlugin
+```
 
+在 `plugin` fixture 之后（类定义之前）添加公共 mock 工具函数：
 
-@pytest.fixture
-def mock_plugin_args() -> dict[str, Any]:
-    """Create mock arguments for plugin initialization."""
-    flags = Mock()
-    flags.ca_cert_dir = None
-    flags.ca_signing_key_file = None
-    flags.ca_cert_file = None
-    flags.ca_key_file = None
-    flags.log_level = "INFO"
-
-    client = Mock()
-    client.connection = Mock()  # Mock connection for _is_client_connected
-    event_queue = Mock()
-
-    return {
-        "uid": "test-uid",
-        "flags": flags,
-        "client": client,
-        "event_queue": event_queue,
-    }
-
-
-@pytest.fixture
-def plugin(mock_plugin_args: dict[str, Any]) -> FlowProxyWebServerPlugin:
-    """Create a plugin instance for testing."""
-    # Clear shared state before test
-    from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
-
-    SharedComponentManager().reset()
-
-    with patch(
-        "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
-    ) as mock_load:
-        mock_load.return_value = [
-            {
-                "name": "test-config-1",
-                "clientId": "test-client-1",
-                "clientSecret": "test-secret-1",
-                "tenant": "test-tenant-1",
-            },
-            {
-                "name": "test-config-2",
-                "clientId": "test-client-2",
-                "clientSecret": "test-secret-2",
-                "tenant": "test-tenant-2",
-            },
-        ]
-
-        return FlowProxyWebServerPlugin(**mock_plugin_args)
-
-
+```python
 def make_mock_httpx_response(
     status_code: int = 200,
     reason_phrase: str = "OK",
@@ -92,13 +343,13 @@ def mock_httpx_stream(
     _get_config_and_token (so JWT generation is bypassed and the happy path is
     actually exercised, not the exception fallback).
     """
-    mock_response = MagicMock()
+    mock_response = Mock(spec=httpx.Response)
     mock_response.status_code = status_code
     mock_response.reason_phrase = reason_phrase
     mock_response.headers = httpx.Headers({"content-type": content_type})
     mock_response.iter_bytes.return_value = iter(chunks or [])
-    mock_response.__enter__.return_value = mock_response
-    mock_response.__exit__.return_value = False
+    mock_response.__enter__ = Mock(return_value=mock_response)
+    mock_response.__exit__ = Mock(return_value=False)
 
     mock_client = Mock()
     mock_client.stream.return_value = mock_response
@@ -112,134 +363,13 @@ def mock_httpx_stream(
         patch.object(plugin, "_get_config_and_token", return_value=mock_token_result),
     ):
         yield mock_response
+```
 
+- [ ] **Step 2: 删除 `TestSendResponse` 测试类，重写为 `TestSendResponseHeaders` 和 `TestStreamResponseBody`**
 
-class TestFlowProxyWebServerPluginInitialization:
-    """Test FlowProxyWebServerPlugin initialization."""
+删除整个 `TestSendResponse` 类（测试的是已删除的 `_send_response` 方法），用以下两个类替代：
 
-    def test_plugin_initialization_success(
-        self, mock_plugin_args: dict[str, Any]
-    ) -> None:
-        """Test successful plugin initialization."""
-        # Clear shared state before test
-        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
-
-        SharedComponentManager().reset()
-
-        with patch(
-            "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
-        ) as mock_load:
-            mock_load.return_value = [
-                {
-                    "name": "test-config",
-                    "clientId": "test-client",
-                    "clientSecret": "test-secret",
-                    "tenant": "test-tenant",
-                }
-            ]
-
-            plugin = FlowProxyWebServerPlugin(**mock_plugin_args)
-
-            assert plugin is not None
-            assert plugin.secrets_manager is not None
-            assert plugin.load_balancer is not None
-            assert plugin.jwt_generator is not None
-            assert plugin.request_forwarder is not None
-            assert len(plugin.configs) == 1
-
-    def test_plugin_initialization_failure(
-        self, mock_plugin_args: dict[str, Any]
-    ) -> None:
-        """Test plugin initialization failure."""
-        # Clear shared state before test
-        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
-
-        SharedComponentManager().reset()
-
-        with patch(
-            "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
-        ) as mock_load:
-            mock_load.side_effect = FileNotFoundError("Secrets file not found")
-
-            with pytest.raises(FileNotFoundError):
-                FlowProxyWebServerPlugin(**mock_plugin_args)
-
-    def test_routes(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Test routes configuration."""
-        routes = plugin.routes()
-        assert len(routes) == 1
-        assert routes[0][1] == r"/.*"
-
-
-class TestConnectionStateCheck:
-    """Test connection state checking."""
-
-    def test_is_client_connected_true(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Test client connection check returns True when connected."""
-        mock_connection = Mock()
-        plugin.client = Mock(connection=mock_connection)
-        assert plugin._is_client_connected() is True
-
-    def test_is_client_connected_false_no_connection(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Test client connection check returns False when no connection."""
-        plugin.client = Mock(connection=None)
-        assert plugin._is_client_connected() is False
-
-    def test_is_client_connected_false_no_attribute(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Test client connection check returns False when attribute missing."""
-        delattr(plugin.client, "connection")
-        assert plugin._is_client_connected() is False
-
-    def test_is_client_connected_exception_handling(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Test client connection check handles exceptions."""
-        # Create a Mock that raises exception when accessing connection
-        mock_client = Mock()
-        type(mock_client).connection = property(
-            lambda self: (_ for _ in ()).throw(Exception("Test error"))
-        )
-        plugin.client = mock_client
-        assert plugin._is_client_connected() is False
-
-
-class TestPrepareHeaders:
-    """Test header preparation."""
-
-    def test_prepare_headers_basic(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Test basic header preparation."""
-        request = Mock(spec=HttpParser)
-        request.headers = {}
-
-        headers = plugin._prepare_headers(request, "test-jwt-token")
-
-        assert headers["Authorization"] == "Bearer test-jwt-token"
-        assert headers["Host"] == "flow.ciandt.com"
-
-    def test_prepare_headers_with_existing_headers(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Test header preparation with existing headers."""
-        request = Mock(spec=HttpParser)
-        request.headers = {
-            b"content-type": (b"application/json", b""),
-            b"user-agent": (b"test-agent", b""),
-            b"host": (b"old-host", b""),  # Should be skipped
-            b"authorization": (b"old-auth", b""),  # Should be skipped
-        }
-
-        headers = plugin._prepare_headers(request, "test-jwt-token")
-
-        assert headers["Authorization"] == "Bearer test-jwt-token"
-        assert headers["Host"] == "flow.ciandt.com"
-        assert headers["content-type"] == "application/json"
-        assert headers["user-agent"] == "test-agent"
-
-
+```python
 class TestSendResponseHeaders:
     """Test _send_response_headers with httpx.Response."""
 
@@ -414,38 +544,11 @@ class TestStreamResponseBody:
         plugin._stream_response_body(mock_response)
 
         assert queued_chunks == [b"chunk1", b"chunk2"]
+```
 
+- [ ] **Step 3: 重写 `TestHandleRequest` 测试类**
 
-class TestSendError:
-    """Test error response sending."""
-
-    def test_send_error_default(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Test sending default error response."""
-        mock_queue = Mock()
-        plugin.client = Mock(queue=mock_queue)
-
-        plugin._send_error()
-
-        mock_queue.assert_called_once()
-        call_args = mock_queue.call_args[0][0]
-        response_bytes = bytes(call_args)
-        assert b"500 Error" in response_bytes
-        assert b"Internal server error" in response_bytes
-
-    def test_send_error_custom(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Test sending custom error response."""
-        mock_queue = Mock()
-        plugin.client = Mock(queue=mock_queue)
-
-        plugin._send_error(status_code=404, message="Not found")
-
-        mock_queue.assert_called_once()
-        call_args = mock_queue.call_args[0][0]
-        response_bytes = bytes(call_args)
-        assert b"404 Error" in response_bytes
-        assert b"Not found" in response_bytes
-
-
+```python
 class TestHandleRequest:
     """Test handle_request with httpx mock."""
 
@@ -463,7 +566,7 @@ class TestHandleRequest:
             plugin.handle_request(request)
 
         # Status line (200 OK) must be queued
-        queued_calls = plugin.client.queue.call_args_list  # type: ignore[attr-defined]
+        queued_calls = plugin.client.queue.call_args_list
         all_bytes = b"".join(bytes(c[0][0]) for c in queued_calls)
         assert b"200" in all_bytes
 
@@ -563,6 +666,86 @@ class TestHandleRequest:
             plugin.handle_request(request)
 
         # Status line must be queued — confirms happy path was taken, not error path
-        queued_calls = plugin.client.queue.call_args_list  # type: ignore[attr-defined]
+        queued_calls = plugin.client.queue.call_args_list
         all_bytes = b"".join(bytes(c[0][0]) for c in queued_calls)
         assert b"200" in all_bytes
+```
+
+- [ ] **Step 4: 运行新测试，确认全部失败（TDD 红灯阶段）**
+
+```bash
+cd /Users/kang/Projects/flow-proxy && poetry run pytest tests/test_web_server_plugin.py -v 2>&1 | tail -30
+```
+
+预期：`TestSendResponseHeaders`、`TestStreamResponseBody`、`TestHandleRequest` 中的测试因代码尚未更新而 FAIL（`AttributeError: requests` 或 `AttributeError: _send_response_headers` 不接受 `httpx.Response`）。这是正确的起点，继续 Task 2 的实现步骤。
+
+- [ ] **Step 5: 完成 Task 2 的全部实现步骤后，运行测试确认全部通过**
+
+```bash
+cd /Users/kang/Projects/flow-proxy && poetry run pytest tests/test_web_server_plugin.py -v
+```
+
+预期：所有测试 PASS。
+
+- [ ] **Step 6: 运行完整测试套件确认无回归**
+
+```bash
+cd /Users/kang/Projects/flow-proxy && poetry run pytest -v
+```
+
+预期：所有测试 PASS。
+
+- [ ] **Step 7: Commit**
+
+```bash
+cd /Users/kang/Projects/flow-proxy && \
+git add flow_proxy_plugin/plugins/web_server_plugin.py \
+        tests/test_web_server_plugin.py \
+        pyproject.toml poetry.lock && \
+git commit -m "feat: replace requests with httpx for zero-buffering SSE streaming"
+```
+
+---
+
+## Chunk 3: 代码质量检查与收尾
+
+### Task 4: 全量 lint 检查
+
+**Files:**
+- 无新文件，检查已修改文件
+
+- [ ] **Step 1: 运行完整 lint**
+
+```bash
+cd /Users/kang/Projects/flow-proxy && make lint
+```
+
+预期：Ruff、MyPy、Pylint 均无报错。常见问题：
+- MyPy 找不到 `httpx` 类型 → httpx 自带 py.typed，应自动识别
+- Pylint `too-many-locals` → `handle_request` 有约 11 个局部变量，pylint 上限为 15，不应触发
+
+- [ ] **Step 2: 如有 lint 问题，逐一修复后重跑**
+
+```bash
+cd /Users/kang/Projects/flow-proxy && make lint
+```
+
+预期：Clean。
+
+- [ ] **Step 3: 运行覆盖率**
+
+```bash
+cd /Users/kang/Projects/flow-proxy && make test-cov
+```
+
+预期：`web_server_plugin.py` 覆盖率不低于改造前（原为 ~80% 左右）。
+
+- [ ] **Step 4: Commit lint 修复（如有）**
+
+```bash
+cd /Users/kang/Projects/flow-proxy && \
+git add -u && \
+git commit -m "fix: lint issues after httpx migration"
+```
+
+如无修复则跳过此步。

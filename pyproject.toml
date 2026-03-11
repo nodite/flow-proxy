@@ -10,9 +10,9 @@ packages = [{include = "flow_proxy_plugin"}]
 python = "^3.12"
 proxy-py = "^2"
 pyjwt = "^2"
-requests = "^2"
 json5 = "^0"
 nested-property = "^1"
+httpx = ">=0.28,<1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9"
@@ -23,7 +23,6 @@ mypy = "^1"
 pylint = "^4"
 commitizen = "^4"
 pre-commit = "^4"
-types-requests = "^2"
 
 [[tool.poetry.source]]
 name = "mirrors"

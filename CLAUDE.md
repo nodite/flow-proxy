@@ -96,34 +96,28 @@ The codebase follows a modular architecture built on top of the proxy.py framewo
 
 - **FlowProxyWebServerPlugin** (`web_server_plugin.py`): Reverse proxy mode implementation
   - Extends `HttpWebServerBasePlugin` from proxy.py
-  - Hook: `handle_client_request()` - processes direct HTTP requests
+  - Hook: `handle_request()` - processes direct HTTP requests
   - Provides web server endpoints for direct access
+
+### Request Filtering (`flow_proxy_plugin/plugins/request_filter.py`)
+
+- **RequestFilter**: Transforms requests before forwarding based on configurable rules
+  - **FilterRule**: Dataclass defining matcher + params/headers to strip
+  - Currently strips `context_management` body field and `anthropic-beta` header from Anthropic Messages API requests (`/v1/messages` with Anthropic headers)
+  - Supports dotted path deletion (e.g. `tools.0.custom.field`) and wildcard paths (`tools.*.custom.field`)
+  - To add a new rule: add a `FilterRule` to `_initialize_rules()` with a matcher function
 
 ### Utilities (`flow_proxy_plugin/utils/`)
 
-- **logging.py**: Centralized logging configuration
-  - Sets up file and console handlers
-  - Configures log rotation and formatting
-  - Initializes log cleanup scheduler
-
-- **log_cleaner.py**: Automatic log file cleanup
-  - Runs on a scheduled interval (configurable via env vars)
-  - Removes logs older than retention period
-  - Monitors total log directory size
-
-- **log_filter.py**: Log message filtering
-  - Filters out noisy third-party library logs
-  - Customizable via environment variables
+- **plugin_base.py**: `SharedComponentManager` singleton — ensures `LoadBalancer` and `configs` are shared across all plugin instances in multi-threaded mode. `initialize_plugin_components()` is the entry point called by both plugins.
+- **logging.py**: Sets up colored console + rotating file handlers; file handler must be re-created in child processes after `fork()`
+- **log_cleaner.py**: Scheduled cleanup of old log files; configurable via env vars
+- **log_filter.py**: Suppresses noisy third-party log messages
 
 ### Error Handling
 
-- **ErrorHandler** (`error_handler.py`): Structured error responses
-  - Defines ErrorCode enum for different error types
-  - Creates standardized error response structures
-
-- **NetworkErrorHandler** (`network_error_handler.py`): Network-specific error handling
-  - Wraps network operations with retry logic
-  - Handles timeouts and connection errors
+- **ErrorHandler** (`flow_proxy_plugin/error_handler.py`): Structured error responses with `ErrorCode` enum
+- **NetworkErrorHandler** (`flow_proxy_plugin/network_error_handler.py`): Retry logic for network operations
 
 ## Configuration
 
@@ -149,6 +143,10 @@ All environment variables are prefixed with `FLOW_PROXY_`:
 - `FLOW_PROXY_LOG_LEVEL=INFO`: Logging level
 - `FLOW_PROXY_SECRETS_FILE=secrets.json`: Path to secrets file
 - `FLOW_PROXY_LOG_DIR=logs`: Log directory
+- `FLOW_PROXY_LOG_CLEANUP_ENABLED=true`: Enable automatic log cleanup
+- `FLOW_PROXY_LOG_RETENTION_DAYS=7`: Log retention period
+- `FLOW_PROXY_LOG_CLEANUP_INTERVAL_HOURS=24`: Cleanup check interval
+- `FLOW_PROXY_LOG_MAX_SIZE_MB=100`: Max log directory size before forced cleanup
 
 ## Testing Guidelines
 
@@ -202,26 +200,24 @@ Configured in `.pre-commit-config.yaml`:
 
 ## Key Design Patterns
 
-### Thread Safety
-All shared state components use `threading.Lock`:
-- JWTGenerator: Class-level lock for cache access
-- LoadBalancer: Instance lock for index/state modifications
+### Shared State Across Plugin Instances
+`SharedComponentManager` (in `utils/plugin_base.py`) is a thread-safe singleton that ensures `LoadBalancer` and `configs` are shared across all plugin instances. Both proxy modes call `initialize_plugin_components()` which returns the same `LoadBalancer` instance — critical for correct round-robin behavior across threads/processes.
 
-### Failover and Retry
-LoadBalancer provides automatic failover:
-```python
-with load_balancer.get_next_config_context() as config:
-    # If this block raises an exception, config is marked as failed
-    # Next call to get_next_config() will skip this config
-    jwt_token = jwt_generator.generate_token(config)
-```
+### Thread Safety
+- `JWTGenerator`: Class-level `threading.Lock` protecting the `_cache` dict
+- `LoadBalancer`: Instance lock for index and failed-config state
+- `SharedComponentManager`: Double-checked locking for singleton initialization
+
+### Failover
+`BaseFlowProxyPlugin._get_config_and_token()` handles failover: if JWT generation fails, the config is marked failed via `load_balancer.mark_config_failed()` and the next config is tried automatically.
+
+### Multi-process File Logging
+After `fork()`, file handlers from the parent process stop working. `setup_file_handler_for_child_process()` creates a fresh file handler in each child process.
 
 ### Plugin Architecture
 The plugin system uses proxy.py's plugin hooks:
-- **Forward proxy**: Intercepts `before_upstream_connection()`
-- **Reverse proxy**: Intercepts `handle_client_request()`
-
-Both modes share the same core components through `BaseFlowProxyPlugin`.
+- **Forward proxy** (`FlowProxyPlugin`): Intercepts `before_upstream_connection()` — handles both forward and reverse proxy requests by converting path-only URLs to full URLs before validation
+- **Reverse proxy** (`FlowProxyWebServerPlugin`): Intercepts `handle_request()` — uses `httpx.Client().stream()` for zero-buffering SSE streaming (connect=30s, read=600s); new `httpx.Client` per request call for fork safety
 
 ## Deployment
 
