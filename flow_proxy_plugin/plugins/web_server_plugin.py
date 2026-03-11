@@ -3,7 +3,7 @@
 import logging
 from typing import Any
 
-import requests
+import httpx
 from proxy.http.parser import HttpParser
 from proxy.http.server import HttpWebServerBasePlugin, httpProtocolTypes
 
@@ -38,66 +38,71 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         self.logger.info("→ %s %s", method, path)
 
         try:
-            # Get config and token
             _, config_name, jwt_token = self._get_config_and_token()
 
-            # Forward request
-            response = self._forward_request(request, method, path, jwt_token)
+            # Build request params
+            filter_rule = self.request_filter.find_matching_rule(request, path)
+            if filter_rule:
+                path = self.request_filter.filter_query_params(
+                    path, filter_rule.query_params_to_remove
+                )
 
-            # Send response
-            self._send_response(response)
+            target_url = f"{self.request_forwarder.target_base_url}{path}"
+            headers = self._build_headers(request, jwt_token, filter_rule)
+            body = self._get_request_body(request, filter_rule)
 
-            # Log result
-            log_func = (
-                self.logger.info if response.status_code < 400 else self.logger.warning
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self._log_request_details(method, path, target_url, headers, body)
+
+            self.logger.info("Sending request to backend: %s", target_url)
+
+            timeout = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
+
+            with httpx.Client() as client:
+                with client.stream(
+                    method=method,
+                    url=target_url,
+                    headers=headers,
+                    content=body,
+                    timeout=timeout,
+                ) as response:
+                    self.logger.info(
+                        "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
+                        response.status_code,
+                        response.reason_phrase,
+                        response.headers.get("transfer-encoding", "none"),
+                        response.headers.get("content-length", "none"),
+                    )
+
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self._log_response_details(response)
+
+                    self._send_response_headers(response)
+                    self._stream_response_body(response)
+
+                    log_func = (
+                        self.logger.info
+                        if response.status_code < 400
+                        else self.logger.warning
+                    )
+                    log_func(
+                        "← %d %s [%s]",
+                        response.status_code,
+                        response.reason_phrase,
+                        config_name,
+                    )
+
+        except (BrokenPipeError, ConnectionResetError) as e:
+            self.logger.debug("Client disconnected (%s)", type(e).__name__)
+        except httpx.RemoteProtocolError as e:
+            self.logger.error(
+                "Backend streaming failed (RemoteProtocolError): %s",
+                str(e),
+                exc_info=True,
             )
-            log_func("← %d %s [%s]", response.status_code, response.reason, config_name)
-
         except Exception as e:
             self.logger.error("✗ Request failed: %s", str(e), exc_info=True)
             self._send_error()
-
-    def _forward_request(
-        self, request: HttpParser, method: str, path: str, jwt_token: str
-    ) -> requests.Response:
-        """Forward request to upstream server with filtering.
-
-        Args:
-            request: Original HTTP request
-            method: HTTP method
-            path: Request path
-            jwt_token: JWT token for authentication
-
-        Returns:
-            Response from upstream server
-        """
-        # Find matching filter rule
-        filter_rule = self.request_filter.find_matching_rule(request, path)
-
-        # Apply filtering if rule matches
-        if filter_rule:
-            path = self.request_filter.filter_query_params(
-                path, filter_rule.query_params_to_remove
-            )
-
-        target_url = f"{self.request_forwarder.target_base_url}{path}"
-        headers = self._build_headers(request, jwt_token, filter_rule)
-        body = self._get_request_body(request, filter_rule)
-
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self._log_request_details(method, path, target_url, headers, body)
-
-        # Log the final URL being sent to backend
-        self.logger.info("Sending request to backend: %s", target_url)
-
-        return requests.request(
-            method=method,
-            url=target_url,
-            headers=headers,
-            data=body,
-            stream=True,
-            timeout=(30, 600),  # 30s connect, 600s read for streaming
-        )
 
     def _build_headers(
         self,
@@ -198,114 +203,50 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         else:
             self.logger.debug("  Body: None")
 
-    def _send_response(self, response: requests.Response) -> None:
-        """Send response back to client with graceful error handling."""
-        # Always log backend response status for debugging
-        self.logger.info(
-            "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
-            response.status_code,
-            response.reason,
-            response.headers.get("Transfer-Encoding", "none"),
-            response.headers.get("Content-Length", "none"),
-        )
-
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self._log_response_details(response)
-
-        bytes_sent = 0
-        chunks_sent = 0
-
-        try:
-            # Send status line and headers
-            self._send_response_headers(response)
-
-            # Log before attempting to stream body
-            self.logger.debug("Starting to stream response body...")
-
-            # Stream response body
-            bytes_sent, chunks_sent = self._stream_response_body(response)
-
-            if chunks_sent > 0:
-                self.logger.debug(
-                    "Streaming completed: %d bytes in %d chunks",
-                    bytes_sent,
-                    chunks_sent,
-                )
-
-        except (BrokenPipeError, ConnectionResetError) as e:
-            self.logger.debug(
-                "Client disconnected (%s) - sent %d bytes", type(e).__name__, bytes_sent
-            )
-        except requests.exceptions.ChunkedEncodingError as e:
-            # Backend closed connection during chunked transfer
-            self.logger.error(
-                "Backend streaming failed (ChunkedEncodingError): %s | "
-                "Backend status: %d %s | Transfer-Encoding: %s | "
-                "Content-Length: %s | Bytes sent to client: %d | Chunks sent: %d",
-                str(e),
-                response.status_code,
-                response.reason,
-                response.headers.get("Transfer-Encoding", "none"),
-                response.headers.get("Content-Length", "none"),
-                bytes_sent,
-                chunks_sent,
-                exc_info=True,
-            )
-        except Exception as e:
-            self.logger.error(
-                "Unexpected error streaming response: %s (sent %d bytes)",
-                e,
-                bytes_sent,
-                exc_info=True,
-            )
-        finally:
-            try:
-                response.close()
-            except Exception:
-                pass
-
-    def _log_response_details(self, response: requests.Response) -> None:
+    def _log_response_details(self, response: httpx.Response) -> None:
         """Log detailed response information in DEBUG mode."""
-        self.logger.debug("Response: %d %s", response.status_code, response.reason)
+        self.logger.debug(
+            "Response: %d %s", response.status_code, response.reason_phrase
+        )
         self.logger.debug("  Response Headers: %s", dict(response.headers))
 
-        # Try to peek at response body without consuming it
-        try:
-            # For streaming responses, we can't read the body without consuming it
-            # So we just log that it's a streaming response
-            if (
-                response.headers.get("Transfer-Encoding") == "chunked"
-                or "stream" in response.headers.get("Content-Type", "").lower()
-            ):
-                self.logger.debug("  Response Body: <streaming response>")
-            else:
-                # For non-streaming, we could read but need to be careful
-                # Since we're streaming anyway, just log the content type
-                content_type = response.headers.get("Content-Type", "unknown")
-                content_length = response.headers.get("Content-Length", "unknown")
-                self.logger.debug(
-                    "  Response Body: Content-Type=%s, Content-Length=%s",
-                    content_type,
-                    content_length,
-                )
-        except Exception as e:
-            self.logger.debug("  Response Body: <error reading: %s>", e)
+        content_type = response.headers.get("content-type", "unknown")
+        if "text/event-stream" in content_type:
+            self.logger.debug("  Response Body: <SSE streaming response>")
+        else:
+            content_length = response.headers.get("content-length", "unknown")
+            self.logger.debug(
+                "  Response Body: Content-Type=%s, Content-Length=%s",
+                content_type,
+                content_length,
+            )
 
-    def _send_response_headers(self, response: requests.Response) -> None:
+    def _send_response_headers(self, response: httpx.Response) -> None:
         """Send HTTP status line and headers."""
+        is_sse = "text/event-stream" in response.headers.get("content-type", "")
+
         # Status line
-        status_line = f"HTTP/1.1 {response.status_code} {response.reason}\r\n"
+        status_line = f"HTTP/1.1 {response.status_code} {response.reason_phrase}\r\n"
         self.client.queue(memoryview(status_line.encode()))
 
-        # Headers (skip connection and transfer-encoding)
+        # Headers
+        skip_headers = {"connection"}
+        if not is_sse:
+            skip_headers.add("transfer-encoding")
+
         for name, value in response.headers.items():
-            if name.lower() not in {"connection", "transfer-encoding"}:
+            if name.lower() not in skip_headers:
                 self.client.queue(memoryview(f"{name}: {value}\r\n".encode()))
+
+        # SSE-specific headers to prevent intermediate proxy buffering
+        if is_sse:
+            self.client.queue(memoryview(b"Cache-Control: no-cache\r\n"))
+            self.client.queue(memoryview(b"X-Accel-Buffering: no\r\n"))
 
         # End of headers
         self.client.queue(memoryview(b"\r\n"))
 
-    def _stream_response_body(self, response: requests.Response) -> tuple[int, int]:
+    def _stream_response_body(self, response: httpx.Response) -> tuple[int, int]:
         """Stream response body to client.
 
         Returns:
@@ -314,34 +255,16 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         bytes_sent = 0
         chunks_sent = 0
 
-        try:
-            chunk_iterator = response.iter_content(chunk_size=8192)
-            self.logger.debug("Created chunk iterator, starting to read chunks...")
-        except Exception as e:
-            self.logger.error(
-                "Failed to create chunk iterator: %s | Response status: %d",
-                str(e),
-                response.status_code,
-            )
-            raise
-
-        for chunk in chunk_iterator:
+        for chunk in response.iter_bytes():
             if not chunk:
                 continue
 
-            # Log first chunk receipt for debugging
             if chunks_sent == 0:
                 self.logger.info(
                     "Received first chunk from backend: %d bytes", len(chunk)
                 )
 
-            # Check client connection
-            client_connected = self._is_client_connected()
-            if chunks_sent == 0:
-                self.logger.debug(
-                    "Client connection check (first chunk): %s", client_connected
-                )
-            if not client_connected:
+            if not self._is_client_connected():
                 self.logger.debug(
                     "Client disconnected - stopping (sent %d bytes in %d chunks)",
                     bytes_sent,
@@ -353,12 +276,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 self.client.queue(memoryview(chunk))
                 bytes_sent += len(chunk)
                 chunks_sent += 1
-
-                if hasattr(self.client, "flush"):
-                    self.client.flush()
-
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                if isinstance(e, OSError) and e.errno != 32:  # Not broken pipe
+                if isinstance(e, OSError) and e.errno != 32:
                     self.logger.warning("OS error during streaming: %s", e)
                 else:
                     self.logger.debug(
@@ -366,6 +285,11 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                         bytes_sent,
                     )
                 break
+
+        if chunks_sent > 0:
+            self.logger.debug(
+                "Streaming completed: %d bytes in %d chunks", bytes_sent, chunks_sent
+            )
 
         return bytes_sent, chunks_sent
 
