@@ -26,9 +26,33 @@ Although `SharedComponentManager` prevents duplicate `LoadBalancer` / `configs` 
 - Logging setup runs exactly once per process, via ProcessServices
 - All shared state owned by one place: `ProcessServices`
 
+## Non-Goals
+
+- Changing proxy.py internals
+- Changing the external CLI interface
+- Changing JWT caching logic (already class-level and effective)
+
 ---
 
 ## Architecture
+
+### Request Lifecycle (After)
+
+```
+proxy.py calls: Plugin(uid, flags, client, event_queue, upstream_conn_pool)
+       ↓
+__new__  → returns pooled instance (or creates new via object.__new__)
+       ↓
+__init__ → if _pooled=True: no-op (return immediately)
+           if _pooled=False: HttpParentPlugin.__init__() + _init_services() + _pooled=True
+       ↓
+handle_request() / before_upstream_connection()
+       ↓
+on_client_connection_close()    ← FlowProxyWebServerPlugin
+on_upstream_connection_close()  ← FlowProxyPlugin (HttpProxyBasePlugin has no on_client_connection_close)
+       ↓
+PluginPool.release(self)
+```
 
 ### Component Map (After)
 
@@ -111,7 +135,11 @@ class ProcessServices:
             cls._instance = None
 ```
 
-**httpx.Client resilience**: If a `TransportError` occurs and the client is in a broken state, the error handler sets `_instance.http_client = None`. The next request that calls `ProcessServices.get()._get_http_client()` detects `None` and rebuilds.
+**Logging**: `_initialize()` calls `setup_colored_logger()`, `setup_file_handler_for_child_process()`, **and** `setup_proxy_log_filters(suppress_broken_pipe=True, suppress_proxy_noise=True)` once. All plugin instances share `ProcessServices.logger`. The `setup_proxy_log_filters` call must not be dropped during migration.
+
+**httpx.Client timeout**: centralized in `_initialize()`: `connect=30s, read=600s, write=30s, pool=30s`.
+
+**httpx.Client resilience**: `httpx.Client` is thread-safe for concurrent requests. On `TransportError`, the handler calls `ProcessServices.get().mark_http_client_dirty()` which closes the old client and sets `http_client = None`. The next call to `get_http_client()` atomically creates a fresh one under a dedicated `_client_lock`. In-flight streaming responses on the old client complete normally before GC.
 
 ---
 
@@ -143,6 +171,8 @@ class PluginPool(Generic[T]):
 ```
 
 **max_size**: Defaults to `64`, configurable via `FLOW_PROXY_PLUGIN_POOL_SIZE` env var. Matches the default proxy.py thread pool concurrency ceiling.
+
+**Avoiding infinite recursion**: `acquire()` must NOT call `cls(*args)` to create new instances — that re-enters `__new__` causing infinite recursion. Use `object.__new__(cls)` then call `.__init__()` manually.
 
 ---
 
@@ -207,7 +237,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         _web_pool.release(self)
 ```
 
-Same pattern applies to `FlowProxyPlugin`.
+**Note on release hooks**: `HttpWebServerBasePlugin` has `on_client_connection_close()`. `HttpProxyBasePlugin` does **not** — `FlowProxyPlugin` uses `on_upstream_connection_close()` instead (already exists in the current codebase).
 
 ---
 
@@ -219,6 +249,8 @@ Same pattern applies to `FlowProxyPlugin`.
 | `httpx.TransportError` in streaming | Mark `_services.http_client` as dirty; rebuild on next access |
 | Pool full | Instance dropped silently; GC handles cleanup |
 | `ProcessServices._initialize()` fails | Exception propagates to proxy.py connection handler; logged as fatal |
+| First-init failure (`_init_services()` raises) | `_pooled` remains `False` — instance never returned to pool, GC-collected normally |
+| Pool slot leak (hook not called by proxy.py on crash/timeout) | Pool fills to `max_size` and overflows gracefully — new instances created as throw-aways; no deadlock or starvation |
 
 ---
 
