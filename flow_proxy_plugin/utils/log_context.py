@@ -1,4 +1,12 @@
-"""Thread-local request context for log grouping."""
+"""Thread-local request context for log grouping.
+
+Known design limitation: components that create their own logger directly (e.g.
+LoadBalancer in unit tests without ProcessServices) will not carry a prefix when
+no request context is active — get_request_prefix() returns '' and the filter is a
+no-op. This is expected behaviour: startup logs and test-only logs emit without a
+prefix, while all in-request log lines (emitted inside handle_request /
+before_upstream_connection) carry [req_id][COMPONENT] prefixes.
+"""
 
 import threading
 from collections.abc import Iterator

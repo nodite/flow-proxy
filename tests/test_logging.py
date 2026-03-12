@@ -388,11 +388,14 @@ class TestSetupColoredLogger:
 
     def test_setup_colored_logger_default(self) -> None:
         """Test setup_colored_logger with default parameters."""
-        logger = logging.getLogger("test.logger")
+        logger = logging.getLogger("test.logger.default")
+        logger.handlers.clear()
+        logger.filters.clear()
         setup_colored_logger(logger)
 
         assert logger.level == logging.INFO
         assert len(logger.handlers) == 1
+        assert len(logger.filters) == 1
 
 
 class TestSetupFileHandlerForChildProcess:
