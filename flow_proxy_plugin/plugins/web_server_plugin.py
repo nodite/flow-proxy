@@ -358,8 +358,9 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         stats = StreamStats(start_time=time.perf_counter())
         try:
             if is_sse:
-                raise NotImplementedError("_stream_sse not yet implemented")
-            self._stream_bytes(response, stats)
+                self._stream_sse(response, stats)
+            else:
+                self._stream_bytes(response, stats)
         finally:
             stats.end_time = time.perf_counter()
             self._log_stream_stats(stats, is_sse)
@@ -389,6 +390,45 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 else:
                     self.logger.debug(
                         "Client disconnected during streaming - sent %d bytes",
+                        stats.bytes_sent,
+                    )
+                return  # completed stays False
+        stats.completed = True  # loop exhausted cleanly
+
+    def _stream_sse(self, response: httpx.Response, stats: StreamStats) -> None:
+        """Stream SSE response body to client, updating stats in place.
+
+        Uses iter_lines() (yields str) to iterate line-by-line.
+        Empty strings mark SSE event boundaries (\\n\\n separators).
+        Each non-empty line is encoded and queued as '<line>\\n'.
+        Each empty-string boundary is queued as b'\\n' and increments event_count.
+        chunks_sent counts non-empty lines only.
+        Sets stats.completed = True only when the iterator exhausts cleanly.
+        """
+        for line in response.iter_lines():
+            if line == "":
+                # SSE event boundary separator
+                data = b"\n"
+            else:
+                if stats.first_chunk_time is None:
+                    stats.first_chunk_time = time.perf_counter()
+                    self.logger.info(
+                        "Received first SSE line from backend: %d chars", len(line)
+                    )
+                data = (line + "\n").encode()
+            try:
+                self.client.queue(memoryview(data))
+                stats.bytes_sent += len(data)
+                if line == "":
+                    stats.event_count += 1  # count only after successful delivery
+                else:
+                    stats.chunks_sent += 1
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                if isinstance(e, OSError) and e.errno != 32:
+                    self.logger.warning("OS error during SSE streaming: %s", e)
+                else:
+                    self.logger.debug(
+                        "Client disconnected during SSE streaming - sent %d bytes",
                         stats.bytes_sent,
                     )
                 return  # completed stays False

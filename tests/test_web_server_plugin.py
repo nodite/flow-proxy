@@ -466,6 +466,142 @@ class TestStreamResponseBody:
         assert stats.chunks_sent == 2
 
 
+class TestSseStreamStats:
+    """Tests for _stream_response_body with SSE (text/event-stream) responses."""
+
+    def test_sse_stream_stats_event_count(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """Empty lines in iter_lines() mark event boundaries and increment event_count."""
+        # Two SSE events: "data: tok1\n\n" and "data: tok2\n\n"
+        lines = ["data: tok1", "", "data: tok2", ""]
+        mock_response = make_mock_httpx_response(
+            headers={"content-type": "text/event-stream"},
+            lines=lines,
+        )
+        plugin.client = Mock(queue=Mock())
+
+        stats = plugin._stream_response_body(mock_response)
+
+        assert stats.event_count == 2
+        assert stats.completed is True
+
+    def test_sse_stream_stats_chunks_sent_excludes_separators(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """chunks_sent counts non-empty lines only (not blank event separators)."""
+        lines = ["data: tok1", "", "data: tok2", ""]
+        mock_response = make_mock_httpx_response(
+            headers={"content-type": "text/event-stream"},
+            lines=lines,
+        )
+        plugin.client = Mock(queue=Mock())
+
+        stats = plugin._stream_response_body(mock_response)
+
+        assert stats.chunks_sent == 2  # two non-empty lines
+
+    def test_sse_stream_stats_bytes_sent_includes_separators(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """bytes_sent includes both data lines and blank separator newlines."""
+        lines = ["data: tok1", ""]
+        mock_response = make_mock_httpx_response(
+            headers={"content-type": "text/event-stream"},
+            lines=lines,
+        )
+        queued: list[bytes] = []
+        plugin.client = Mock(queue=lambda mv: queued.append(bytes(mv)))
+
+        stats = plugin._stream_response_body(mock_response)
+
+        total_queued = sum(len(b) for b in queued)
+        assert stats.bytes_sent == total_queued
+
+    def test_sse_stream_stats_ttft(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """ttft_ms measures time from start_time to first non-empty line."""
+        lines = ["data: tok1", ""]
+        mock_response = make_mock_httpx_response(
+            headers={"content-type": "text/event-stream"},
+            lines=lines,
+        )
+        plugin.client = Mock(queue=Mock())
+
+        time_values = [1000.0, 1000.042, 1003.292]
+        call_index = 0
+
+        def mock_perf_counter() -> float:
+            nonlocal call_index
+            val = time_values[call_index % len(time_values)]
+            call_index += 1
+            return val
+
+        with patch("flow_proxy_plugin.plugins.web_server_plugin.time") as mock_time:
+            mock_time.perf_counter.side_effect = mock_perf_counter
+            stats = plugin._stream_response_body(mock_response)
+
+        assert stats.ttft_ms is not None
+        assert abs(stats.ttft_ms - 42.0) < 1.0
+
+    def test_sse_stream_stats_duration(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """duration_ms is non-None and positive after a complete SSE stream."""
+        lines = ["data: tok1", "", "data: tok2", ""]
+        mock_response = make_mock_httpx_response(
+            headers={"content-type": "text/event-stream"},
+            lines=lines,
+        )
+        plugin.client = Mock(queue=Mock())
+
+        stats = plugin._stream_response_body(mock_response)
+
+        assert stats.duration_ms is not None
+        assert stats.duration_ms >= 0.0
+
+    def test_sse_stream_interrupted_on_broken_pipe(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """BrokenPipeError during SSE sets completed=False, end_time is set."""
+        lines = ["data: tok1", "", "data: tok2", ""]
+        mock_response = make_mock_httpx_response(
+            headers={"content-type": "text/event-stream"},
+            lines=lines,
+        )
+        call_count = 0
+
+        def queue_with_error(mv: memoryview) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 3:
+                raise BrokenPipeError()
+
+        plugin.client = Mock(queue=queue_with_error)
+
+        stats = plugin._stream_response_body(mock_response)  # must not raise
+
+        assert stats.completed is False
+        assert stats.end_time is not None
+        assert stats.bytes_sent > 0
+
+    def test_non_sse_stream_stats(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """Non-SSE path: event_count stays 0, bytes_sent and completed are correct."""
+        chunks = [b"chunk1", b"chunk2"]
+        mock_response = make_mock_httpx_response(chunks=chunks)  # default: application/json
+
+        plugin.client = Mock(queue=Mock())
+
+        stats = plugin._stream_response_body(mock_response)
+
+        assert stats.event_count == 0
+        assert stats.bytes_sent == sum(len(c) for c in chunks)
+        assert stats.completed is True
+
+
 class TestSendError:
     """Test error response sending."""
 
