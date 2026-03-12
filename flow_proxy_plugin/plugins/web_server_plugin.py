@@ -4,6 +4,7 @@ import logging
 import os
 import secrets
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -346,52 +347,87 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         # End of headers
         self.client.queue(memoryview(b"\r\n"))
 
-    def _stream_response_body(self, response: httpx.Response) -> tuple[int, int]:
-        """Stream response body to client.
+    def _stream_response_body(self, response: httpx.Response) -> StreamStats:
+        """Stream response body to client; returns stats for the completed stream.
 
-        Returns:
-            Tuple of (bytes_sent, chunks_sent)
+        stats.completed is set inside _stream_bytes/_stream_sse only when the
+        iterator exhausts cleanly. The dispatcher does not set it — this lets
+        disconnect-interrupted streams correctly have completed=False.
         """
-        bytes_sent = 0
-        chunks_sent = 0
+        is_sse = "text/event-stream" in response.headers.get("content-type", "")
+        stats = StreamStats(start_time=time.perf_counter())
+        try:
+            if is_sse:
+                self._stream_sse(response, stats)  # type: ignore[attr-defined]  # added in Task 7
+            else:
+                self._stream_bytes(response, stats)
+        finally:
+            stats.end_time = time.perf_counter()
+            self._log_stream_stats(stats, is_sse)
+        return stats
 
+    def _stream_bytes(self, response: httpx.Response, stats: StreamStats) -> None:
+        """Stream non-SSE response body to client, updating stats in place.
+
+        Sets stats.completed = True only if the iterator is exhausted without
+        interruption. Returns early (completed stays False) on disconnect.
+        """
         for chunk in response.iter_bytes():
             if not chunk:
                 continue
-
-            if chunks_sent == 0:
+            if stats.first_chunk_time is None:
+                stats.first_chunk_time = time.perf_counter()
                 self.logger.info(
                     "Received first chunk from backend: %d bytes", len(chunk)
                 )
-
-            if not self._is_client_connected():
-                self.logger.debug(
-                    "Client disconnected - stopping (sent %d bytes in %d chunks)",
-                    bytes_sent,
-                    chunks_sent,
-                )
-                break
-
             try:
                 self.client.queue(memoryview(chunk))
-                bytes_sent += len(chunk)
-                chunks_sent += 1
+                stats.bytes_sent += len(chunk)
+                stats.chunks_sent += 1
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 if isinstance(e, OSError) and e.errno != 32:
                     self.logger.warning("OS error during streaming: %s", e)
                 else:
                     self.logger.debug(
                         "Client disconnected during streaming - sent %d bytes",
-                        bytes_sent,
+                        stats.bytes_sent,
                     )
-                break
+                return  # completed stays False
+        stats.completed = True  # loop exhausted cleanly
 
-        if chunks_sent > 0:
-            self.logger.debug(
-                "Streaming completed: %d bytes in %d chunks", bytes_sent, chunks_sent
+    def _log_stream_stats(self, stats: StreamStats, is_sse: bool) -> None:
+        """Log a single summary line after streaming completes or is interrupted."""
+        if is_sse:
+            if stats.completed:
+                if stats.ttft_ms is not None:
+                    self.logger.info(
+                        "SSE stream complete: TTFT=%.0fms, duration=%.0fms, events=%d, bytes=%d",
+                        stats.ttft_ms,
+                        stats.duration_ms or 0.0,
+                        stats.event_count,
+                        stats.bytes_sent,
+                    )
+                else:
+                    self.logger.info(
+                        "SSE stream complete: no data received, bytes=%d", stats.bytes_sent
+                    )
+            else:
+                if stats.ttft_ms is not None:
+                    self.logger.info(
+                        "SSE stream interrupted: TTFT=%.0fms, events=%d, bytes=%d",
+                        stats.ttft_ms,
+                        stats.event_count,
+                        stats.bytes_sent,
+                    )
+                else:
+                    self.logger.info(
+                        "SSE stream interrupted: no data received, bytes=%d", stats.bytes_sent
+                    )
+        else:
+            prefix = "Stream complete" if stats.completed else "Stream interrupted"
+            self.logger.info(
+                "%s: bytes=%d, chunks=%d", prefix, stats.bytes_sent, stats.chunks_sent
             )
-
-        return bytes_sent, chunks_sent
 
     def _is_client_connected(self) -> bool:
         """Check if client connection is still active."""

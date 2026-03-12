@@ -365,28 +365,30 @@ class TestStreamResponseBody:
         mock_response = make_mock_httpx_response(chunks=chunks)
 
         queued_chunks: list[bytes] = []
-        plugin.client = Mock(
-            queue=lambda mv: queued_chunks.append(bytes(mv)),
-            connection=Mock(),
-        )
+        plugin.client = Mock(queue=lambda mv: queued_chunks.append(bytes(mv)))
 
-        plugin._stream_response_body(mock_response)
+        stats = plugin._stream_response_body(mock_response)
 
         assert queued_chunks == chunks
+        assert stats.chunks_sent == 3
+        assert stats.bytes_sent == sum(len(c) for c in chunks)
+        assert stats.completed is True
+        assert stats.event_count == 0  # non-SSE path never increments event_count
 
     def test_stops_when_client_disconnects(
         self, plugin: FlowProxyWebServerPlugin
     ) -> None:
-        """Streaming stops gracefully when client connection is lost."""
+        """Streaming stops gracefully when client disconnects on first write."""
         chunks = [b"chunk1", b"chunk2", b"chunk3"]
         mock_response = make_mock_httpx_response(chunks=chunks)
 
-        plugin.client = Mock(queue=Mock(), connection=None)  # disconnected
+        plugin.client = Mock(queue=Mock(side_effect=BrokenPipeError()))
 
-        bytes_sent, chunks_sent = plugin._stream_response_body(mock_response)
+        stats = plugin._stream_response_body(mock_response)
 
-        # No chunks should be sent (client was disconnected from the start)
-        assert chunks_sent == 0
+        assert stats.bytes_sent == 0
+        assert stats.completed is False
+        assert stats.end_time is not None
 
     def test_handles_broken_pipe_gracefully(
         self, plugin: FlowProxyWebServerPlugin
@@ -403,10 +405,10 @@ class TestStreamResponseBody:
             if call_count >= 2:
                 raise BrokenPipeError()
 
-        plugin.client = Mock(queue=queue_with_error, connection=Mock())
+        plugin.client = Mock(queue=queue_with_error)
 
-        # Must not raise
-        plugin._stream_response_body(mock_response)
+        stats = plugin._stream_response_body(mock_response)  # must not raise
+        assert stats.completed is False
 
     def test_handles_connection_reset_error_gracefully(
         self, plugin: FlowProxyWebServerPlugin
@@ -423,9 +425,10 @@ class TestStreamResponseBody:
             if call_count >= 2:
                 raise ConnectionResetError()
 
-        plugin.client = Mock(queue=queue_with_reset, connection=Mock())
+        plugin.client = Mock(queue=queue_with_reset)
 
-        plugin._stream_response_body(mock_response)  # must not raise
+        stats = plugin._stream_response_body(mock_response)  # must not raise
+        assert stats.completed is False
 
     def test_handles_os_error_errno_32_gracefully(
         self, plugin: FlowProxyWebServerPlugin
@@ -444,9 +447,10 @@ class TestStreamResponseBody:
                 err.errno = 32
                 raise err
 
-        plugin.client = Mock(queue=queue_with_oserror, connection=Mock())
+        plugin.client = Mock(queue=queue_with_oserror)
 
-        plugin._stream_response_body(mock_response)  # must not raise
+        stats = plugin._stream_response_body(mock_response)  # must not raise
+        assert stats.completed is False
 
     def test_skips_empty_chunks(self, plugin: FlowProxyWebServerPlugin) -> None:
         """Empty byte strings from iter_bytes() are skipped, not forwarded."""
@@ -454,14 +458,12 @@ class TestStreamResponseBody:
         mock_response = make_mock_httpx_response(chunks=chunks)
 
         queued_chunks: list[bytes] = []
-        plugin.client = Mock(
-            queue=lambda mv: queued_chunks.append(bytes(mv)),
-            connection=Mock(),
-        )
+        plugin.client = Mock(queue=lambda mv: queued_chunks.append(bytes(mv)))
 
-        plugin._stream_response_body(mock_response)
+        stats = plugin._stream_response_body(mock_response)
 
         assert queued_chunks == [b"chunk1", b"chunk2"]
+        assert stats.chunks_sent == 2
 
 
 class TestSendError:
