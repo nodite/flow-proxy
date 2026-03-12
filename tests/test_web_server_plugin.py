@@ -63,7 +63,6 @@ def mock_plugin_args() -> dict[str, Any]:
     flags.log_level = "INFO"
 
     client = Mock()
-    client.connection = Mock()  # Mock connection for _is_client_connected
     event_queue = Mock()
 
     return {
@@ -218,41 +217,6 @@ class TestFlowProxyWebServerPluginInitialization:
         assert len(routes) == 1
         assert routes[0][1] == r"/.*"
 
-
-class TestConnectionStateCheck:
-    """Test connection state checking."""
-
-    def test_is_client_connected_true(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Test client connection check returns True when connected."""
-        mock_connection = Mock()
-        plugin.client = Mock(connection=mock_connection)
-        assert plugin._is_client_connected() is True
-
-    def test_is_client_connected_false_no_connection(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Test client connection check returns False when no connection."""
-        plugin.client = Mock(connection=None)
-        assert plugin._is_client_connected() is False
-
-    def test_is_client_connected_false_no_attribute(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Test client connection check returns False when attribute missing."""
-        delattr(plugin.client, "connection")
-        assert plugin._is_client_connected() is False
-
-    def test_is_client_connected_exception_handling(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Test client connection check handles exceptions."""
-        # Create a Mock that raises exception when accessing connection
-        mock_client = Mock()
-        type(mock_client).connection = property(
-            lambda self: (_ for _ in ()).throw(Exception("Test error"))
-        )
-        plugin.client = mock_client
-        assert plugin._is_client_connected() is False
 
 
 class TestPrepareHeaders:

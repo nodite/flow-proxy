@@ -6,7 +6,8 @@
       "Bash(git commit:*)",
       "Bash(python3 -c \":*)",
       "Bash(make test:*)",
-      "Bash(make lint:*)"
+      "Bash(make lint:*)",
+      "Bash(python -m pytest:*)"
     ]
   }
 }

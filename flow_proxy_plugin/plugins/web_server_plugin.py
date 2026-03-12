@@ -468,25 +468,6 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 "%s: bytes=%d, chunks=%d", prefix, stats.bytes_sent, stats.chunks_sent
             )
 
-    def _is_client_connected(self) -> bool:
-        """Check if client connection is still active."""
-        try:
-            has_connection_attr = hasattr(self.client, "connection")
-            if not has_connection_attr:
-                self.logger.debug("Client has no 'connection' attribute")
-                return False
-
-            connection_not_none = self.client.connection is not None
-            self.logger.debug(
-                "Client connection check: has_attr=%s, not_none=%s",
-                has_connection_attr,
-                connection_not_none,
-            )
-            return connection_not_none
-        except Exception as e:
-            self.logger.debug("Client connection check exception: %s", e)
-            return False
-
     def _send_error(
         self, status_code: int = 500, message: str = "Internal server error"
     ) -> None:
