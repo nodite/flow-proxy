@@ -385,7 +385,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 stats.bytes_sent += len(chunk)
                 stats.chunks_sent += 1
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                if isinstance(e, OSError) and e.errno != 32:
+                if not isinstance(e, (BrokenPipeError, ConnectionResetError)) and e.errno != 32:
                     self.logger.warning("OS error during streaming: %s", e)
                 else:
                     self.logger.debug(
@@ -424,7 +424,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 else:
                     stats.chunks_sent += 1
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                if isinstance(e, OSError) and e.errno != 32:
+                if not isinstance(e, (BrokenPipeError, ConnectionResetError)) and e.errno != 32:
                     self.logger.warning("OS error during SSE streaming: %s", e)
                 else:
                     self.logger.debug(
