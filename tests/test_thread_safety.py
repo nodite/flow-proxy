@@ -4,6 +4,7 @@ import threading
 from collections import Counter
 
 from flow_proxy_plugin.core.load_balancer import LoadBalancer
+from flow_proxy_plugin.utils.plugin_pool import PluginPool
 
 
 class TestLoadBalancerThreadSafety:
@@ -225,3 +226,51 @@ class TestLoadBalancerThreadSafety:
 
         # Verify total requests matches
         assert lb.total_requests == len(configs_obtained)
+
+
+class FakePoolPlugin:
+    """Minimal plugin for pool thread-safety tests."""
+    _pooled: bool = False
+
+    def __init__(self, uid: str) -> None:
+        self.uid = uid
+        self._pooled = True
+
+    def _rebind(self, uid: str) -> None:
+        self.uid = uid
+
+    def _reset_request_state(self) -> None:
+        pass
+
+
+class TestPluginPoolThreadSafety:
+    """Concurrent acquire/release does not corrupt pool state."""
+
+    def test_concurrent_acquire_all_instances_valid(self) -> None:
+        """50 concurrent threads each get a valid FakePoolPlugin instance."""
+        pool = PluginPool(FakePoolPlugin, max_size=64)
+        results: list[FakePoolPlugin] = []
+        lock = threading.Lock()
+
+        def worker(n: int) -> None:
+            inst = pool.acquire(f"uid-{n}")
+            with lock:
+                results.append(inst)
+            pool.release(inst)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(results) == 50
+        assert all(isinstance(r, FakePoolPlugin) for r in results)
+
+    def test_pool_size_never_exceeds_max(self) -> None:
+        """Pool size stays at or below max_size under concurrent load."""
+        pool = PluginPool(FakePoolPlugin, max_size=8)
+        instances = [pool.acquire(f"uid-{i}") for i in range(20)]
+        for inst in instances:
+            pool.release(inst)
+        assert len(pool._pool) <= 8
