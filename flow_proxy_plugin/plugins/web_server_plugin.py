@@ -1,14 +1,22 @@
 """Web Server plugin for reverse proxy mode."""
 
 import logging
-from typing import Any
+import os
+import threading
+from typing import Any, Optional
 
 import httpx
 from proxy.http.parser import HttpParser
 from proxy.http.server import HttpWebServerBasePlugin, httpProtocolTypes
 
+from ..utils.plugin_pool import PluginPool
+from ..utils.process_services import ProcessServices
 from .base_plugin import BaseFlowProxyPlugin
-from .request_filter import FilterRule, RequestFilter
+from .request_filter import FilterRule
+
+_web_pool: Optional["PluginPool[FlowProxyWebServerPlugin]"] = None
+_web_pool_lock = threading.Lock()
+_WEB_POOL_SIZE = int(os.getenv("FLOW_PROXY_PLUGIN_POOL_SIZE", "64"))
 
 
 class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
@@ -18,13 +26,62 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
     them to Flow LLM Proxy with authentication.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    _log_once: bool = False  # Class variable: log initialization message only once
+
+    def __new__(  # pylint: disable=too-many-positional-arguments
+        cls,
+        uid: str,
+        flags: Any,
+        client: Any,
+        event_queue: Any,
+        upstream_conn_pool: Any = None,
+    ) -> "FlowProxyWebServerPlugin":
+        global _web_pool  # pylint: disable=global-statement
+        if _web_pool is None:
+            with _web_pool_lock:
+                if _web_pool is None:
+                    _web_pool = PluginPool(cls, max_size=_WEB_POOL_SIZE)
+        return _web_pool.acquire(uid, flags, client, event_queue, upstream_conn_pool)
+
+    def __init__(  # pylint: disable=too-many-positional-arguments
+        self,
+        uid: str,
+        flags: Any,
+        client: Any,
+        event_queue: Any,
+        upstream_conn_pool: Any = None,
+    ) -> None:
         """Initialize web server plugin."""
-        super().__init__(*args, **kwargs)
-        self._setup_logging()  # type: ignore[attr-defined]
-        self.logger.info("Initializing FlowProxyWebServerPlugin...")
-        self._initialize_components()  # type: ignore[attr-defined]
-        self.request_filter = RequestFilter(self.logger)
+        if self._pooled:
+            return  # Reuse: _rebind() already ran in pool.acquire()
+        # First-time initialization (runs exactly once per instance)
+        HttpWebServerBasePlugin.__init__(
+            self, uid, flags, client, event_queue, upstream_conn_pool
+        )
+        self._init_services()
+        self._pooled = True
+        if not FlowProxyWebServerPlugin._log_once:
+            FlowProxyWebServerPlugin._log_once = True
+            self.logger.info("FlowProxyWebServerPlugin initialized (pooled)")
+
+    def _rebind(  # pylint: disable=too-many-positional-arguments,arguments-differ
+        self,
+        uid: str,
+        flags: Any,
+        client: Any,
+        event_queue: Any,
+        upstream_conn_pool: Any = None,
+    ) -> None:
+        """Rebind proxy.py connection-specific state for pool reuse."""
+        HttpWebServerBasePlugin.__init__(
+            self, uid, flags, client, event_queue, upstream_conn_pool
+        )
+        self._pooled = True  # Ensure flag stays True
+
+    def on_client_connection_close(self) -> None:
+        """Return instance to pool when connection closes."""
+        if _web_pool is not None and self._pooled:
+            _web_pool.release(self)
 
     def routes(self) -> list[tuple[int, str]]:
         """Define routes that this plugin handles."""
@@ -56,41 +113,39 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
             self.logger.info("Sending request to backend: %s", target_url)
 
-            timeout = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
+            http_client = ProcessServices.get().http_client
+            with http_client.stream(
+                method=method,
+                url=target_url,
+                headers=headers,
+                content=body,
+                timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
+            ) as response:
+                self.logger.info(
+                    "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
+                    response.status_code,
+                    response.reason_phrase,
+                    response.headers.get("transfer-encoding", "none"),
+                    response.headers.get("content-length", "none"),
+                )
 
-            with httpx.Client() as client:
-                with client.stream(
-                    method=method,
-                    url=target_url,
-                    headers=headers,
-                    content=body,
-                    timeout=timeout,
-                ) as response:
-                    self.logger.info(
-                        "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
-                        response.status_code,
-                        response.reason_phrase,
-                        response.headers.get("transfer-encoding", "none"),
-                        response.headers.get("content-length", "none"),
-                    )
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self._log_response_details(response)
 
-                    if self.logger.isEnabledFor(logging.DEBUG):
-                        self._log_response_details(response)
+                self._send_response_headers(response)
+                self._stream_response_body(response)
 
-                    self._send_response_headers(response)
-                    self._stream_response_body(response)
-
-                    log_func = (
-                        self.logger.info
-                        if response.status_code < 400
-                        else self.logger.warning
-                    )
-                    log_func(
-                        "← %d %s [%s]",
-                        response.status_code,
-                        response.reason_phrase,
-                        config_name,
-                    )
+                log_func = (
+                    self.logger.info
+                    if response.status_code < 400
+                    else self.logger.warning
+                )
+                log_func(
+                    "← %d %s [%s]",
+                    response.status_code,
+                    response.reason_phrase,
+                    config_name,
+                )
 
         except (BrokenPipeError, ConnectionResetError) as e:
             self.logger.debug("Client disconnected (%s)", type(e).__name__)
