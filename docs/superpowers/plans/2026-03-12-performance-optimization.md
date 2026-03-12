@@ -893,7 +893,9 @@ The key changes needed:
 
 - [ ] **Step 1: Update `test_web_server_plugin.py` fixtures**
 
-Change the `plugin` fixture:
+Change the `plugin` fixture and `mock_httpx_stream` helper. The existing file has a module-level `mock_httpx_stream` context manager that patches `httpx.Client` — this must change to mock `mock_svc.http_client.stream` directly.
+
+**a) Replace the `plugin` fixture:**
 
 ```python
 # Before:
@@ -904,24 +906,79 @@ with patch("flow_proxy_plugin.core.config.SecretsManager.load_secrets") as mock_
     return FlowProxyWebServerPlugin(**mock_plugin_args)
 
 # After:
-import json
+import flow_proxy_plugin.plugins.web_server_plugin as ws_mod
 from flow_proxy_plugin.utils.process_services import ProcessServices
-ProcessServices.reset()
-# Write a real secrets.json to tmp_path and set env var, OR:
-with patch.object(ProcessServices, 'get') as mock_get:
-    mock_svc = MagicMock()
-    mock_svc.configs = [{"name": "test-config-1", ...}]
-    mock_svc.load_balancer = MagicMock()
-    mock_svc.jwt_generator = MagicMock()
-    mock_svc.request_forwarder = MagicMock()
-    mock_svc.request_forwarder.target_base_url = "https://flow.ciandt.com"
-    mock_svc.request_filter = RequestFilter(mock_svc.logger)
-    mock_svc.http_client = MagicMock()
-    mock_get.return_value = mock_svc
-    return FlowProxyWebServerPlugin(**mock_plugin_args)
+
+@pytest.fixture
+def mock_svc() -> MagicMock:
+    """Shared ProcessServices mock reused across fixtures and tests."""
+    svc = MagicMock()
+    svc.configs = [
+        {"name": "test-config-1", "clientId": "test-client-1",
+         "clientSecret": "test-secret-1", "tenant": "test-tenant-1"},
+    ]
+    svc.load_balancer = MagicMock()
+    svc.jwt_generator = MagicMock()
+    svc.request_forwarder = MagicMock()
+    svc.request_forwarder.target_base_url = "https://flow.ciandt.com"
+    svc.request_forwarder.validate_request.return_value = True
+    svc.request_filter = MagicMock()
+    svc.http_client = MagicMock()
+    return svc
+
+
+@pytest.fixture(autouse=True)
+def reset_state(mock_svc: MagicMock):
+    """Reset ProcessServices singleton and pool module vars before/after each test."""
+    ProcessServices.reset()
+    ws_mod._web_pool = None
+    yield
+    ProcessServices.reset()
+    ws_mod._web_pool = None
+
+
+@pytest.fixture
+def plugin(mock_plugin_args: dict, mock_svc: MagicMock) -> FlowProxyWebServerPlugin:
+    with patch.object(ProcessServices, "get", return_value=mock_svc):
+        yield FlowProxyWebServerPlugin(**mock_plugin_args)
 ```
 
-Update `mock_httpx_stream` context manager: instead of `patch("httpx.Client", ...)`, patch the `http_client.stream` on the process services mock.
+**b) Replace `mock_httpx_stream` to mock on `mock_svc.http_client.stream`:**
+
+```python
+# Before (existing pattern — will break after refactor):
+@contextmanager
+def mock_httpx_stream(mock_response_lines, status_code=200):
+    mock_response = MagicMock()
+    mock_response.status_code = status_code
+    mock_response.headers = {}
+    mock_response.__iter__ = MagicMock(return_value=iter(mock_response_lines))
+    mock_response.__enter__ = MagicMock(return_value=mock_response)
+    mock_response.__exit__ = MagicMock(return_value=False)
+    mock_client = MagicMock()
+    mock_client.stream.return_value = mock_response
+    with patch("httpx.Client", return_value=mock_client):
+        yield mock_response
+
+# After — no longer patches httpx.Client constructor; directly mocks the
+# persistent http_client.stream that the plugin gets from ProcessServices:
+@contextmanager
+def mock_httpx_stream(mock_svc: MagicMock, mock_response_lines, status_code=200):
+    mock_response = MagicMock()
+    mock_response.status_code = status_code
+    mock_response.headers = {}
+    mock_response.__iter__ = MagicMock(return_value=iter(mock_response_lines))
+    mock_response.__enter__ = MagicMock(return_value=mock_response)
+    mock_response.__exit__ = MagicMock(return_value=False)
+    mock_svc.http_client.stream.return_value = mock_response
+    yield mock_response
+```
+
+All tests that previously called `mock_httpx_stream(lines)` must be updated to
+`mock_httpx_stream(mock_svc, lines)` — passing the `mock_svc` fixture parameter.
+
+**Note**: The `mock_svc` fixture must be declared as a parameter in every test function
+or class that uses `mock_httpx_stream` after this change.
 
 - [ ] **Step 2: Update `test_handle_request_timeout_configuration`**
 
@@ -942,13 +999,24 @@ from flow_proxy_plugin.utils.process_services import ProcessServices
 ProcessServices.reset()
 ```
 
-**b) Update the `plugin` fixture (`mock_plugin_args`) — wrap instantiation to mock `ProcessServices.get()`:**
+**b) Update the `plugin` fixture (`mock_plugin_args`) — wrap instantiation to mock `ProcessServices.get()` and reset pool module var:**
 ```python
+import flow_proxy_plugin.plugins.proxy_plugin as proxy_mod
+from flow_proxy_plugin.utils.process_services import ProcessServices
+
+@pytest.fixture(autouse=True)
+def reset_state():
+    """Reset ProcessServices singleton and proxy pool module var before/after each test."""
+    ProcessServices.reset()
+    proxy_mod._proxy_pool = None
+    yield
+    ProcessServices.reset()
+    proxy_mod._proxy_pool = None
+
+
 @pytest.fixture
 def plugin(mock_plugin_args: dict[str, Any]) -> FlowProxyPlugin:
     from unittest.mock import MagicMock, patch
-    from flow_proxy_plugin.utils.process_services import ProcessServices
-    ProcessServices.reset()
     mock_svc = MagicMock()
     mock_svc.configs = [
         {"name": "test-config-1", "clientId": "test-client-1",
@@ -966,7 +1034,6 @@ def plugin(mock_plugin_args: dict[str, Any]) -> FlowProxyPlugin:
     mock_svc.request_filter = MagicMock()
     with patch.object(ProcessServices, "get", return_value=mock_svc):
         yield FlowProxyPlugin(**mock_plugin_args)
-    ProcessServices.reset()
 ```
 
 **c) `test_plugin_initialization_success`**: Same pattern as fixture — patch `ProcessServices.get` to return a fully configured `mock_svc`. Assert `plugin is not None`.
@@ -1264,5 +1331,5 @@ git commit -m "chore: complete performance optimization refactoring"
 |------|-----------|
 | `HttpWebServerBasePlugin` has no `on_client_connection_close` | Verify in Task 3 Step 1; use correct hook name |
 | `httpx.Client` not thread-safe for concurrent stream | httpx docs confirm Client is thread-safe; streams are independent |
-| Pool instances hold stale references after `ProcessServices.reset()` (tests) | Call `ProcessServices.reset()` AND reset pool vars in test teardown |
+| Pool instances hold stale references after `ProcessServices.reset()` (tests) | Each test file that instantiates plugin classes must include an `autouse` fixture that resets both the singleton and the module-level pool var: `ProcessServices.reset(); proxy_mod._proxy_pool = None` (or `ws_mod._web_pool = None`). See Task 8 Step 1 and Step 3b for concrete fixture code. |
 | `_pooled` class var vs instance var confusion | Class var `= False` is default; instance var set to `True` after first init — Python attribute lookup picks instance var first |
