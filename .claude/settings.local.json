@@ -5,7 +5,8 @@
       "Bash(poetry run:*)",
       "Bash(git commit:*)",
       "Bash(python3 -c \":*)",
-      "Bash(make test:*)"
+      "Bash(make test:*)",
+      "Bash(make lint:*)"
     ]
   }
 }

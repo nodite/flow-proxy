@@ -358,9 +358,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         stats = StreamStats(start_time=time.perf_counter())
         try:
             if is_sse:
-                self._stream_sse(response, stats)  # type: ignore[attr-defined]  # added in Task 7
-            else:
-                self._stream_bytes(response, stats)
+                raise NotImplementedError("_stream_sse not yet implemented")
+            self._stream_bytes(response, stats)
         finally:
             stats.end_time = time.perf_counter()
             self._log_stream_stats(stats, is_sse)
