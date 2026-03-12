@@ -4,6 +4,7 @@ import logging
 import os
 import secrets
 import threading
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
@@ -23,6 +24,33 @@ from .request_filter import FilterRule
 _web_pool: Optional["PluginPool[FlowProxyWebServerPlugin]"] = None
 _web_pool_lock = threading.Lock()
 _WEB_POOL_SIZE = int(os.getenv("FLOW_PROXY_PLUGIN_POOL_SIZE", "64"))
+
+
+@dataclass
+class StreamStats:
+    """Metrics collected during a single streaming response."""
+
+    start_time: float
+    first_chunk_time: float | None = None
+    end_time: float | None = None
+    bytes_sent: int = 0
+    chunks_sent: int = 0  # non-empty payload writes only
+    event_count: int = 0  # SSE only: incremented at each empty-line boundary
+    completed: bool = False  # True only if stream finished without interruption
+
+    @property
+    def ttft_ms(self) -> float | None:
+        """Time-to-first-token in milliseconds, or None if no data received."""
+        if self.first_chunk_time is None:
+            return None
+        return (self.first_chunk_time - self.start_time) * 1000
+
+    @property
+    def duration_ms(self) -> float | None:
+        """Stream duration (first chunk -> last chunk) in ms, or None if incomplete."""
+        if self.end_time is None or self.first_chunk_time is None:
+            return None
+        return (self.end_time - self.first_chunk_time) * 1000
 
 
 class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):

@@ -10,8 +10,46 @@ import pytest
 from proxy.http.parser import HttpParser
 
 import flow_proxy_plugin.plugins.web_server_plugin as ws_mod
-from flow_proxy_plugin.plugins.web_server_plugin import FlowProxyWebServerPlugin
+from flow_proxy_plugin.plugins.web_server_plugin import (
+    FlowProxyWebServerPlugin,
+    StreamStats,
+)
 from flow_proxy_plugin.utils.process_services import ProcessServices
+
+
+class TestStreamStats:
+    """Unit tests for StreamStats dataclass."""
+
+    def test_ttft_ms_none_when_no_first_chunk(self) -> None:
+        stats = StreamStats(start_time=1000.0)
+        assert stats.ttft_ms is None
+
+    def test_ttft_ms_calculated_correctly(self) -> None:
+        stats = StreamStats(start_time=1000.0, first_chunk_time=1000.042)
+        assert abs(stats.ttft_ms - 42.0) < 0.001  # type: ignore[operator]
+
+    def test_duration_ms_none_when_no_first_chunk(self) -> None:
+        stats = StreamStats(start_time=1000.0, end_time=1001.0)
+        assert stats.duration_ms is None
+
+    def test_duration_ms_none_when_no_end_time(self) -> None:
+        stats = StreamStats(start_time=1000.0, first_chunk_time=1000.042)
+        assert stats.duration_ms is None
+
+    def test_duration_ms_calculated_correctly(self) -> None:
+        stats = StreamStats(
+            start_time=1000.0,
+            first_chunk_time=1000.042,
+            end_time=1003.292,
+        )
+        assert abs(stats.duration_ms - 3250.0) < 0.001  # type: ignore[operator]
+
+    def test_defaults(self) -> None:
+        stats = StreamStats(start_time=0.0)
+        assert stats.bytes_sent == 0
+        assert stats.chunks_sent == 0
+        assert stats.event_count == 0
+        assert stats.completed is False
 
 
 @pytest.fixture
