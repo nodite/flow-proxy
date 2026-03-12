@@ -2,6 +2,7 @@
 
 import logging
 import os
+import secrets
 import threading
 from typing import Any, Optional
 
@@ -9,6 +10,7 @@ import httpx
 from proxy.http.parser import HttpParser
 from proxy.http.server import HttpWebServerBasePlugin, httpProtocolTypes
 
+from ..utils.log_context import clear_request_context, set_request_context
 from ..utils.plugin_pool import PluginPool
 from ..utils.process_services import ProcessServices
 from .base_plugin import BaseFlowProxyPlugin
@@ -92,76 +94,81 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         method = self._decode_bytes(request.method) if request.method else "GET"
         path = self._decode_bytes(request.path) if request.path else "/"
 
-        self.logger.info("→ %s %s", method, path)
-
+        req_id = secrets.token_hex(3)
+        set_request_context(req_id, "WS")
         try:
-            _, config_name, jwt_token = self._get_config_and_token()
+            self.logger.info("→ %s %s", method, path)
 
-            # Build request params
-            filter_rule = self.request_filter.find_matching_rule(request, path)
-            if filter_rule:
-                path = self.request_filter.filter_query_params(
-                    path, filter_rule.query_params_to_remove
-                )
+            try:
+                _, config_name, jwt_token = self._get_config_and_token()
 
-            target_url = f"{self.request_forwarder.target_base_url}{path}"
-            headers = self._build_headers(request, jwt_token, filter_rule)
-            body = self._get_request_body(request, filter_rule)
+                # Build request params
+                filter_rule = self.request_filter.find_matching_rule(request, path)
+                if filter_rule:
+                    path = self.request_filter.filter_query_params(
+                        path, filter_rule.query_params_to_remove
+                    )
 
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self._log_request_details(method, path, target_url, headers, body)
-
-            self.logger.info("Sending request to backend: %s", target_url)
-
-            http_client = ProcessServices.get().get_http_client()
-            with http_client.stream(
-                method=method,
-                url=target_url,
-                headers=headers,
-                content=body,
-                timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
-            ) as response:
-                self.logger.info(
-                    "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
-                    response.status_code,
-                    response.reason_phrase,
-                    response.headers.get("transfer-encoding", "none"),
-                    response.headers.get("content-length", "none"),
-                )
+                target_url = f"{self.request_forwarder.target_base_url}{path}"
+                headers = self._build_headers(request, jwt_token, filter_rule)
+                body = self._get_request_body(request, filter_rule)
 
                 if self.logger.isEnabledFor(logging.DEBUG):
-                    self._log_response_details(response)
+                    self._log_request_details(method, path, target_url, headers, body)
 
-                self._send_response_headers(response)
-                self._stream_response_body(response)
+                self.logger.info("Sending request to backend: %s", target_url)
 
-                log_func = (
-                    self.logger.info
-                    if response.status_code < 400
-                    else self.logger.warning
+                http_client = ProcessServices.get().get_http_client()
+                with http_client.stream(
+                    method=method,
+                    url=target_url,
+                    headers=headers,
+                    content=body,
+                    timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
+                ) as response:
+                    self.logger.info(
+                        "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
+                        response.status_code,
+                        response.reason_phrase,
+                        response.headers.get("transfer-encoding", "none"),
+                        response.headers.get("content-length", "none"),
+                    )
+
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self._log_response_details(response)
+
+                    self._send_response_headers(response)
+                    self._stream_response_body(response)
+
+                    log_func = (
+                        self.logger.info
+                        if response.status_code < 400
+                        else self.logger.warning
+                    )
+                    log_func(
+                        "← %d %s [%s]",
+                        response.status_code,
+                        response.reason_phrase,
+                        config_name,
+                    )
+
+            except (BrokenPipeError, ConnectionResetError) as e:
+                self.logger.debug("Client disconnected (%s)", type(e).__name__)
+            except httpx.RemoteProtocolError as e:
+                self.logger.error(
+                    "Backend streaming failed (RemoteProtocolError): %s",
+                    str(e),
+                    exc_info=True,
                 )
-                log_func(
-                    "← %d %s [%s]",
-                    response.status_code,
-                    response.reason_phrase,
-                    config_name,
-                )
-
-        except (BrokenPipeError, ConnectionResetError) as e:
-            self.logger.debug("Client disconnected (%s)", type(e).__name__)
-        except httpx.RemoteProtocolError as e:
-            self.logger.error(
-                "Backend streaming failed (RemoteProtocolError): %s",
-                str(e),
-                exc_info=True,
-            )
-        except httpx.TransportError as e:
-            self.logger.error("Transport error — marking httpx client dirty: %s", e)
-            ProcessServices.get().mark_http_client_dirty()
-            self._send_error(503, "Upstream transport error")
-        except Exception as e:
-            self.logger.error("✗ Request failed: %s", str(e), exc_info=True)
-            self._send_error()
+            except httpx.TransportError as e:
+                self.logger.error("Transport error — marking httpx client dirty: %s", e)
+                ProcessServices.get().mark_http_client_dirty()
+                self._send_error(503, "Upstream transport error")
+            except Exception as e:
+                self.logger.error("✗ Request failed: %s", str(e), exc_info=True)
+                self._send_error()
+        finally:
+            clear_request_context()
 
     def _build_headers(
         self,
