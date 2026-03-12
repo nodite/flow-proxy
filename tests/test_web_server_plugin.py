@@ -121,13 +121,19 @@ def make_mock_httpx_response(
     reason_phrase: str = "OK",
     headers: dict[str, str] | None = None,
     chunks: list[bytes] | None = None,
+    lines: list[str] | None = None,
 ) -> Mock:
-    """Create a mock httpx.Response for testing."""
+    """Create a mock httpx.Response for testing.
+
+    Use `chunks` for non-SSE iter_bytes() tests.
+    Use `lines` for SSE iter_lines() tests (str values, empty string = event boundary).
+    """
     response = Mock(spec=httpx.Response)
     response.status_code = status_code
     response.reason_phrase = reason_phrase
     response.headers = httpx.Headers(headers or {"content-type": "application/json"})
     response.iter_bytes.return_value = iter(chunks or [])
+    response.iter_lines.return_value = iter(lines or [])
     return response
 
 
