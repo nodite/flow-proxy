@@ -391,20 +391,31 @@ Add this method after `_stream_bytes`:
 def _log_stream_stats(self, stats: StreamStats, is_sse: bool) -> None:
     """Log a single summary line after streaming completes or is interrupted."""
     if is_sse:
-        prefix = "SSE stream complete" if stats.completed else "SSE stream interrupted"
-        if stats.ttft_ms is not None:
-            self.logger.info(
-                "%s: TTFT=%.0fms, duration=%.0fms, events=%d, bytes=%d",
-                prefix,
-                stats.ttft_ms,
-                stats.duration_ms or 0.0,
-                stats.event_count,
-                stats.bytes_sent,
-            )
+        if stats.completed:
+            if stats.ttft_ms is not None:
+                self.logger.info(
+                    "SSE stream complete: TTFT=%.0fms, duration=%.0fms, events=%d, bytes=%d",
+                    stats.ttft_ms,
+                    stats.duration_ms or 0.0,
+                    stats.event_count,
+                    stats.bytes_sent,
+                )
+            else:
+                self.logger.info(
+                    "SSE stream complete: no data received, bytes=%d", stats.bytes_sent
+                )
         else:
-            self.logger.info(
-                "%s: no data received, bytes=%d", prefix, stats.bytes_sent
-            )
+            if stats.ttft_ms is not None:
+                self.logger.info(
+                    "SSE stream interrupted: TTFT=%.0fms, events=%d, bytes=%d",
+                    stats.ttft_ms,
+                    stats.event_count,
+                    stats.bytes_sent,
+                )
+            else:
+                self.logger.info(
+                    "SSE stream interrupted: no data received, bytes=%d", stats.bytes_sent
+                )
     else:
         prefix = "Stream complete" if stats.completed else "Stream interrupted"
         self.logger.info(
@@ -595,6 +606,21 @@ class TestSseStreamStats:
         assert stats.completed is False
         assert stats.end_time is not None
         assert stats.bytes_sent > 0
+
+    def test_non_sse_stream_stats(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """Non-SSE path: event_count stays 0, bytes_sent and completed are correct."""
+        chunks = [b"chunk1", b"chunk2"]
+        mock_response = make_mock_httpx_response(chunks=chunks)  # default: application/json
+
+        plugin.client = Mock(queue=Mock())
+
+        stats = plugin._stream_response_body(mock_response)
+
+        assert stats.event_count == 0
+        assert stats.bytes_sent == sum(len(c) for c in chunks)
+        assert stats.completed is True
 ```
 
 - [ ] **Step 24: Run new SSE tests to confirm they fail**
