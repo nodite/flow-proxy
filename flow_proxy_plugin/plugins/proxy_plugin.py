@@ -1,12 +1,14 @@
 """Main FlowProxyPlugin class implementation."""
 
 import os
+import secrets
 import threading
 from typing import Any, Optional
 
 from proxy.http.parser import HttpParser
 from proxy.http.proxy import HttpProxyBasePlugin
 
+from ..utils.log_context import clear_request_context, set_request_context
 from ..utils.plugin_pool import PluginPool
 from .base_plugin import BaseFlowProxyPlugin
 
@@ -92,6 +94,8 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
         Returns:
             Modified request with authentication headers, or None to reject
         """
+        req_id = secrets.token_hex(3)
+        set_request_context(req_id, "PROXY")
         try:
             # Convert reverse proxy requests to forward proxy format
             self._convert_reverse_proxy_request(request)
@@ -123,6 +127,8 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
         except Exception as e:
             self.logger.error("Unexpected error: %s", str(e), exc_info=True)
             return None
+        finally:
+            clear_request_context()
 
     def _convert_reverse_proxy_request(self, request: HttpParser) -> None:
         """Convert reverse proxy request (path only) to forward proxy format (full URL).
