@@ -113,7 +113,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
             self.logger.info("Sending request to backend: %s", target_url)
 
-            http_client = ProcessServices.get().http_client
+            http_client = ProcessServices.get().get_http_client()
             with http_client.stream(
                 method=method,
                 url=target_url,
@@ -155,6 +155,10 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 str(e),
                 exc_info=True,
             )
+        except httpx.TransportError as e:
+            self.logger.error("Transport error — marking httpx client dirty: %s", e)
+            ProcessServices.get().mark_http_client_dirty()
+            self._send_error(503, "Upstream transport error")
         except Exception as e:
             self.logger.error("✗ Request failed: %s", str(e), exc_info=True)
             self._send_error()

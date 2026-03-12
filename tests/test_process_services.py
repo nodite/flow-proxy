@@ -85,3 +85,19 @@ def test_reset_closes_http_client() -> None:
     with patch.object(svc.http_client, "close") as mock_close:
         ProcessServices.reset()
     mock_close.assert_called_once()
+
+
+def test_get_http_client_rebuilds_after_mark_dirty() -> None:
+    svc = _make_services()
+    original = svc.http_client
+    svc.mark_http_client_dirty()
+    new_client = svc.get_http_client()
+    assert new_client is not original
+    assert svc.http_client is new_client
+
+
+def test_get_http_client_returns_same_when_healthy() -> None:
+    svc = _make_services()
+    c1 = svc.get_http_client()
+    c2 = svc.get_http_client()
+    assert c1 is c2

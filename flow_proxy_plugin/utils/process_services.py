@@ -51,7 +51,7 @@ class ProcessServices:  # pylint: disable=too-many-instance-attributes
         self.request_forwarder = RequestForwarder(self.logger)
         self.request_filter = RequestFilter(self.logger)
         self._client_lock = threading.Lock()
-        self.http_client = httpx.Client(
+        self.http_client: httpx.Client | None = httpx.Client(
             timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
             follow_redirects=False,
         )
@@ -59,13 +59,40 @@ class ProcessServices:  # pylint: disable=too-many-instance-attributes
             "ProcessServices initialized with %d configs", len(self.configs)
         )
 
+    def get_http_client(self) -> httpx.Client:
+        """Return the process-level httpx.Client, rebuilding if previously marked dirty.
+
+        Uses a dedicated _client_lock (NOT the class-level _lock) to avoid deadlock
+        if this method is ever called from within a get() critical section.
+        """
+        if self.http_client is None:
+            with self._client_lock:
+                if self.http_client is None:
+                    self.http_client = httpx.Client(
+                        timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
+                        follow_redirects=False,
+                    )
+                    self.logger.info("httpx.Client rebuilt after transport error")
+        return self.http_client
+
+    def mark_http_client_dirty(self) -> None:
+        """Signal that the httpx.Client is in a broken state; next call to get_http_client()
+        will close it and create a fresh one. Call this from TransportError handlers."""
+        try:
+            if self.http_client is not None:
+                self.http_client.close()
+        except Exception:
+            pass
+        self.http_client = None
+
     @classmethod
     def reset(cls) -> None:
         """Reset singleton. For testing only."""
         with cls._lock:
             if cls._instance is not None:
                 try:
-                    cls._instance.http_client.close()
+                    if cls._instance.http_client is not None:
+                        cls._instance.http_client.close()
                 except Exception:
                     pass
             cls._instance = None

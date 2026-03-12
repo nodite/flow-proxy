@@ -55,6 +55,7 @@ def mock_svc() -> MagicMock:
     svc.request_forwarder.validate_request.return_value = True
     svc.request_filter = MagicMock()
     svc.http_client = MagicMock()
+    svc.get_http_client.return_value = svc.http_client
     return svc
 
 
