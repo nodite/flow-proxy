@@ -9,7 +9,9 @@ import httpx
 import pytest
 from proxy.http.parser import HttpParser
 
+import flow_proxy_plugin.plugins.web_server_plugin as ws_mod
 from flow_proxy_plugin.plugins.web_server_plugin import FlowProxyWebServerPlugin
+from flow_proxy_plugin.utils.process_services import ProcessServices
 
 
 @pytest.fixture
@@ -35,32 +37,44 @@ def mock_plugin_args() -> dict[str, Any]:
 
 
 @pytest.fixture
-def plugin(mock_plugin_args: dict[str, Any]) -> FlowProxyWebServerPlugin:
-    """Create a plugin instance for testing."""
-    # Clear shared state before test
-    from flow_proxy_plugin.utils.process_services import ProcessServices
+def mock_svc() -> MagicMock:
+    """Shared ProcessServices mock reused across fixtures and tests."""
+    svc = MagicMock()
+    svc.configs = [
+        {
+            "name": "test-config-1",
+            "clientId": "test-client-1",
+            "clientSecret": "test-secret-1",
+            "tenant": "test-tenant-1",
+        },
+    ]
+    svc.load_balancer = MagicMock()
+    svc.jwt_generator = MagicMock()
+    svc.request_forwarder = MagicMock()
+    svc.request_forwarder.target_base_url = "https://flow.ciandt.com"
+    svc.request_forwarder.validate_request.return_value = True
+    svc.request_filter = MagicMock()
+    svc.http_client = MagicMock()
+    return svc
 
+
+@pytest.fixture(autouse=True)
+def reset_state(mock_svc: MagicMock) -> Generator[None, None, None]:
+    """Reset ProcessServices singleton and pool module vars before/after each test."""
     ProcessServices.reset()
+    ws_mod._web_pool = None
+    yield
+    ProcessServices.reset()
+    ws_mod._web_pool = None
 
-    with patch(
-        "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
-    ) as mock_load:
-        mock_load.return_value = [
-            {
-                "name": "test-config-1",
-                "clientId": "test-client-1",
-                "clientSecret": "test-secret-1",
-                "tenant": "test-tenant-1",
-            },
-            {
-                "name": "test-config-2",
-                "clientId": "test-client-2",
-                "clientSecret": "test-secret-2",
-                "tenant": "test-tenant-2",
-            },
-        ]
 
-        return FlowProxyWebServerPlugin(**mock_plugin_args)
+@pytest.fixture
+def plugin(
+    mock_plugin_args: dict[str, Any], mock_svc: MagicMock
+) -> Generator[FlowProxyWebServerPlugin, None, None]:
+    """Create a plugin instance for testing."""
+    with patch.object(ProcessServices, "get", return_value=mock_svc):
+        yield FlowProxyWebServerPlugin(**mock_plugin_args)
 
 
 def make_mock_httpx_response(
@@ -80,38 +94,27 @@ def make_mock_httpx_response(
 
 @contextmanager
 def mock_httpx_stream(
-    plugin: "FlowProxyWebServerPlugin",
+    mock_svc: MagicMock,
     status_code: int = 200,
     reason_phrase: str = "OK",
     content_type: str = "application/json",
     chunks: list[bytes] | None = None,
-) -> Generator[Mock, None, None]:
-    """Mock httpx.Client.stream and _get_config_and_token for handle_request tests.
+) -> Generator[MagicMock, None, None]:
+    """Configure mock_svc.http_client.stream for handle_request tests.
 
-    Patches both httpx.Client (so stream() works as a context manager) and
-    _get_config_and_token (so JWT generation is bypassed and the happy path is
-    actually exercised, not the exception fallback).
+    Configures the http_client.stream() on the shared ProcessServices mock so
+    that handle_request() exercises the happy path without hitting real backends.
     """
     mock_response = MagicMock()
     mock_response.status_code = status_code
     mock_response.reason_phrase = reason_phrase
     mock_response.headers = httpx.Headers({"content-type": content_type})
     mock_response.iter_bytes.return_value = iter(chunks or [])
-    mock_response.__enter__.return_value = mock_response
-    mock_response.__exit__.return_value = False
+    mock_response.__enter__ = MagicMock(return_value=mock_response)
+    mock_response.__exit__ = MagicMock(return_value=False)
 
-    mock_client = Mock()
-    mock_client.stream.return_value = mock_response
-    mock_client.__enter__ = Mock(return_value=mock_client)
-    mock_client.__exit__ = Mock(return_value=False)
-
-    mock_token_result = ({"clientId": "test"}, "test-config", "test-jwt-token")
-
-    with (
-        patch("httpx.Client", return_value=mock_client),
-        patch.object(plugin, "_get_config_and_token", return_value=mock_token_result),
-    ):
-        yield mock_response
+    mock_svc.http_client.stream.return_value = mock_response
+    yield mock_response
 
 
 class TestFlowProxyWebServerPluginInitialization:
@@ -450,7 +453,7 @@ class TestHandleRequest:
     """Test handle_request with httpx mock."""
 
     def test_handle_request_success_queues_response(
-        self, plugin: FlowProxyWebServerPlugin
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
         """Successful request queues status line and body chunks."""
         request = Mock(spec=HttpParser)
@@ -459,7 +462,15 @@ class TestHandleRequest:
         request.body = b'{"model": "gpt-3.5-turbo"}'
         request.headers = {b"content-type": (b"application/json", b"")}
 
-        with mock_httpx_stream(plugin, chunks=[b'{"response": "ok"}']):
+        with (
+            mock_httpx_stream(mock_svc, chunks=[b'{"response": "ok"}']),
+            patch.object(
+                plugin,
+                "_get_config_and_token",
+                return_value=({"clientId": "test"}, "test-config", "test-jwt-token"),
+            ),
+            patch.object(ProcessServices, "get", return_value=mock_svc),
+        ):
             plugin.handle_request(request)
 
         # Status line (200 OK) must be queued
@@ -468,7 +479,7 @@ class TestHandleRequest:
         assert b"200" in all_bytes
 
     def test_handle_request_failure_sends_error(
-        self, plugin: FlowProxyWebServerPlugin
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
         """Exceptions during request processing trigger _send_error()."""
         request = Mock(spec=HttpParser)
@@ -476,17 +487,19 @@ class TestHandleRequest:
         request.path = b"/v1/models"
         request.headers = {}
 
+        mock_svc.http_client.stream.side_effect = Exception("Connection failed")
+
         mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
         with (
-            patch("httpx.Client", side_effect=Exception("Connection failed")),
             patch.object(plugin, "_get_config_and_token", return_value=mock_token_result),
+            patch.object(ProcessServices, "get", return_value=mock_svc),
             patch.object(plugin, "_send_error") as mock_error,
         ):
             plugin.handle_request(request)
             mock_error.assert_called_once()
 
     def test_handle_request_timeout_configuration(
-        self, plugin: FlowProxyWebServerPlugin
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
         """httpx.Timeout must be configured with connect=30s and read=600s."""
         request = Mock(spec=HttpParser)
@@ -497,23 +510,24 @@ class TestHandleRequest:
 
         captured_timeout: httpx.Timeout | None = None
 
-        def capture_stream(**kwargs: Any) -> Mock:
+        def capture_stream(**kwargs: Any) -> MagicMock:
             nonlocal captured_timeout
             captured_timeout = kwargs.get("timeout")
-            mock_resp = make_mock_httpx_response()
-            mock_resp.__enter__ = Mock(return_value=mock_resp)
-            mock_resp.__exit__ = Mock(return_value=False)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.reason_phrase = "OK"
+            mock_resp.headers = httpx.Headers({"content-type": "application/json"})
+            mock_resp.iter_bytes.return_value = iter([])
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
             return mock_resp
 
-        mock_client = Mock()
-        mock_client.stream.side_effect = capture_stream
-        mock_client.__enter__ = Mock(return_value=mock_client)
-        mock_client.__exit__ = Mock(return_value=False)
+        mock_svc.http_client.stream.side_effect = capture_stream
 
         mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
         with (
-            patch("httpx.Client", return_value=mock_client),
             patch.object(plugin, "_get_config_and_token", return_value=mock_token_result),
+            patch.object(ProcessServices, "get", return_value=mock_svc),
         ):
             plugin.handle_request(request)
 
@@ -522,7 +536,7 @@ class TestHandleRequest:
         assert captured_timeout.read == 600.0
 
     def test_handle_request_remote_protocol_error_does_not_send_error(
-        self, plugin: FlowProxyWebServerPlugin
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
         """httpx.RemoteProtocolError is logged but does NOT trigger _send_error()."""
         request = Mock(spec=HttpParser)
@@ -531,25 +545,21 @@ class TestHandleRequest:
         request.body = b"{}"
         request.headers = {}
 
-        mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
-
-        mock_client = Mock()
-        mock_client.stream.side_effect = httpx.RemoteProtocolError(
+        mock_svc.http_client.stream.side_effect = httpx.RemoteProtocolError(
             "Server disconnected", request=Mock()
         )
-        mock_client.__enter__ = Mock(return_value=mock_client)
-        mock_client.__exit__ = Mock(return_value=False)
 
+        mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
         with (
-            patch("httpx.Client", return_value=mock_client),
             patch.object(plugin, "_get_config_and_token", return_value=mock_token_result),
+            patch.object(ProcessServices, "get", return_value=mock_svc),
             patch.object(plugin, "_send_error") as mock_error,
         ):
             plugin.handle_request(request)
             mock_error.assert_not_called()
 
     def test_handle_request_with_buffer_body(
-        self, plugin: FlowProxyWebServerPlugin
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
         """Request body read from buffer attribute when body attribute is absent."""
         request = Mock(spec=HttpParser)
@@ -559,7 +569,15 @@ class TestHandleRequest:
         request.headers = {}
         delattr(request, "body")
 
-        with mock_httpx_stream(plugin):
+        with (
+            mock_httpx_stream(mock_svc),
+            patch.object(
+                plugin,
+                "_get_config_and_token",
+                return_value=({"clientId": "test"}, "test-config", "test-jwt-token"),
+            ),
+            patch.object(ProcessServices, "get", return_value=mock_svc),
+        ):
             plugin.handle_request(request)
 
         # Status line must be queued — confirms happy path was taken, not error path
