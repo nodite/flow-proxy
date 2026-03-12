@@ -21,9 +21,9 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize web server plugin."""
         super().__init__(*args, **kwargs)
-        self._setup_logging()
+        self._setup_logging()  # type: ignore[attr-defined]
         self.logger.info("Initializing FlowProxyWebServerPlugin...")
-        self._initialize_components()
+        self._initialize_components()  # type: ignore[attr-defined]
         self.request_filter = RequestFilter(self.logger)
 
     def routes(self) -> list[tuple[int, str]]:

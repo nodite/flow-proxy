@@ -1,71 +1,42 @@
-"""Base plugin class with shared functionality."""
+"""Base plugin mixin providing shared services and utilities."""
 
-import logging
-import os
 from typing import Any
 
-from ..utils.log_filter import setup_proxy_log_filters
-from ..utils.logging import setup_colored_logger, setup_file_handler_for_child_process
-from ..utils.plugin_base import initialize_plugin_components
+from ..utils.process_services import ProcessServices
 
 
 class BaseFlowProxyPlugin:
-    """Base class for Flow Proxy plugins with shared initialization logic."""
+    """Mixin for Flow Proxy plugins. Provides shared service references and utilities.
 
-    def _setup_logging(self) -> None:
-        """Set up logging with colored output and filters."""
-        self.logger = logging.getLogger(self.__class__.__name__)
+    Concrete plugins must call _init_services() once in their __init__ (when not pooled).
+    They must override _rebind() to rebind connection-specific state on pool reuse.
+    """
 
-        # Determine log level from environment or flags
-        log_level = os.getenv("FLOW_PROXY_LOG_LEVEL", "INFO")
+    _pooled: bool = False  # Class-level default; instance attr set to True after first init
 
-        if hasattr(self, "flags") and hasattr(self.flags, "log_level"):
-            flags_level = getattr(self.flags, "log_level", None)
-            if not os.getenv("FLOW_PROXY_LOG_LEVEL") and isinstance(flags_level, str):
-                log_level = flags_level
+    def _init_services(self) -> None:
+        """Bind service references from ProcessServices. Call once in first __init__."""
+        svc = ProcessServices.get()
+        self.logger = svc.logger
+        self.secrets_manager = svc.secrets_manager
+        self.configs = svc.configs
+        self.load_balancer = svc.load_balancer
+        self.jwt_generator = svc.jwt_generator
+        self.request_forwarder = svc.request_forwarder
+        self.request_filter = svc.request_filter
 
-        # Setup logger with console output only (no propagation to avoid duplicate logs)
-        setup_colored_logger(self.logger, log_level, propagate=False)
+    def _rebind(self, *args: Any, **kwargs: Any) -> None:
+        """Rebind connection-specific state for pool reuse. Override in each subclass."""
+        raise NotImplementedError
 
-        # In multi-process environment, CREATE NEW file handler in child process
-        # This is necessary because file handlers from parent process don't work after fork()
-        log_dir = os.getenv("FLOW_PROXY_LOG_DIR", "logs")
-        setup_file_handler_for_child_process(self.logger, log_level, log_dir)
+    def _reset_request_state(self) -> None:
+        """Clear per-request state before returning instance to pool.
 
-        setup_proxy_log_filters(suppress_broken_pipe=True, suppress_proxy_noise=True)
-
-    def _initialize_components(self) -> None:
-        """Initialize core components for request processing.
-
-        Uses SharedComponentManager to maintain state across plugin instances.
-        This is essential for LoadBalancer to work correctly in multi-threaded/multi-process mode.
+        Override in subclasses if handle_request() assigns any self.* request-scoped state.
         """
-        try:
-            # Use existing SharedComponentManager for thread-safe shared state
-            (
-                self.secrets_manager,
-                self.configs,
-                self.load_balancer,
-                self.jwt_generator,
-                self.request_forwarder,
-            ) = initialize_plugin_components(self.logger)
-
-            self.logger.info("✓ Plugin ready with %d configs", len(self.configs))
-
-        except Exception as e:
-            self.logger.critical("Failed to initialize: %s", str(e))
-            raise
 
     def _get_config_and_token(self) -> tuple[dict[str, Any], str, str]:
-        """Get next config and generate JWT token with failover support.
-
-        Returns:
-            Tuple of (config, config_name, jwt_token)
-
-        Raises:
-            RuntimeError: If no available configurations
-            ValueError: If token generation fails for all configs
-        """
+        """Get next config and generate JWT token with failover support."""
         config = self.load_balancer.get_next_config()
         config_name = config.get("name", config.get("clientId", "unknown"))
 
@@ -74,13 +45,11 @@ class BaseFlowProxyPlugin:
             return config, config_name, jwt_token
 
         except ValueError as e:
-            # Token generation failed, try failover
             self.logger.error(
                 "Token generation failed for '%s': %s", config_name, str(e)
             )
             self.load_balancer.mark_config_failed(config)
 
-            # Attempt failover
             config = self.load_balancer.get_next_config()
             config_name = config.get("name", config.get("clientId", "unknown"))
             jwt_token = self.jwt_generator.generate_token(config)
@@ -100,7 +69,6 @@ class BaseFlowProxyPlugin:
             actual_value = header_value[0]
         else:
             actual_value = header_value
-
         return (
             actual_value.decode()
             if isinstance(actual_value, bytes)

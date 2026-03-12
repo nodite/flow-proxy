@@ -19,9 +19,9 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         """Initialize plugin and load authentication configurations."""
         super().__init__(*args, **kwargs)
-        self._setup_logging()
+        self._setup_logging()  # type: ignore[attr-defined]
         self.logger.info("Initializing FlowProxyPlugin...")
-        self._initialize_components()
+        self._initialize_components()  # type: ignore[attr-defined]
 
     def before_upstream_connection(self, request: HttpParser) -> HttpParser | None:
         """Process request before establishing upstream connection.
