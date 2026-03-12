@@ -10,7 +10,11 @@ import httpx
 from proxy.http.parser import HttpParser
 from proxy.http.server import HttpWebServerBasePlugin, httpProtocolTypes
 
-from ..utils.log_context import clear_request_context, set_request_context
+from ..utils.log_context import (
+    clear_request_context,
+    component_context,
+    set_request_context,
+)
 from ..utils.plugin_pool import PluginPool
 from ..utils.process_services import ProcessServices
 from .base_plugin import BaseFlowProxyPlugin
@@ -103,11 +107,12 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 _, config_name, jwt_token = self._get_config_and_token()
 
                 # Build request params
-                filter_rule = self.request_filter.find_matching_rule(request, path)
-                if filter_rule:
-                    path = self.request_filter.filter_query_params(
-                        path, filter_rule.query_params_to_remove
-                    )
+                with component_context("FILTER"):
+                    filter_rule = self.request_filter.find_matching_rule(request, path)
+                    if filter_rule:
+                        path = self.request_filter.filter_query_params(
+                            path, filter_rule.query_params_to_remove
+                        )
 
                 target_url = f"{self.request_forwarder.target_base_url}{path}"
                 headers = self._build_headers(request, jwt_token, filter_rule)
@@ -116,7 +121,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 if self.logger.isEnabledFor(logging.DEBUG):
                     self._log_request_details(method, path, target_url, headers, body)
 
-                self.logger.info("Sending request to backend: %s", target_url)
+                with component_context("FWD"):
+                    self.logger.info("Sending request to backend: %s", target_url)
 
                 http_client = ProcessServices.get().get_http_client()
                 with http_client.stream(
