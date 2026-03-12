@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from ..utils.log_context import component_context
 from ..utils.process_services import ProcessServices
 
 
@@ -37,23 +38,23 @@ class BaseFlowProxyPlugin:
 
     def _get_config_and_token(self) -> tuple[dict[str, Any], str, str]:
         """Get next config and generate JWT token with failover support."""
-        config = self.load_balancer.get_next_config()
+        with component_context("LB"):
+            config = self.load_balancer.get_next_config()
         config_name = config.get("name", config.get("clientId", "unknown"))
-
         try:
-            jwt_token = self.jwt_generator.generate_token(config)
+            with component_context("JWT"):
+                jwt_token = self.jwt_generator.generate_token(config)
             return config, config_name, jwt_token
-
         except ValueError as e:
             self.logger.error(
                 "Token generation failed for '%s': %s", config_name, str(e)
             )
-            self.load_balancer.mark_config_failed(config)
-
-            config = self.load_balancer.get_next_config()
+            with component_context("LB"):
+                self.load_balancer.mark_config_failed(config)
+                config = self.load_balancer.get_next_config()
             config_name = config.get("name", config.get("clientId", "unknown"))
-            jwt_token = self.jwt_generator.generate_token(config)
-
+            with component_context("JWT"):
+                jwt_token = self.jwt_generator.generate_token(config)
             self.logger.info("Failover successful - using '%s'", config_name)
             return config, config_name, jwt_token
 
