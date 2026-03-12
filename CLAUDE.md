@@ -84,20 +84,23 @@ The codebase follows a modular architecture built on top of the proxy.py framewo
 
 ### Plugin Layer (`flow_proxy_plugin/plugins/`)
 
-- **BaseFlowProxyPlugin** (`base_plugin.py`): Shared initialization and component setup
-  - Initializes SecretsManager, LoadBalancer, JWTGenerator, RequestForwarder
-  - Handles reverse-to-forward proxy conversion
-  - Shared by both plugin implementations
+- **BaseFlowProxyPlugin** (`base_plugin.py`): Thin mixin providing service references and utilities
+  - `_init_services()`: binds references from `ProcessServices.get()` — call once in first `__init__`
+  - `_rebind()`: abstract — subclasses override to rebind proxy.py connection state on pool reuse
+  - `_reset_request_state()`: empty hook — override if `handle_request()` assigns `self.*` request-scoped state
+  - Keeps `_get_config_and_token()` (with failover), `_decode_bytes()`, `_extract_header_value()`
 
 - **FlowProxyPlugin** (`proxy_plugin.py`): Forward proxy mode implementation
   - Extends `HttpProxyBasePlugin` from proxy.py
-  - Hook: `before_upstream_connection()` - processes requests with `-x` proxy flag
-  - Handles authentication for requests sent through the proxy
+  - Hook: `before_upstream_connection()` — processes requests with `-x` proxy flag
+  - Pool-enabled: `__new__` routes through `_proxy_pool`, `__init__` guarded by `if self._pooled: return`
+  - Releases to pool in `on_upstream_connection_close()`
 
 - **FlowProxyWebServerPlugin** (`web_server_plugin.py`): Reverse proxy mode implementation
   - Extends `HttpWebServerBasePlugin` from proxy.py
-  - Hook: `handle_request()` - processes direct HTTP requests
-  - Provides web server endpoints for direct access
+  - Hook: `handle_request()` — uses `ProcessServices.get().get_http_client().stream()` for SSE streaming (connect=30s, read=600s); `httpx.TransportError` marks client dirty for rebuild
+  - Pool-enabled: `__new__` routes through `_web_pool`, `__init__` guarded by `if self._pooled: return`
+  - Releases to pool in `on_client_connection_close()`
 
 ### Request Filtering (`flow_proxy_plugin/plugins/request_filter.py`)
 
@@ -109,7 +112,8 @@ The codebase follows a modular architecture built on top of the proxy.py framewo
 
 ### Utilities (`flow_proxy_plugin/utils/`)
 
-- **plugin_base.py**: `SharedComponentManager` singleton — ensures `LoadBalancer` and `configs` are shared across all plugin instances in multi-threaded mode. `initialize_plugin_components()` is the entry point called by both plugins.
+- **process_services.py**: `ProcessServices` singleton — lazily initialized per-process (fork-safe), owns all shared resources: `logger`, `secrets_manager`, `configs`, `load_balancer`, `jwt_generator`, `request_forwarder`, `request_filter`, and a persistent `httpx.Client`. Use `ProcessServices.get()` to access; `ProcessServices.reset()` in tests only.
+- **plugin_pool.py**: `PluginPool[T]` — thread-safe generic instance pool. `acquire(*args)` returns a pooled instance (calling `_rebind()`) or creates a new one via `object.__new__()` to avoid recursion. `release(instance)` calls `_reset_request_state()` then returns to pool.
 - **logging.py**: Sets up colored console + rotating file handlers; file handler must be re-created in child processes after `fork()`
 - **log_cleaner.py**: Scheduled cleanup of old log files; configurable via env vars
 - **log_filter.py**: Suppresses noisy third-party log messages
@@ -147,6 +151,7 @@ All environment variables are prefixed with `FLOW_PROXY_`:
 - `FLOW_PROXY_LOG_RETENTION_DAYS=7`: Log retention period
 - `FLOW_PROXY_LOG_CLEANUP_INTERVAL_HOURS=24`: Cleanup check interval
 - `FLOW_PROXY_LOG_MAX_SIZE_MB=100`: Max log directory size before forced cleanup
+- `FLOW_PROXY_PLUGIN_POOL_SIZE=64`: Max pooled plugin instances per plugin type
 
 ## Testing Guidelines
 
@@ -158,14 +163,18 @@ Tests are organized by component in `tests/`:
 - `test_load_balancer.py`: Round-robin logic
 - `test_plugin.py`: FlowProxyPlugin behavior
 - `test_web_server_plugin.py`: FlowProxyWebServerPlugin behavior
-- `test_thread_safety.py`: Concurrent access tests
-- `test_shared_state.py`: Multi-process state management
+- `test_thread_safety.py`: Concurrent access tests (includes PluginPool thread-safety)
+- `test_shared_state.py`: Shared state via ProcessServices singleton
+- `test_process_services.py`: ProcessServices singleton, http_client resilience
+- `test_plugin_pool.py`: PluginPool acquire/release/reuse behavior
 
 ### Test Fixtures
 Common fixtures are defined in `conftest.py`:
 - `mock_config`: Sample auth configuration
 - `mock_configs`: List of multiple configs for load balancing tests
 - `secrets_file`: Temporary secrets.json file
+
+Plugin tests (`test_plugin.py`, `test_web_server_plugin.py`) use a local `mock_svc` fixture that returns a `MagicMock` of `ProcessServices`, and an `autouse` `reset_state` fixture that calls `ProcessServices.reset()` and resets the module-level pool variable (`proxy_mod._proxy_pool = None` / `ws_mod._web_pool = None`) before and after each test.
 
 ### Running Tests
 Use pytest markers and filters for targeted testing:
@@ -200,24 +209,30 @@ Configured in `.pre-commit-config.yaml`:
 
 ## Key Design Patterns
 
-### Shared State Across Plugin Instances
-`SharedComponentManager` (in `utils/plugin_base.py`) is a thread-safe singleton that ensures `LoadBalancer` and `configs` are shared across all plugin instances. Both proxy modes call `initialize_plugin_components()` which returns the same `LoadBalancer` instance — critical for correct round-robin behavior across threads/processes.
+### ProcessServices Singleton
+`ProcessServices` (in `utils/process_services.py`) is the single source of truth for all shared resources. It is lazily initialized the first time `ProcessServices.get()` is called after `fork()`, making it fork-safe. All plugin instances share the same `LoadBalancer`, `JWTGenerator`, `httpx.Client`, etc. — critical for correct round-robin behavior across threads/processes.
+
+### PluginPool Instance Reuse
+Both plugins intercept their own instantiation via `__new__` to route through a module-level `PluginPool`. On each connection, proxy.py calls `Plugin(uid, flags, client, event_queue)` — `__new__` returns a pooled instance, `_rebind()` re-runs `HttpXxxBasePlugin.__init__()` to reset connection state, and `__init__` is a no-op (guarded by `if self._pooled: return`). On connection close, the instance is returned to the pool. This eliminates per-connection initialization overhead.
+
+**`__new__` recursion hazard**: `PluginPool.acquire()` uses `object.__new__(cls)` + `.__init__()` directly — never `PluginClass(*args)`, which would re-enter `__new__`.
+
+**`_rebind` must call proxy.py parent explicitly**: `_rebind` calls `HttpWebServerBasePlugin.__init__(self, ...)` directly, not `super().__init__()`, because the MRO for the concrete class would resolve to `object.__init__`.
 
 ### Thread Safety
 - `JWTGenerator`: Class-level `threading.Lock` protecting the `_cache` dict
 - `LoadBalancer`: Instance lock for index and failed-config state
-- `SharedComponentManager`: Double-checked locking for singleton initialization
+- `ProcessServices`: Double-checked locking for singleton initialization
+- `PluginPool`: Per-pool lock protecting the `deque`; `_rebind()` called outside the lock
 
 ### Failover
 `BaseFlowProxyPlugin._get_config_and_token()` handles failover: if JWT generation fails, the config is marked failed via `load_balancer.mark_config_failed()` and the next config is tried automatically.
 
 ### Multi-process File Logging
-After `fork()`, file handlers from the parent process stop working. `setup_file_handler_for_child_process()` creates a fresh file handler in each child process.
+After `fork()`, file handlers from the parent process stop working. `ProcessServices._initialize()` calls `setup_file_handler_for_child_process()` — this runs once per process on first `get()` call after fork.
 
-### Plugin Architecture
-The plugin system uses proxy.py's plugin hooks:
-- **Forward proxy** (`FlowProxyPlugin`): Intercepts `before_upstream_connection()` — handles both forward and reverse proxy requests by converting path-only URLs to full URLs before validation
-- **Reverse proxy** (`FlowProxyWebServerPlugin`): Intercepts `handle_request()` — uses `httpx.Client().stream()` for zero-buffering SSE streaming (connect=30s, read=600s); new `httpx.Client` per request call for fork safety
+### httpx.Client Resilience
+`ProcessServices` holds a single persistent `httpx.Client`. On `httpx.TransportError`, `handle_request()` calls `ProcessServices.get().mark_http_client_dirty()` which closes the old client and sets it to `None`. The next call to `get_http_client()` rebuilds it (double-checked lock on `_client_lock`).
 
 ## Deployment
 
@@ -241,7 +256,7 @@ Default configuration is optimized for performance:
 ### Adding a New Core Component
 1. Create module in `flow_proxy_plugin/core/`
 2. Export in `flow_proxy_plugin/core/__init__.py`
-3. Initialize in `BaseFlowProxyPlugin._initialize_components()`
+3. Initialize in `ProcessServices._initialize()` and expose as an instance attribute
 4. Add tests in `tests/test_<component>.py`
 
 ### Modifying Request Processing
