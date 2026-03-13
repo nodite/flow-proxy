@@ -249,89 +249,76 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         return [(httpProtocolTypes.HTTP, r"/.*")]
 
     def handle_request(self, request: HttpParser) -> None:
-        """Handle web server request."""
+        """Start async streaming: authenticate, build params, launch worker, return.
+
+        Does NOT block waiting for the upstream response. The worker thread feeds
+        chunks through StreamingState; read_from_descriptors() delivers them to
+        the client via proxy.py's event loop.
+        """
         method = self._decode_bytes(request.method) if request.method else "GET"
         path = self._decode_bytes(request.path) if request.path else "/"
 
         req_id = secrets.token_hex(3)
         set_request_context(req_id, "WS")
+        self.logger.info("→ %s %s", method, path)
+
         try:
-            self.logger.info("→ %s %s", method, path)
-
-            try:
-                _, config_name, jwt_token = self._get_config_and_token()
-
-                # Build request params
-                with component_context("FILTER"):
-                    filter_rule = self.request_filter.find_matching_rule(request, path)
-                    if filter_rule:
-                        path = self.request_filter.filter_query_params(
-                            path, filter_rule.query_params_to_remove
-                        )
-
-                target_url = f"{self.request_forwarder.target_base_url}{path}"
-                headers = self._build_headers(request, jwt_token, filter_rule)
-                body = self._get_request_body(request, filter_rule)
-
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self._log_request_details(method, path, target_url, headers, body)
-
-                with component_context("FWD"):
-                    self.logger.info("Sending request to backend: %s", target_url)
-
-                http_client = ProcessServices.get().get_http_client()
-                with http_client.stream(
-                    method=method,
-                    url=target_url,
-                    headers=headers,
-                    content=body,
-                    timeout=httpx.Timeout(
-                        connect=30.0, read=600.0, write=30.0, pool=30.0
-                    ),
-                ) as response:
-                    self.logger.info(
-                        "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
-                        response.status_code,
-                        response.reason_phrase,
-                        response.headers.get("transfer-encoding", "none"),
-                        response.headers.get("content-length", "none"),
-                    )
-
-                    if self.logger.isEnabledFor(logging.DEBUG):
-                        self._log_response_details(response)
-
-                    self._send_response_headers(response)
-                    self._stream_response_body(response)
-
-                    log_func = (
-                        self.logger.info
-                        if response.status_code < 400
-                        else self.logger.warning
-                    )
-                    log_func(
-                        "← %d %s [%s]",
-                        response.status_code,
-                        response.reason_phrase,
-                        config_name,
-                    )
-
-            except (BrokenPipeError, ConnectionResetError) as e:
-                self.logger.debug("Client disconnected (%s)", type(e).__name__)
-            except httpx.RemoteProtocolError as e:
-                self.logger.error(
-                    "Backend streaming failed (RemoteProtocolError): %s",
-                    str(e),
-                    exc_info=True,
-                )
-            except httpx.TransportError as e:
-                self.logger.error("Transport error — marking httpx client dirty: %s", e)
-                ProcessServices.get().mark_http_client_dirty()
-                self._send_error(503, "Upstream transport error")
-            except Exception as e:
-                self.logger.error("✗ Request failed: %s", str(e), exc_info=True)
-                self._send_error()
-        finally:
+            _, config_name, jwt_token = self._get_config_and_token()
+        except Exception as e:
+            self.logger.error("Auth failed: %s", e)
+            self._send_error(503, "Auth error")
             clear_request_context()
+            return
+
+        with component_context("FILTER"):
+            filter_rule = self.request_filter.find_matching_rule(request, path)
+            if filter_rule:
+                path = self.request_filter.filter_query_params(
+                    path, filter_rule.query_params_to_remove
+                )
+
+        target_url = f"{self.request_forwarder.target_base_url}{path}"
+        headers = self._build_headers(request, jwt_token, filter_rule)
+        body = self._get_request_body(request, filter_rule)
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self._log_request_details(method, path, target_url, headers, body)
+
+        with component_context("FWD"):
+            self.logger.info("Sending request to backend: %s", target_url)
+
+        pipe_r, pipe_w = os.pipe()
+        try:
+            state = StreamingState(
+                pipe_r=pipe_r,
+                pipe_w=pipe_w,
+                chunk_queue=queue.Queue(),
+                cancel=threading.Event(),
+                req_id=req_id,
+                config_name=config_name,
+                thread=None,
+            )
+            state.thread = threading.Thread(
+                target=self._streaming_worker,
+                args=(method, target_url, headers, body, state),
+                name=f"streaming-{req_id}",
+                daemon=True,
+            )
+            self._streaming_state = state
+            state.thread.start()
+        except Exception:
+            try:
+                os.close(pipe_r)
+            except OSError:
+                pass
+            try:
+                os.close(pipe_w)
+            except OSError:
+                pass
+            self._streaming_state = None
+            self._send_error(500, "Failed to start streaming")
+            clear_request_context()
+        # Return immediately — event loop resumes, read_from_descriptors delivers data
 
     def _build_headers(
         self,

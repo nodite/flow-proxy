@@ -1275,3 +1275,147 @@ class TestEventLoopHooks:
         assert not plugin.client.queue.called  # type: ignore[attr-defined]
         # Error must be logged (warning-level when headers already committed)
         plugin.logger.warning.assert_called()  # type: ignore[attr-defined]
+
+
+class TestHandleRequestAsync:
+    """Tests for the refactored handle_request() that starts a worker and returns."""
+
+    def test_handle_request_starts_worker_thread(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """handle_request() returns immediately and sets _streaming_state."""
+        mock_svc.load_balancer.get_next_config.return_value = {
+            "name": "cfg", "clientId": "cid", "clientSecret": "s", "tenant": "t"
+        }
+        mock_svc.jwt_generator.generate_token.return_value = "jwt-token"
+        mock_svc.request_filter.find_matching_rule.return_value = None
+        mock_svc.request_forwarder.target_base_url = "https://flow.ciandt.com"
+
+        # Make http_client.stream block until we release it
+        import threading
+        ready = threading.Event()
+        released = threading.Event()
+
+        def blocking_stream(*a: Any, **kw: Any) -> MagicMock:
+            ready.set()
+            released.wait(timeout=2)
+            return MagicMock(__enter__=MagicMock(return_value=MagicMock(
+                status_code=200, reason_phrase="OK",
+                headers=httpx.Headers({"content-type": "application/json"}),
+                iter_bytes=MagicMock(return_value=iter([])),
+            )), __exit__=MagicMock(return_value=False))
+
+        mock_svc.http_client.stream.side_effect = blocking_stream
+
+        request = Mock(spec=HttpParser)
+        request.method = b"GET"
+        request.path = b"/v1/test"
+        request.headers = {}
+        request.body = None
+        request.buffer = None
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin.handle_request(request)
+
+        # handle_request() returned — state should be set
+        assert plugin._streaming_state is not None
+        released.set()  # let the worker finish
+
+    def test_handle_request_cleans_up_pipe_on_auth_failure(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """If auth fails, handle_request sends error and returns without leaking fds."""
+        mock_svc.load_balancer.get_next_config.side_effect = Exception("no config")
+
+        request = Mock(spec=HttpParser)
+        request.method = b"GET"
+        request.path = b"/v1/test"
+        request.headers = {}
+        request.body = None
+        request.buffer = None
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin.handle_request(request)
+
+        assert plugin._streaming_state is None
+        # _send_error should have been called
+        assert plugin.client.queue.called  # type: ignore[attr-defined]
+
+    def test_handle_request_cleans_up_pipe_on_setup_failure(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """If threading.Thread.start() raises, pipe fds are closed and state is None."""
+        mock_svc.load_balancer.get_next_config.return_value = {
+            "name": "cfg", "clientId": "cid", "clientSecret": "s", "tenant": "t"
+        }
+        mock_svc.jwt_generator.generate_token.return_value = "jwt-token"
+        mock_svc.request_filter.find_matching_rule.return_value = None
+        mock_svc.request_forwarder.target_base_url = "https://flow.ciandt.com"
+
+        request = Mock(spec=HttpParser)
+        request.method = b"GET"
+        request.path = b"/v1/test"
+        request.headers = {}
+        request.body = None
+        request.buffer = None
+
+        import os
+        captured_fds: list[int] = []
+        real_pipe = os.pipe
+
+        def capturing_pipe() -> tuple[int, int]:
+            r, w = real_pipe()
+            captured_fds.extend([r, w])
+            return r, w
+
+        with patch("flow_proxy_plugin.plugins.web_server_plugin.os.pipe", side_effect=capturing_pipe):
+            with patch("threading.Thread.start", side_effect=RuntimeError("thread start failed")):
+                with patch.object(ProcessServices, "get", return_value=mock_svc):
+                    plugin.handle_request(request)
+
+        assert plugin._streaming_state is None
+        # _send_error should have been called for the setup failure
+        assert plugin.client.queue.called  # type: ignore[attr-defined]
+        # Both pipe fds must have been closed — re-closing should raise OSError
+        assert len(captured_fds) == 2
+        with pytest.raises(OSError):
+            os.close(captured_fds[0])
+        with pytest.raises(OSError):
+            os.close(captured_fds[1])
+
+    def test_handle_request_filter_applied(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """Filter rule is applied synchronously in handle_request() before thread start."""
+        from flow_proxy_plugin.plugins.request_filter import FilterRule
+        mock_svc.load_balancer.get_next_config.return_value = {
+            "name": "cfg", "clientId": "cid", "clientSecret": "s", "tenant": "t"
+        }
+        mock_svc.jwt_generator.generate_token.return_value = "jwt-token"
+        mock_svc.request_forwarder.target_base_url = "https://flow.ciandt.com"
+
+        # Return a filter rule that removes a query param
+        filter_rule = FilterRule(
+            name="test-rule",
+            matcher=lambda req, path: True,
+            query_params_to_remove=["key"],
+        )
+        mock_svc.request_filter.find_matching_rule.return_value = filter_rule
+        mock_svc.request_filter.filter_query_params.return_value = "/v1/messages"
+        mock_svc.request_filter.get_headers_to_skip.return_value = set()
+
+        request = Mock(spec=HttpParser)
+        request.method = b"GET"
+        request.path = b"/v1/messages?key=secret"
+        request.headers = {}
+        request.body = None
+        request.buffer = None
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin.handle_request(request)
+
+        # filter_query_params must be called — proves filter was applied before thread start
+        mock_svc.request_filter.filter_query_params.assert_called_once()
+        # Clean up
+        if plugin._streaming_state:
+            plugin._reset_request_state()
