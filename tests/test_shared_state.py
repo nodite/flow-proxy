@@ -1,12 +1,8 @@
 """Tests for shared state across plugin instances."""
 
-import logging
 from typing import Any
 
-from flow_proxy_plugin.utils.plugin_base import (
-    SharedComponentManager,
-    initialize_plugin_components,
-)
+from flow_proxy_plugin.utils.process_services import ProcessServices
 
 
 class TestSharedState:
@@ -15,7 +11,7 @@ class TestSharedState:
     def test_shared_load_balancer_across_instances(
         self, sample_secrets_config: list[dict[str, str]], tmp_path: Any
     ) -> None:
-        """Test that LoadBalancer state is shared across multiple plugin instances."""
+        """Test that LoadBalancer state is shared via ProcessServices singleton."""
         import json
         import os
 
@@ -30,37 +26,33 @@ class TestSharedState:
 
         try:
             # Clear shared state first
-            manager = SharedComponentManager()
-            manager.reset()
+            ProcessServices.reset()
 
-            logger = logging.getLogger(__name__)
+            # Access the singleton
+            svc1 = ProcessServices.get()
+            lb1 = svc1.load_balancer
 
-            # Initialize first instance
-            _, _, lb1, _, _ = initialize_plugin_components(logger)
-
-            # Get first config from first instance
+            # Get first config
             config1 = lb1.get_next_config()
             assert config1["name"] == "config1"
             assert lb1.total_requests == 1
 
-            # Initialize second instance - should reuse the same LoadBalancer
-            _, _, lb2, _, _ = initialize_plugin_components(logger)
+            # Access singleton again — must be the same instance
+            svc2 = ProcessServices.get()
+            lb2 = svc2.load_balancer
 
-            # Verify it's the same instance
+            assert svc2 is svc1, "ProcessServices must be the same singleton"
             assert lb2 is lb1, "LoadBalancer should be the same instance"
 
-            # Get next config from second instance
+            # Get next config from same load balancer
             config2 = lb2.get_next_config()
-            # Should get config2 since lb1 already got config1
             assert config2["name"] == "config2"
             assert lb2.total_requests == 2
 
-            # Initialize third instance
-            _, _, lb3, _, _ = initialize_plugin_components(logger)
-
-            # Get next config from third instance
+            # Third access wraps around
+            svc3 = ProcessServices.get()
+            lb3 = svc3.load_balancer
             config3 = lb3.get_next_config()
-            # Should wrap around to config1
             assert config3["name"] == "config1"
             assert lb3.total_requests == 3
 
@@ -71,14 +63,12 @@ class TestSharedState:
             elif "FLOW_PROXY_SECRETS_FILE" in os.environ:
                 del os.environ["FLOW_PROXY_SECRETS_FILE"]
 
-            # Clean up shared state
-            manager = SharedComponentManager()
-            manager.reset()
+            ProcessServices.reset()
 
     def test_independent_jwt_generators(
         self, sample_secrets_config: list[dict[str, str]], tmp_path: Any
     ) -> None:
-        """Test that JWTGenerator instances are independent."""
+        """Test that JWTGenerator instance is shared via ProcessServices."""
         import json
         import os
 
@@ -92,17 +82,14 @@ class TestSharedState:
 
         try:
             # Clear shared state
-            manager = SharedComponentManager()
-            manager.reset()
+            ProcessServices.reset()
 
-            logger = logging.getLogger(__name__)
+            svc1 = ProcessServices.get()
+            svc2 = ProcessServices.get()
 
-            # Initialize two instances
-            _, _, _, jwt1, _ = initialize_plugin_components(logger)
-            _, _, _, jwt2, _ = initialize_plugin_components(logger)
-
-            # JWT generators should be different instances
-            assert jwt1 is not jwt2, "JWTGenerator instances should be independent"
+            # Both references should point to the same singleton and same JWTGenerator
+            assert svc1 is svc2, "ProcessServices singleton must be stable"
+            assert svc1.jwt_generator is svc2.jwt_generator
 
         finally:
             if original_env:
@@ -110,6 +97,4 @@ class TestSharedState:
             elif "FLOW_PROXY_SECRETS_FILE" in os.environ:
                 del os.environ["FLOW_PROXY_SECRETS_FILE"]
 
-            # Clean up
-            manager = SharedComponentManager()
-            manager.reset()
+            ProcessServices.reset()

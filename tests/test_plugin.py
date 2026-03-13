@@ -61,9 +61,9 @@ class TestFlowProxyPluginInitialization:
     ) -> None:
         """Test successful plugin initialization with valid configuration."""
         # Clear shared state before test
-        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+        from flow_proxy_plugin.utils.process_services import ProcessServices
 
-        SharedComponentManager().reset()
+        ProcessServices.reset()
 
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
@@ -91,9 +91,9 @@ class TestFlowProxyPluginInitialization:
     ) -> None:
         """Test plugin initialization fails when secrets.json is missing."""
         # Clear shared state before test
-        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+        from flow_proxy_plugin.utils.process_services import ProcessServices
 
-        SharedComponentManager().reset()
+        ProcessServices.reset()
 
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
@@ -108,9 +108,9 @@ class TestFlowProxyPluginInitialization:
     ) -> None:
         """Test plugin initialization fails with invalid configuration."""
         # Clear shared state before test
-        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+        from flow_proxy_plugin.utils.process_services import ProcessServices
 
-        SharedComponentManager().reset()
+        ProcessServices.reset()
 
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
@@ -128,9 +128,9 @@ class TestFlowProxyPluginRequestProcessing:
     def plugin(self, mock_plugin_args: dict[str, Any]) -> FlowProxyPlugin:
         """Create a plugin instance for testing."""
         # Clear shared state before test
-        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+        from flow_proxy_plugin.utils.process_services import ProcessServices
 
-        SharedComponentManager().reset()
+        ProcessServices.reset()
 
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"
@@ -262,9 +262,9 @@ class TestFlowProxyPluginResponseProcessing:
     def plugin(self, mock_plugin_args: dict[str, Any]) -> FlowProxyPlugin:
         """Create a plugin instance for testing."""
         # Clear shared state before test
-        from flow_proxy_plugin.utils.plugin_base import SharedComponentManager
+        from flow_proxy_plugin.utils.process_services import ProcessServices
 
-        SharedComponentManager().reset()
+        ProcessServices.reset()
 
         with patch(
             "flow_proxy_plugin.core.config.SecretsManager.load_secrets"

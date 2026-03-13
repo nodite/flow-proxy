@@ -8,6 +8,8 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import ClassVar
 
+from .log_context import get_request_prefix
+
 
 # ANSI color codes
 class Colors:
@@ -39,6 +41,21 @@ class ColoredFormatter(logging.Formatter):
         record.levelname = f"{level_color}{record.levelname:8s}{Colors.RESET}"
         record.name = f"{Colors.BRIGHT_BLACK}{record.name}{Colors.RESET}"
         return super().format(record)
+
+
+class RequestContextFilter(logging.Filter):
+    """Prepends [req_id][COMPONENT] prefix to log messages when request context is set.
+
+    Attached to the logger object (not individual handlers) so filter() is called
+    exactly once per log call — preventing double-prefix when multiple handlers exist.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Prepend request context prefix to record.msg."""
+        prefix = get_request_prefix()
+        if prefix:
+            record.msg = f"{prefix}{record.msg}"
+        return True
 
 
 @dataclass
@@ -250,8 +267,13 @@ def setup_colored_logger(
     level = getattr(logging, log_level.upper(), logging.INFO)
     logger.setLevel(level)
 
-    # Clear existing handlers
+    # Clear existing handlers and filters (reset to clean state)
     logger.handlers.clear()
+    logger.filters.clear()
+
+    # Attach request context filter at logger level (not handler level) to avoid
+    # double-prefix when multiple handlers are present.
+    logger.addFilter(RequestContextFilter())
 
     # Add colored console handler
     config = LogConfig(level=log_level)

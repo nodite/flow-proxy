@@ -388,11 +388,14 @@ class TestSetupColoredLogger:
 
     def test_setup_colored_logger_default(self) -> None:
         """Test setup_colored_logger with default parameters."""
-        logger = logging.getLogger("test.logger")
+        logger = logging.getLogger("test.logger.default")
+        logger.handlers.clear()
+        logger.filters.clear()
         setup_colored_logger(logger)
 
         assert logger.level == logging.INFO
         assert len(logger.handlers) == 1
+        assert len(logger.filters) == 1
 
 
 class TestSetupFileHandlerForChildProcess:
@@ -518,3 +521,93 @@ class TestSetupFileHandlerForChildProcess:
         assert isinstance(handler2, TimedRotatingFileHandler)
         assert handler1.baseFilename == str(log_dir1 / "flow_proxy_plugin.log")
         assert handler2.baseFilename == str(log_dir2 / "flow_proxy_plugin.log")
+
+
+class TestRequestContextFilter:
+    """Tests for RequestContextFilter."""
+
+    def setup_method(self) -> None:
+        from flow_proxy_plugin.utils.log_context import clear_request_context
+        clear_request_context()
+
+    def teardown_method(self) -> None:
+        from flow_proxy_plugin.utils.log_context import clear_request_context
+        clear_request_context()
+
+    def _make_record(self, msg: str) -> logging.LogRecord:
+        return logging.LogRecord(
+            name="flow_proxy",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg=msg,
+            args=(),
+            exc_info=None,
+        )
+
+    def test_prepends_prefix_when_context_set(self) -> None:
+        from flow_proxy_plugin.utils.log_context import set_request_context
+        from flow_proxy_plugin.utils.logging import RequestContextFilter
+
+        set_request_context("a1b2c3", "WS")
+        f = RequestContextFilter()
+        record = self._make_record("hello world")
+        f.filter(record)
+        assert record.msg == "[a1b2c3][WS] hello world"
+
+    def test_no_op_when_no_context(self) -> None:
+        from flow_proxy_plugin.utils.logging import RequestContextFilter
+
+        f = RequestContextFilter()
+        record = self._make_record("hello world")
+        f.filter(record)
+        assert record.msg == "hello world"
+
+    def test_filter_always_returns_true(self) -> None:
+        from flow_proxy_plugin.utils.logging import RequestContextFilter
+
+        f = RequestContextFilter()
+        record = self._make_record("msg")
+        assert f.filter(record) is True
+
+    def test_filter_attached_at_logger_level(self) -> None:
+        """RequestContextFilter must be on the logger, not individual handlers."""
+        from flow_proxy_plugin.utils.log_context import set_request_context
+        from flow_proxy_plugin.utils.logging import (
+            RequestContextFilter,
+            setup_colored_logger,
+        )
+
+        logger = logging.getLogger("test.filter.attachment")
+        logger.handlers.clear()
+        logger.filters.clear()
+        set_request_context("x1y2z3", "WS")
+        setup_colored_logger(logger)
+
+        # Filter must be on the logger object
+        assert any(isinstance(f, RequestContextFilter) for f in logger.filters)
+
+    def test_no_double_prefix_with_multiple_handlers(self) -> None:
+        """A single logger.info() call with two handlers should produce prefix exactly once."""
+        import io
+
+        from flow_proxy_plugin.utils.log_context import set_request_context
+        from flow_proxy_plugin.utils.logging import setup_colored_logger
+
+        logger = logging.getLogger("test.no.double.prefix")
+        logger.handlers.clear()
+        logger.filters.clear()
+        setup_colored_logger(logger)
+
+        # Add a second handler
+        stream = io.StringIO()
+        second_handler = logging.StreamHandler(stream)
+        second_handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(second_handler)
+
+        set_request_context("ab12cd", "WS")
+        logger.info("test message")
+
+        output = stream.getvalue()
+        # Prefix should appear exactly once, not twice
+        assert output.count("[ab12cd][WS]") == 1

@@ -1,11 +1,20 @@
 """Main FlowProxyPlugin class implementation."""
 
-from typing import Any
+import os
+import secrets
+import threading
+from typing import Any, Optional
 
 from proxy.http.parser import HttpParser
 from proxy.http.proxy import HttpProxyBasePlugin
 
+from ..utils.log_context import clear_request_context, set_request_context
+from ..utils.plugin_pool import PluginPool
 from .base_plugin import BaseFlowProxyPlugin
+
+_proxy_pool: Optional["PluginPool[FlowProxyPlugin]"] = None
+_proxy_pool_lock = threading.Lock()
+_PROXY_POOL_SIZE = int(os.getenv("FLOW_PROXY_PLUGIN_POOL_SIZE", "64"))
 
 
 class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
@@ -16,12 +25,57 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
     proxy mode (curl -x).
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    _log_once: bool = False  # Class variable: log initialization message only once
+
+    def __new__(  # pylint: disable=too-many-positional-arguments
+        cls,
+        uid: str,
+        flags: Any,
+        client: Any,
+        event_queue: Any,
+        upstream_conn_pool: Any = None,
+    ) -> "FlowProxyPlugin":
+        global _proxy_pool  # pylint: disable=global-statement
+        if _proxy_pool is None:
+            with _proxy_pool_lock:
+                if _proxy_pool is None:
+                    _proxy_pool = PluginPool(cls, max_size=_PROXY_POOL_SIZE)
+        return _proxy_pool.acquire(uid, flags, client, event_queue, upstream_conn_pool)
+
+    def __init__(  # pylint: disable=too-many-positional-arguments
+        self,
+        uid: str,
+        flags: Any,
+        client: Any,
+        event_queue: Any,
+        upstream_conn_pool: Any = None,
+    ) -> None:
         """Initialize plugin and load authentication configurations."""
-        super().__init__(*args, **kwargs)
-        self._setup_logging()
-        self.logger.info("Initializing FlowProxyPlugin...")
-        self._initialize_components()
+        if self._pooled:
+            return  # Reuse: _rebind() already ran in pool.acquire()
+        # First-time initialization (runs exactly once per instance)
+        HttpProxyBasePlugin.__init__(
+            self, uid, flags, client, event_queue, upstream_conn_pool
+        )
+        self._init_services()
+        self._pooled = True
+        if not FlowProxyPlugin._log_once:
+            FlowProxyPlugin._log_once = True
+            self.logger.info("FlowProxyPlugin initialized (pooled)")
+
+    def _rebind(  # pylint: disable=too-many-positional-arguments,arguments-differ
+        self,
+        uid: str,
+        flags: Any,
+        client: Any,
+        event_queue: Any,
+        upstream_conn_pool: Any = None,
+    ) -> None:
+        """Rebind proxy.py connection-specific state for pool reuse."""
+        HttpProxyBasePlugin.__init__(
+            self, uid, flags, client, event_queue, upstream_conn_pool
+        )
+        self._pooled = True  # Ensure flag stays True
 
     def before_upstream_connection(self, request: HttpParser) -> HttpParser | None:
         """Process request before establishing upstream connection.
@@ -40,6 +94,8 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
         Returns:
             Modified request with authentication headers, or None to reject
         """
+        req_id = secrets.token_hex(3)
+        set_request_context(req_id, "PROXY")
         try:
             # Convert reverse proxy requests to forward proxy format
             self._convert_reverse_proxy_request(request)
@@ -60,7 +116,7 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
             # Log success
             target_url = self._decode_bytes(request.path) if request.path else "unknown"
             self.logger.info(
-                "Request processed with config '%s' � %s", config_name, target_url
+                "Request processed with config '%s' → %s", config_name, target_url
             )
 
             return modified_request
@@ -71,6 +127,8 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
         except Exception as e:
             self.logger.error("Unexpected error: %s", str(e), exc_info=True)
             return None
+        finally:
+            clear_request_context()
 
     def _convert_reverse_proxy_request(self, request: HttpParser) -> None:
         """Convert reverse proxy request (path only) to forward proxy format (full URL).
@@ -91,7 +149,7 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
         request.set_url(target_url.encode())
 
         self.logger.debug(
-            "Converted reverse proxy request: %s � %s", original_path, target_url
+            "Converted reverse proxy request: %s → %s", original_path, target_url
         )
 
     def handle_client_request(self, request: HttpParser) -> HttpParser | None:
@@ -134,8 +192,10 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
             return chunk  # Return chunk anyway to maintain connection stability
 
     def on_upstream_connection_close(self) -> None:
-        """Handle upstream connection closure."""
+        """Return instance to pool on upstream connection close."""
         self.logger.info("Upstream connection closed")
+        if _proxy_pool is not None and self._pooled:
+            _proxy_pool.release(self)
 
     def on_access_log(self, context: dict[str, Any]) -> dict[str, Any] | None:
         """Add plugin-specific information to access log.
