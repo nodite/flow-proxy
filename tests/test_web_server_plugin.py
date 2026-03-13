@@ -884,3 +884,150 @@ class TestHelperMethods:
         plugin._send_response_headers_from(h)
         calls = [bytes(c.args[0]) for c in plugin.client.queue.call_args_list]  # type: ignore[attr-defined]
         assert calls[-1] == b"\r\n"
+
+
+class TestStreamingWorker:
+    """Tests for _streaming_worker() background thread method."""
+
+    def _make_state(self) -> "StreamingState":
+        import os
+        import queue as q
+        import threading
+
+        pipe_r, pipe_w = os.pipe()
+        return StreamingState(
+            pipe_r=pipe_r, pipe_w=pipe_w,
+            chunk_queue=q.Queue(),
+            thread=None,
+            cancel=threading.Event(),
+            req_id="test01",
+            config_name="cfg",
+        )
+
+    def test_worker_puts_headers_then_chunks_then_sentinel(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """Worker puts _ResponseHeaders, byte chunks, then None sentinel in order."""
+        import os
+        state = self._make_state()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.reason_phrase = "OK"
+        mock_response.headers = httpx.Headers({"content-type": "application/json"})
+        mock_response.iter_bytes.return_value = iter([b"chunk1", b"chunk2"])
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_svc.http_client.stream.return_value = mock_response
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("GET", "https://example.com", {}, None, state)
+
+        items = []
+        while not state.chunk_queue.empty():
+            items.append(state.chunk_queue.get_nowait())
+
+        assert isinstance(items[0], _ResponseHeaders)
+        assert items[1] == b"chunk1"
+        assert items[2] == b"chunk2"
+        assert items[-1] is None  # sentinel
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)
+
+    def test_worker_sse_encodes_lines(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """SSE lines are encoded: empty string → b'\\n', content → bytes with \\n."""
+        import os
+        state = self._make_state()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.reason_phrase = "OK"
+        mock_response.headers = httpx.Headers({"content-type": "text/event-stream"})
+        mock_response.iter_lines.return_value = iter(["data: hi", "", "data: bye"])
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_svc.http_client.stream.return_value = mock_response
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("POST", "https://example.com", {}, None, state)
+
+        items = []
+        while not state.chunk_queue.empty():
+            items.append(state.chunk_queue.get_nowait())
+
+        assert isinstance(items[0], _ResponseHeaders)  # headers
+        assert items[1] == b"data: hi\n"
+        assert items[2] == b"\n"          # SSE event boundary
+        assert items[3] == b"data: bye\n"
+        assert items[-1] is None
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)
+
+    def test_worker_cancel_stops_iteration(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """cancel_event causes worker to break out of the iteration loop."""
+        import os
+
+        state = self._make_state()
+        state.cancel.set()  # pre-set cancel before worker starts
+
+        def slow_iter() -> "Generator[bytes, None, None]":
+            yield b"first"
+            yield b"should not appear"
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.reason_phrase = "OK"
+        mock_response.headers = httpx.Headers({"content-type": "application/json"})
+        mock_response.iter_bytes.return_value = slow_iter()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_svc.http_client.stream.return_value = mock_response
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("GET", "https://example.com", {}, None, state)
+
+        items = []
+        while not state.chunk_queue.empty():
+            items.append(state.chunk_queue.get_nowait())
+
+        # First chunk may or may not be present (cancel checked before enqueue),
+        # but sentinel must be last and "should not appear" must not be present.
+        assert items[-1] is None
+        byte_items = [i for i in items if isinstance(i, bytes)]
+        assert b"should not appear" not in byte_items
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)
+
+    def test_worker_transport_error_sets_state_error_and_sentinel(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """On httpx.TransportError, worker stores error, marks client dirty, puts sentinel."""
+        import os
+        state = self._make_state()
+        mock_svc.http_client.stream.side_effect = httpx.TransportError("conn failed")
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("GET", "https://example.com", {}, None, state)
+
+        assert isinstance(state.error, httpx.TransportError)
+        assert state.chunk_queue.get_nowait() is None  # sentinel
+        mock_svc.mark_http_client_dirty.assert_called_once()
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)
+
+    def test_worker_generic_exception_sets_error_and_sentinel(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        import os
+        state = self._make_state()
+        mock_svc.http_client.stream.side_effect = RuntimeError("boom")
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("GET", "https://example.com", {}, None, state)
+
+        assert isinstance(state.error, RuntimeError)
+        assert state.chunk_queue.get_nowait() is None
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)

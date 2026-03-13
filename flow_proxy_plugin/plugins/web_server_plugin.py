@@ -431,6 +431,102 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
         self.client.queue(memoryview(b"\r\n"))
 
+    def _streaming_worker(  # pylint: disable=too-many-positional-arguments
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        state: StreamingState,
+    ) -> None:
+        """Background thread: opens httpx stream, feeds chunks into state.chunk_queue.
+
+        Queue protocol (strict order):
+          1. _ResponseHeaders  — response metadata for main thread to send headers
+          2. bytes             — one item per non-empty chunk/encoded SSE line
+          3. None              — sentinel, always last (even on error)
+
+        Never touches self.client. Thread-safety invariant: only main thread uses self.client.
+        """
+        set_request_context(state.req_id, "WS")
+        try:
+            http_client = ProcessServices.get().get_http_client()
+            with http_client.stream(
+                method=method,
+                url=url,
+                headers=headers,
+                content=body,
+                timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
+            ) as response:
+                is_sse = "text/event-stream" in response.headers.get("content-type", "")
+                self.logger.info(
+                    "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
+                    response.status_code,
+                    response.reason_phrase,
+                    response.headers.get("transfer-encoding", "none"),
+                    response.headers.get("content-length", "none"),
+                )
+                state.chunk_queue.put(
+                    _ResponseHeaders(
+                        status_code=response.status_code,
+                        reason_phrase=response.reason_phrase,
+                        headers=dict(response.headers),
+                        is_sse=is_sse,
+                    )
+                )
+                try:
+                    os.write(state.pipe_w, b"\x00")
+                except OSError:
+                    return  # client already disconnected
+
+                first_logged = False
+                if is_sse:
+                    for line in response.iter_lines():
+                        if state.cancel.is_set():
+                            break
+                        chunk = self._encode_sse_line(line)
+                        if chunk:
+                            if not first_logged:
+                                self.logger.info(
+                                    "Received first SSE line from backend: %d chars", len(line)
+                                )
+                                first_logged = True
+                            state.chunk_queue.put(chunk)
+                            try:
+                                os.write(state.pipe_w, b"\x00")
+                            except OSError:
+                                return
+                else:
+                    for chunk in response.iter_bytes():
+                        if state.cancel.is_set():
+                            break
+                        if not chunk:
+                            continue
+                        if not first_logged:
+                            self.logger.info(
+                                "Received first chunk from backend: %d bytes", len(chunk)
+                            )
+                            first_logged = True
+                        state.chunk_queue.put(chunk)
+                        try:
+                            os.write(state.pipe_w, b"\x00")
+                        except OSError:
+                            return
+
+        except httpx.TransportError as e:
+            self.logger.error("Transport error — marking httpx client dirty: %s", e)
+            ProcessServices.get().mark_http_client_dirty()
+            state.error = e
+        except Exception as e:
+            self.logger.error("Worker error: %s", e, exc_info=True)
+            state.error = e
+        finally:
+            state.chunk_queue.put(None)
+            try:
+                os.write(state.pipe_w, b"\x00")
+            except OSError:
+                pass  # pipe may already be closed (client disconnected)
+
     def _stream_response_body(self, response: httpx.Response) -> StreamStats:
         """Stream response body to client; returns stats for the completed stream.
 
