@@ -67,6 +67,8 @@ httpx.stream() opens
 
 Holds all per-request streaming state; stored as `self._streaming_state`.
 
+`self._streaming_state` is initialized to `None` in `__init__` (first-time init) and must also be set to `None` in `_rebind()` to prevent pool-reuse from carrying a stale state reference.
+
 ```python
 @dataclass
 class StreamingState:
@@ -79,8 +81,12 @@ class StreamingState:
     config_name: str                     # for final access log line
     headers_sent: bool = False           # guards error-response logic
     status_code: int = 0                 # stored after headers item is processed
-    error: BaseException | None = None   # set by worker on exception
+    error: BaseException | None = None   # set by worker on exception; GIL ensures
+                                         # visibility when main thread reads after
+                                         # queue.get(None) — no lock needed in CPython
 ```
+
+**`state.error` thread safety note:** `state.error` is written by the worker thread before `queue.put(None)` and read by the main thread after `queue.get_nowait()` returns `None`. CPython's GIL guarantees that the write is visible after the queue operation. This is an accepted CPython-specific pattern; porting to a GIL-free interpreter would require an explicit lock.
 
 ### `_ResponseHeaders`
 
@@ -137,22 +143,37 @@ def handle_request(self, request: HttpParser) -> None:
     ...
 
     pipe_r, pipe_w = os.pipe()
-    state = StreamingState(
-        pipe_r=pipe_r, pipe_w=pipe_w,
-        chunk_queue=queue.Queue(),
-        cancel=threading.Event(),
-        req_id=req_id,
-        config_name=config_name,
-        thread=threading.Thread(target=self._dummy),  # replaced below
-    )
-    self._streaming_state = state
-    state.thread = threading.Thread(
-        target=self._streaming_worker,
-        args=(method, target_url, headers, body, state),
-        name=f"streaming-{req_id}",
-        daemon=True,
-    )
-    state.thread.start()
+    try:
+        state = StreamingState(
+            pipe_r=pipe_r, pipe_w=pipe_w,
+            chunk_queue=queue.Queue(),
+            cancel=threading.Event(),
+            req_id=req_id,
+            config_name=config_name,
+            thread=threading.Thread(
+                target=self._streaming_worker,
+                args=(method, target_url, headers, body),  # state injected after
+                name=f"streaming-{req_id}",
+                daemon=True,
+            ),
+        )
+        # Re-create with state in args now that state exists
+        state.thread = threading.Thread(
+            target=self._streaming_worker,
+            args=(method, target_url, headers, body, state),
+            name=f"streaming-{req_id}",
+            daemon=True,
+        )
+        self._streaming_state = state
+        state.thread.start()
+    except Exception:
+        # Ensure pipe fds are not leaked if setup fails
+        try: os.close(pipe_r)
+        except OSError: pass
+        try: os.close(pipe_w)
+        except OSError: pass
+        self._streaming_state = None
+        raise
     # Return immediately — event loop resumes
 ```
 
@@ -211,6 +232,8 @@ def _streaming_worker(
 
 `_encode_sse_line(raw: str) -> bytes` replicates current `_stream_sse` encoding: empty string → `b"\n"`, otherwise `(raw + "\n").encode()`.
 
+**Type note:** `iter_lines()` yields `str`; `iter_bytes()` yields `bytes`. The two branches of the iterator loop have different types for `raw`. Under strict MyPy the loop body must use explicit type narrowing or separate branches — a single unified `raw` variable would cause a type error. Implementation must handle this with a type guard or two separate loops.
+
 ### `get_descriptors()` (new override)
 
 ```python
@@ -251,8 +274,16 @@ async def read_from_descriptors(self, readables: list[int]) -> bool:
 
 ### `_finish_stream()` (new)
 
+Closes the pipe fds and clears `self._streaming_state` immediately to prevent `get_descriptors()` from returning a stale `pipe_r` after teardown is signalled.
+
 ```python
 def _finish_stream(self, state: StreamingState) -> None:
+    # Clear state before logging so get_descriptors() returns [] immediately
+    self._streaming_state = None
+    for fd in (state.pipe_r, state.pipe_w):
+        try: os.close(fd)
+        except OSError: pass
+
     if state.error:
         if not state.headers_sent:
             self._send_error(503, "Upstream error")
@@ -263,6 +294,8 @@ def _finish_stream(self, state: StreamingState) -> None:
         log_func("← %d ... [%s]", state.status_code, state.config_name)
     clear_request_context()
 ```
+
+Because `_finish_stream()` closes the fds and clears `self._streaming_state`, subsequent calls to `get_descriptors()` return `[]`. `_reset_request_state()` checks for `None` before acting, so the double-close is harmless.
 
 ### `_reset_request_state()` (new override)
 
@@ -275,6 +308,11 @@ def _reset_request_state(self) -> None:
         return
     state.cancel.set()
     state.thread.join(timeout=2.0)
+    # join timeout: if upstream is unresponsive and cancel does not interrupt
+    # iter_bytes()/iter_lines() in time, the worker is abandoned as a daemon
+    # thread. It holds no reference to self.client (invariant), so no further
+    # socket writes occur. Its finally block suppresses OSError on the closed
+    # pipe_w fd below.
     for fd in (state.pipe_r, state.pipe_w):
         try:
             os.close(fd)
@@ -283,9 +321,17 @@ def _reset_request_state(self) -> None:
     self._streaming_state = None
 ```
 
-### `_send_response_headers_from()` (new)
+### `_send_response_headers_from(item: _ResponseHeaders)` (new)
 
-Replaces `_send_response_headers(response: httpx.Response)` for the B3 path. Takes the plain-data `_ResponseHeaders` and calls `self.client.queue()` with the same logic as the current implementation.
+Replaces `_send_response_headers(response: httpx.Response)` for the B3 path. Called from the main thread only.
+
+Writes to `self.client` in this order:
+1. Status line: `HTTP/1.1 {status_code} {reason_phrase}\r\n`
+2. Each response header from `item.headers`, excluding `connection` and (for non-SSE) `transfer-encoding`
+3. For SSE: additionally queue `Cache-Control: no-cache\r\n` and `X-Accel-Buffering: no\r\n`
+4. Blank line: `\r\n`
+
+All bytes are passed as `memoryview` to `self.client.queue()`.
 
 ---
 
@@ -344,3 +390,8 @@ Log lines emitted by this feature:
 | `test_worker_error_before_headers_sends_503` | `state.headers_sent = False` + `state.error` set → `_send_error(503)` called |
 | `test_worker_error_after_headers_logs_only` | `state.headers_sent = True` + `state.error` → no error response, only log |
 | `test_reset_cleans_up_pipe_fds` | After `_reset_request_state()`, both pipe fds are closed |
+| `test_get_descriptors_returns_empty_when_no_state` | `get_descriptors()` returns `[], []` when `_streaming_state` is `None` |
+| `test_read_from_descriptors_noop_when_pipe_not_readable` | Returns `False` when `pipe_r` is not in `readables` |
+| `test_handle_request_cleans_up_pipe_on_setup_failure` | If thread start raises, both pipe fds are closed |
+| `test_reset_is_safe_when_join_times_out` | `_reset_request_state()` closes fds even if `join()` times out |
+| `test_get_descriptors_empty_after_stream_finishes` | After sentinel processed, `get_descriptors()` returns `[]` |
