@@ -41,14 +41,25 @@ class StreamStats:
 
     @property
     def ttft_ms(self) -> float | None:
-        """Time-to-first-token in milliseconds, or None if no data received."""
+        """Time from stream iteration start to first data byte, in ms.
+
+        Measures how long iter_bytes()/iter_lines() blocked before yielding the
+        first non-empty chunk. Returns None if no data was received.
+        Note: this does not include network round-trip time; it reflects buffering
+        latency within the httpx streaming iterator.
+        """
         if self.first_chunk_time is None:
             return None
         return (self.first_chunk_time - self.start_time) * 1000
 
     @property
     def duration_ms(self) -> float | None:
-        """Stream duration (first chunk -> last chunk) in ms, or None if incomplete."""
+        """Stream duration (first data -> streaming end) in ms.
+
+        Returns None only if no data was received (first_chunk_time is None).
+        Always set for completed and interrupted streams that received at least
+        one chunk, because end_time is set unconditionally in the finally block.
+        """
         if self.end_time is None or self.first_chunk_time is None:
             return None
         return (self.end_time - self.first_chunk_time) * 1000
@@ -406,7 +417,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         Sets stats.completed = True only when the iterator exhausts cleanly.
         """
         for line in response.iter_lines():
-            if line == "":
+            is_separator = line == ""
+            if is_separator:
                 # SSE event boundary separator
                 data = b"\n"
             else:
@@ -419,7 +431,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             try:
                 self.client.queue(memoryview(data))
                 stats.bytes_sent += len(data)
-                if line == "":
+                if is_separator:
                     stats.event_count += 1  # count only after successful delivery
                 else:
                     stats.chunks_sent += 1
@@ -440,9 +452,9 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             if stats.completed:
                 if stats.ttft_ms is not None:
                     self.logger.info(
-                        "SSE stream complete: TTFT=%.0fms, duration=%.0fms, events=%d, bytes=%d",
+                        "SSE stream complete: first_byte=%.0fms, duration=%.0fms, events=%d, bytes=%d",
                         stats.ttft_ms,
-                        stats.duration_ms or 0.0,
+                        stats.duration_ms,
                         stats.event_count,
                         stats.bytes_sent,
                     )
@@ -453,7 +465,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             else:
                 if stats.ttft_ms is not None:
                     self.logger.info(
-                        "SSE stream interrupted: TTFT=%.0fms, events=%d, bytes=%d",
+                        "SSE stream interrupted: first_byte=%.0fms, events=%d, bytes=%d",
                         stats.ttft_ms,
                         stats.event_count,
                         stats.bytes_sent,

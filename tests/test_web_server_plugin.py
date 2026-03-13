@@ -218,7 +218,6 @@ class TestFlowProxyWebServerPluginInitialization:
         assert routes[0][1] == r"/.*"
 
 
-
 class TestPrepareHeaders:
     """Test header preparation."""
 
@@ -493,17 +492,8 @@ class TestSseStreamStats:
         )
         plugin.client = Mock(queue=Mock())
 
-        time_values = [1000.0, 1000.042, 1003.292]
-        call_index = 0
-
-        def mock_perf_counter() -> float:
-            nonlocal call_index
-            val = time_values[call_index % len(time_values)]
-            call_index += 1
-            return val
-
         with patch("flow_proxy_plugin.plugins.web_server_plugin.time") as mock_time:
-            mock_time.perf_counter.side_effect = mock_perf_counter
+            mock_time.perf_counter.side_effect = iter([1000.0, 1000.042, 1003.292])
             stats = plugin._stream_response_body(mock_response)
 
         assert stats.ttft_ms is not None
@@ -512,18 +502,21 @@ class TestSseStreamStats:
     def test_sse_stream_stats_duration(
         self, plugin: FlowProxyWebServerPlugin
     ) -> None:
-        """duration_ms is non-None and positive after a complete SSE stream."""
-        lines = ["data: tok1", "", "data: tok2", ""]
+        """duration_ms measures time from first data to stream end."""
+        lines = ["data: tok1", ""]
         mock_response = make_mock_httpx_response(
             headers={"content-type": "text/event-stream"},
             lines=lines,
         )
         plugin.client = Mock(queue=Mock())
 
-        stats = plugin._stream_response_body(mock_response)
+        # start=1000.0, first_chunk=1000.042, end=1003.292 → duration=3250ms
+        with patch("flow_proxy_plugin.plugins.web_server_plugin.time") as mock_time:
+            mock_time.perf_counter.side_effect = iter([1000.0, 1000.042, 1003.292])
+            stats = plugin._stream_response_body(mock_response)
 
         assert stats.duration_ms is not None
-        assert stats.duration_ms >= 0.0
+        assert abs(stats.duration_ms - 3250.0) < 1.0
 
     def test_sse_stream_interrupted_on_broken_pipe(
         self, plugin: FlowProxyWebServerPlugin
@@ -564,6 +557,58 @@ class TestSseStreamStats:
         assert stats.event_count == 0
         assert stats.bytes_sent == sum(len(c) for c in chunks)
         assert stats.completed is True
+
+    def test_sse_empty_stream(self, plugin: FlowProxyWebServerPlugin) -> None:
+        """Empty SSE stream (zero lines): completed=True, no data counters incremented."""
+        mock_response = make_mock_httpx_response(
+            headers={"content-type": "text/event-stream"},
+            lines=[],
+        )
+        plugin.client = Mock(queue=Mock())
+
+        stats = plugin._stream_response_body(mock_response)
+
+        assert stats.completed is True
+        assert stats.event_count == 0
+        assert stats.chunks_sent == 0
+        assert stats.bytes_sent == 0
+        assert stats.ttft_ms is None
+
+    def test_sse_interrupted_before_first_data(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """BrokenPipeError on first queue call: completed=False, bytes_sent==0, end_time set."""
+        lines = ["data: tok1", ""]
+        mock_response = make_mock_httpx_response(
+            headers={"content-type": "text/event-stream"},
+            lines=lines,
+        )
+        plugin.client = Mock(queue=Mock(side_effect=BrokenPipeError()))
+
+        stats = plugin._stream_response_body(mock_response)  # must not raise
+
+        assert stats.completed is False
+        assert stats.bytes_sent == 0
+        assert stats.end_time is not None
+
+    def test_sse_oserror_non_32_logs_warning(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """OSError with errno != 32 triggers warning log, not debug, and stops streaming."""
+        lines = ["data: tok1", ""]
+        mock_response = make_mock_httpx_response(
+            headers={"content-type": "text/event-stream"},
+            lines=lines,
+        )
+        err = OSError("Input/output error")
+        err.errno = 5
+        plugin.client = Mock(queue=Mock(side_effect=err))
+
+        with patch.object(plugin.logger, "warning") as mock_warning:
+            stats = plugin._stream_response_body(mock_response)  # must not raise
+
+        mock_warning.assert_called_once()
+        assert stats.completed is False
 
 
 class TestSendError:
