@@ -13,6 +13,7 @@ from .utils.logging import setup_logging
 
 try:
     from importlib.metadata import version
+
     __version__ = version("flow-proxy-plugin")
 except Exception:
     __version__ = "unknown"
@@ -119,8 +120,8 @@ def main() -> None:
     parser.add_argument(
         "--client-timeout",
         type=float,
-        default=float(os.getenv("FLOW_PROXY_CLIENT_TIMEOUT", "120")),
-        help="Client connection inactivity timeout in seconds (default: 120, env: FLOW_PROXY_CLIENT_TIMEOUT). "
+        default=float(os.getenv("FLOW_PROXY_CLIENT_TIMEOUT", "600")),
+        help="Client connection inactivity timeout in seconds (default: 600, env: FLOW_PROXY_CLIENT_TIMEOUT). "
         "Must be >= backend TTFB for streaming; proxy.py default is 10s which can close before first byte.",
     )
 

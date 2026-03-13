@@ -193,6 +193,10 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         state = self._streaming_state
         if state is None:
             return
+        set_request_context(state.req_id, "WS")
+        self.logger.info(
+            "Stream canceled (client disconnect), no ← 200 [%s]", state.config_name
+        )
         state.cancel.set()
         if state.thread is not None:
             state.thread.join(timeout=2.0)
@@ -204,6 +208,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             except OSError:
                 pass
         self._streaming_state = None
+        clear_request_context()
 
     def routes(self) -> list[tuple[int, str]]:
         """Define routes that this plugin handles."""
@@ -505,12 +510,18 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             except OSError:
                 pass  # pipe may already be closed (client disconnected)
 
+    _REASON_PHRASES: dict[int, str] = {
+        500: "Internal Server Error",
+        503: "Service Unavailable",
+    }
+
     def _send_error(
         self, status_code: int = 500, message: str = "Internal server error"
     ) -> None:
         """Send error response to client."""
+        reason = self._REASON_PHRASES.get(status_code, "Error")
         error_response = (
-            f"HTTP/1.1 {status_code} Error\r\n"
+            f"HTTP/1.1 {status_code} {reason}\r\n"
             f"Content-Type: application/json\r\n"
             f"Connection: close\r\n"
             f"\r\n"

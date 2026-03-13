@@ -322,7 +322,7 @@ Replaces `_send_response_headers(response: httpx.Response)` for the B3 path. Cal
 
 Writes to `self.client` in this order:
 1. Status line: `HTTP/1.1 {status_code} {reason_phrase}\r\n`
-2. Each response header from `item.headers`, excluding `connection` always, and excluding `transfer-encoding` **for non-SSE only** (SSE responses retain `transfer-encoding: chunked` because they are delivered as a persistent chunked stream)
+2. Each response header from `item.headers`, excluding `connection` always, and excluding `transfer-encoding` always — **including SSE** (the B3 path sends raw bytes without chunked framing; retaining `transfer-encoding` would cause clients to parse as chunked and raise `InvalidHTTPResponse`). See `docs/superpowers/specs/2026-03-13-streaming-robustness-design.md` §2.2 for authoritative contract.
 3. For SSE: additionally queue `Cache-Control: no-cache\r\n` and `X-Accel-Buffering: no\r\n`
 4. Blank line: `\r\n`
 

@@ -149,7 +149,7 @@ All environment variables are prefixed with `FLOW_PROXY_`:
 - `FLOW_PROXY_HOST=127.0.0.1`: Bind address
 - `FLOW_PROXY_NUM_WORKERS`: Worker processes (default: CPU count)
 - `FLOW_PROXY_THREADED=1`: Enable threaded mode (1=on, 0=off)
-- `FLOW_PROXY_CLIENT_TIMEOUT=120`: Client inactivity timeout (seconds); must be ≥ backend TTFB for streaming
+- `FLOW_PROXY_CLIENT_TIMEOUT=600`: Client inactivity timeout (seconds); must be ≥ backend TTFB for streaming
 - `FLOW_PROXY_LOG_LEVEL=INFO`: Logging level
 - `FLOW_PROXY_SECRETS_FILE=secrets.json`: Path to secrets file
 - `FLOW_PROXY_LOG_DIR=logs`: Log directory

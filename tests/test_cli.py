@@ -135,7 +135,7 @@ class TestCLI:
                 args = mock_proxy.call_args[1]["input_args"]
                 assert "--timeout" in args
                 idx = args.index("--timeout")
-                assert args[idx + 1] == "120"
+                assert args[idx + 1] == "600"
 
     def test_client_timeout_custom(self) -> None:
         """Test custom client timeout via CLI and env."""
@@ -279,7 +279,9 @@ class TestCLI:
             # Check that version was logged
             calls = [str(call) for call in mock_log.info.call_args_list]
             version_logged = any(f"v{__version__}" in str(call) for call in calls)
-            assert version_logged, f"Version not found in logs. __version__={__version__}"
+            assert version_logged, (
+                f"Version not found in logs. __version__={__version__}"
+            )
 
     def test_version_format(self) -> None:
         """Test that version is in correct format."""
