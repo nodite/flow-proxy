@@ -2,6 +2,7 @@
 
 import logging
 import os
+import queue
 import secrets
 import threading
 import time
@@ -63,6 +64,41 @@ class StreamStats:
         if self.end_time is None or self.first_chunk_time is None:
             return None
         return (self.end_time - self.first_chunk_time) * 1000
+
+
+@dataclass
+class _ResponseHeaders:
+    """Response metadata passed from worker thread to main thread.
+
+    Contains only plain Python types — no httpx objects cross thread boundaries.
+    """
+
+    status_code: int
+    reason_phrase: str
+    headers: dict[str, str]  # extracted from httpx.Headers
+    is_sse: bool  # True if Content-Type: text/event-stream
+
+
+@dataclass
+class StreamingState:  # pylint: disable=too-many-instance-attributes
+    """Per-request streaming state for the B3 async pipe-mediated pattern.
+
+    Stored as self._streaming_state. Initialized to None in __init__ and _rebind().
+    Thread-safety: self.client is ONLY touched by the main thread.
+    state.error is written by worker before queue.put(None) and read by main
+    thread after queue.get() returns None — GIL guarantees visibility in CPython.
+    """
+
+    pipe_r: int  # registered with selector as readable fd
+    pipe_w: int  # worker writes notification bytes here
+    chunk_queue: "queue.Queue[_ResponseHeaders | bytes | None]"
+    thread: threading.Thread | None  # None until assigned in handle_request()
+    cancel: threading.Event  # set by _reset_request_state() on disconnect
+    req_id: str  # for log context
+    config_name: str  # for final access log line
+    headers_sent: bool = False  # guards error-response logic
+    status_code: int = 0  # stored after _ResponseHeaders item is processed
+    error: BaseException | None = None  # set by worker on exception
 
 
 class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
@@ -170,7 +206,9 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                     url=target_url,
                     headers=headers,
                     content=body,
-                    timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
+                    timeout=httpx.Timeout(
+                        connect=30.0, read=600.0, write=30.0, pool=30.0
+                    ),
                 ) as response:
                     self.logger.info(
                         "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
@@ -396,7 +434,10 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 stats.bytes_sent += len(chunk)
                 stats.chunks_sent += 1
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                if not isinstance(e, (BrokenPipeError, ConnectionResetError)) and e.errno != 32:
+                if (
+                    not isinstance(e, (BrokenPipeError, ConnectionResetError))
+                    and e.errno != 32
+                ):
                     self.logger.warning("OS error during streaming: %s", e)
                 else:
                     self.logger.debug(
@@ -436,7 +477,10 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 else:
                     stats.chunks_sent += 1
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                if not isinstance(e, (BrokenPipeError, ConnectionResetError)) and e.errno != 32:
+                if (
+                    not isinstance(e, (BrokenPipeError, ConnectionResetError))
+                    and e.errno != 32
+                ):
                     self.logger.warning("OS error during SSE streaming: %s", e)
                 else:
                     self.logger.debug(
@@ -460,7 +504,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                     )
                 else:
                     self.logger.info(
-                        "SSE stream complete: no data received, bytes=%d", stats.bytes_sent
+                        "SSE stream complete: no data received, bytes=%d",
+                        stats.bytes_sent,
                     )
             else:
                 if stats.ttft_ms is not None:
@@ -472,7 +517,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                     )
                 else:
                     self.logger.info(
-                        "SSE stream interrupted: no data received, bytes=%d", stats.bytes_sent
+                        "SSE stream interrupted: no data received, bytes=%d",
+                        stats.bytes_sent,
                     )
         else:
             prefix = "Stream complete" if stats.completed else "Stream interrupted"

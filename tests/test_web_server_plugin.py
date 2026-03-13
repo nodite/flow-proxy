@@ -1,5 +1,6 @@
 """Unit tests for FlowProxyWebServerPlugin."""
 
+import queue
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
@@ -12,9 +13,45 @@ from proxy.http.parser import HttpParser
 import flow_proxy_plugin.plugins.web_server_plugin as ws_mod
 from flow_proxy_plugin.plugins.web_server_plugin import (
     FlowProxyWebServerPlugin,
+    StreamingState,
     StreamStats,
+    _ResponseHeaders,
 )
 from flow_proxy_plugin.utils.process_services import ProcessServices
+
+
+class TestDataStructures:
+    def test_streaming_state_defaults(self) -> None:
+        import os
+        import threading
+
+        pipe_r, pipe_w = os.pipe()
+        try:
+            state = StreamingState(
+                pipe_r=pipe_r,
+                pipe_w=pipe_w,
+                chunk_queue=queue.Queue(),
+                thread=None,
+                cancel=threading.Event(),
+                req_id="abc123",
+                config_name="test-config",
+            )
+            assert state.headers_sent is False
+            assert state.status_code == 0
+            assert state.error is None
+        finally:
+            os.close(pipe_r)
+            os.close(pipe_w)
+
+    def test_response_headers_fields(self) -> None:
+        h = _ResponseHeaders(
+            status_code=200,
+            reason_phrase="OK",
+            headers={"content-type": "text/event-stream"},
+            is_sse=True,
+        )
+        assert h.is_sse is True
+        assert h.headers["content-type"] == "text/event-stream"
 
 
 class TestStreamStats:
@@ -259,7 +296,10 @@ class TestSendResponseHeaders:
     ) -> None:
         """SSE responses must include Cache-Control: no-cache and X-Accel-Buffering: no."""
         mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream", "transfer-encoding": "chunked"}
+            headers={
+                "content-type": "text/event-stream",
+                "transfer-encoding": "chunked",
+            }
         )
         queued: list[bytes] = []
         plugin.client = Mock(queue=lambda mv: queued.append(bytes(mv)))
@@ -275,7 +315,10 @@ class TestSendResponseHeaders:
     ) -> None:
         """SSE responses must NOT strip Transfer-Encoding: chunked."""
         mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream", "transfer-encoding": "chunked"}
+            headers={
+                "content-type": "text/event-stream",
+                "transfer-encoding": "chunked",
+            }
         )
         queued: list[bytes] = []
         plugin.client = Mock(queue=lambda mv: queued.append(bytes(mv)))
@@ -481,9 +524,7 @@ class TestSseStreamStats:
         total_queued = sum(len(b) for b in queued)
         assert stats.bytes_sent == total_queued
 
-    def test_sse_stream_stats_ttft(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
+    def test_sse_stream_stats_ttft(self, plugin: FlowProxyWebServerPlugin) -> None:
         """ttft_ms measures time from start_time to first non-empty line."""
         lines = ["data: tok1", ""]
         mock_response = make_mock_httpx_response(
@@ -499,9 +540,7 @@ class TestSseStreamStats:
         assert stats.ttft_ms is not None
         assert abs(stats.ttft_ms - 42.0) < 1.0
 
-    def test_sse_stream_stats_duration(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
+    def test_sse_stream_stats_duration(self, plugin: FlowProxyWebServerPlugin) -> None:
         """duration_ms measures time from first data to stream end."""
         lines = ["data: tok1", ""]
         mock_response = make_mock_httpx_response(
@@ -543,12 +582,12 @@ class TestSseStreamStats:
         assert stats.end_time is not None
         assert stats.bytes_sent > 0
 
-    def test_non_sse_stream_stats(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
+    def test_non_sse_stream_stats(self, plugin: FlowProxyWebServerPlugin) -> None:
         """Non-SSE path: event_count stays 0, bytes_sent and completed are correct."""
         chunks = [b"chunk1", b"chunk2"]
-        mock_response = make_mock_httpx_response(chunks=chunks)  # default: application/json
+        mock_response = make_mock_httpx_response(
+            chunks=chunks
+        )  # default: application/json
 
         plugin.client = Mock(queue=Mock())
 
@@ -683,7 +722,9 @@ class TestHandleRequest:
 
         mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
         with (
-            patch.object(plugin, "_get_config_and_token", return_value=mock_token_result),
+            patch.object(
+                plugin, "_get_config_and_token", return_value=mock_token_result
+            ),
             patch.object(ProcessServices, "get", return_value=mock_svc),
             patch.object(plugin, "_send_error") as mock_error,
         ):
@@ -718,7 +759,9 @@ class TestHandleRequest:
 
         mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
         with (
-            patch.object(plugin, "_get_config_and_token", return_value=mock_token_result),
+            patch.object(
+                plugin, "_get_config_and_token", return_value=mock_token_result
+            ),
             patch.object(ProcessServices, "get", return_value=mock_svc),
         ):
             plugin.handle_request(request)
@@ -743,7 +786,9 @@ class TestHandleRequest:
 
         mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
         with (
-            patch.object(plugin, "_get_config_and_token", return_value=mock_token_result),
+            patch.object(
+                plugin, "_get_config_and_token", return_value=mock_token_result
+            ),
             patch.object(ProcessServices, "get", return_value=mock_svc),
             patch.object(plugin, "_send_error") as mock_error,
         ):
