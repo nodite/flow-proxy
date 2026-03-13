@@ -821,3 +821,66 @@ class TestHandleRequest:
         queued_calls = plugin.client.queue.call_args_list  # type: ignore[attr-defined]
         all_bytes = b"".join(bytes(c[0][0]) for c in queued_calls)
         assert b"200" in all_bytes
+
+
+class TestHelperMethods:
+    def test_encode_sse_line_empty_string_gives_newline(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        result = plugin._encode_sse_line("")
+        assert result == b"\n"
+
+    def test_encode_sse_line_content_line(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        result = plugin._encode_sse_line("data: hello")
+        assert result == b"data: hello\n"
+
+    def test_send_response_headers_from_status_line(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        h = _ResponseHeaders(200, "OK", {"content-type": "application/json"}, False)
+        plugin._send_response_headers_from(h)
+        calls = [bytes(c.args[0]) for c in plugin.client.queue.call_args_list]  # type: ignore[attr-defined]
+        assert b"HTTP/1.1 200 OK\r\n" in calls
+
+    def test_send_response_headers_from_strips_connection(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        h = _ResponseHeaders(200, "OK", {"connection": "keep-alive", "content-type": "text/plain"}, False)
+        plugin._send_response_headers_from(h)
+        calls = [bytes(c.args[0]) for c in plugin.client.queue.call_args_list]  # type: ignore[attr-defined]
+        assert not any(b"connection" in c.lower() for c in calls)
+
+    def test_send_response_headers_from_strips_transfer_encoding_for_non_sse(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        h = _ResponseHeaders(200, "OK", {"transfer-encoding": "chunked"}, False)
+        plugin._send_response_headers_from(h)
+        calls = [bytes(c.args[0]) for c in plugin.client.queue.call_args_list]  # type: ignore[attr-defined]
+        assert not any(b"transfer-encoding" in c.lower() for c in calls)
+
+    def test_send_response_headers_from_keeps_transfer_encoding_for_sse(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        h = _ResponseHeaders(200, "OK", {"transfer-encoding": "chunked", "content-type": "text/event-stream"}, True)
+        plugin._send_response_headers_from(h)
+        calls = [bytes(c.args[0]) for c in plugin.client.queue.call_args_list]  # type: ignore[attr-defined]
+        assert any(b"transfer-encoding" in c.lower() for c in calls)
+
+    def test_send_response_headers_from_adds_sse_anti_buffer_headers(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        h = _ResponseHeaders(200, "OK", {"content-type": "text/event-stream"}, True)
+        plugin._send_response_headers_from(h)
+        calls = [bytes(c.args[0]) for c in plugin.client.queue.call_args_list]  # type: ignore[attr-defined]
+        assert b"Cache-Control: no-cache\r\n" in calls
+        assert b"X-Accel-Buffering: no\r\n" in calls
+
+    def test_send_response_headers_from_ends_with_blank_line(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        h = _ResponseHeaders(200, "OK", {}, False)
+        plugin._send_response_headers_from(h)
+        calls = [bytes(c.args[0]) for c in plugin.client.queue.call_args_list]  # type: ignore[attr-defined]
+        assert calls[-1] == b"\r\n"

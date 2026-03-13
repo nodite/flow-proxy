@@ -396,6 +396,41 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         # End of headers
         self.client.queue(memoryview(b"\r\n"))
 
+    @staticmethod
+    def _encode_sse_line(raw: str) -> bytes:
+        """Encode a single SSE line to bytes.
+
+        Empty string (event boundary separator) → b'\\n'.
+        Content line → (raw + '\\n').encode().
+        """
+        if raw == "":
+            return b"\n"
+        return (raw + "\n").encode()
+
+    def _send_response_headers_from(self, item: _ResponseHeaders) -> None:
+        """Send HTTP status line and headers from a _ResponseHeaders item.
+
+        Called from the main thread only (read_from_descriptors path).
+        Mirrors _send_response_headers() but accepts plain-data _ResponseHeaders
+        instead of an httpx.Response.
+        """
+        status_line = f"HTTP/1.1 {item.status_code} {item.reason_phrase}\r\n"
+        self.client.queue(memoryview(status_line.encode()))
+
+        skip_headers = {"connection"}
+        if not item.is_sse:
+            skip_headers.add("transfer-encoding")
+
+        for name, value in item.headers.items():
+            if name.lower() not in skip_headers:
+                self.client.queue(memoryview(f"{name}: {value}\r\n".encode()))
+
+        if item.is_sse:
+            self.client.queue(memoryview(b"Cache-Control: no-cache\r\n"))
+            self.client.queue(memoryview(b"X-Accel-Buffering: no\r\n"))
+
+        self.client.queue(memoryview(b"\r\n"))
+
     def _stream_response_body(self, response: httpx.Response) -> StreamStats:
         """Stream response body to client; returns stats for the completed stream.
 
