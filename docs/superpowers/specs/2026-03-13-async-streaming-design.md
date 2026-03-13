@@ -286,7 +286,7 @@ def _finish_stream(self, state: StreamingState) -> None:
         log_func("Stream ended with error: %s", state.error)
     else:
         log_func = self.logger.info if state.status_code < 400 else self.logger.warning
-        log_func("← %d ... [%s]", state.status_code, state.config_name)
+        log_func("← %d [%s]", state.status_code, state.config_name)
     clear_request_context()
 ```
 
@@ -355,7 +355,7 @@ Log lines emitted by this feature:
 | Backend request | main | INFO | `[FWD] Sending request to backend: ...` |
 | Backend response headers | worker | INFO | `Backend response: 200 OK, ...` |
 | First chunk | worker | INFO | `Received first SSE line / first chunk` |
-| Stream end | main | INFO | `← 200 OK [config_name]` |
+| Stream end | main | INFO | `← 200 [config_name]` |
 | Worker error | worker | ERROR | `Worker error: ...` |
 
 `set_request_context(req_id, "WS")` is called in both the worker thread and in `read_from_descriptors()` so all log lines carry the correct request ID prefix regardless of which thread emits them.
