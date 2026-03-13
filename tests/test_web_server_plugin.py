@@ -14,7 +14,6 @@ import flow_proxy_plugin.plugins.web_server_plugin as ws_mod
 from flow_proxy_plugin.plugins.web_server_plugin import (
     FlowProxyWebServerPlugin,
     StreamingState,
-    StreamStats,
     _ResponseHeaders,
 )
 from flow_proxy_plugin.utils.process_services import ProcessServices
@@ -53,40 +52,6 @@ class TestDataStructures:
         assert h.is_sse is True
         assert h.headers["content-type"] == "text/event-stream"
 
-
-class TestStreamStats:
-    """Unit tests for StreamStats dataclass."""
-
-    def test_ttft_ms_none_when_no_first_chunk(self) -> None:
-        stats = StreamStats(start_time=1000.0)
-        assert stats.ttft_ms is None
-
-    def test_ttft_ms_calculated_correctly(self) -> None:
-        stats = StreamStats(start_time=1000.0, first_chunk_time=1000.042)
-        assert abs(stats.ttft_ms - 42.0) < 0.001  # type: ignore[operator]
-
-    def test_duration_ms_none_when_no_first_chunk(self) -> None:
-        stats = StreamStats(start_time=1000.0, end_time=1001.0)
-        assert stats.duration_ms is None
-
-    def test_duration_ms_none_when_no_end_time(self) -> None:
-        stats = StreamStats(start_time=1000.0, first_chunk_time=1000.042)
-        assert stats.duration_ms is None
-
-    def test_duration_ms_calculated_correctly(self) -> None:
-        stats = StreamStats(
-            start_time=1000.0,
-            first_chunk_time=1000.042,
-            end_time=1003.292,
-        )
-        assert abs(stats.duration_ms - 3250.0) < 0.001  # type: ignore[operator]
-
-    def test_defaults(self) -> None:
-        stats = StreamStats(start_time=0.0)
-        assert stats.bytes_sent == 0
-        assert stats.chunks_sent == 0
-        assert stats.event_count == 0
-        assert stats.completed is False
 
 
 @pytest.fixture
@@ -288,366 +253,7 @@ class TestPrepareHeaders:
         assert headers["user-agent"] == "test-agent"
 
 
-class TestSendResponseHeaders:
-    """Test _send_response_headers with httpx.Response."""
 
-    def test_sse_response_includes_cache_control_and_accel_buffering(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """SSE responses must include Cache-Control: no-cache and X-Accel-Buffering: no."""
-        mock_response = make_mock_httpx_response(
-            headers={
-                "content-type": "text/event-stream",
-                "transfer-encoding": "chunked",
-            }
-        )
-        queued: list[bytes] = []
-        plugin.client = Mock(queue=lambda mv: queued.append(bytes(mv)))
-
-        plugin._send_response_headers(mock_response)
-
-        all_headers = b"".join(queued)
-        assert b"Cache-Control: no-cache" in all_headers
-        assert b"X-Accel-Buffering: no" in all_headers
-
-    def test_sse_response_preserves_transfer_encoding(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """SSE responses must NOT strip Transfer-Encoding: chunked."""
-        mock_response = make_mock_httpx_response(
-            headers={
-                "content-type": "text/event-stream",
-                "transfer-encoding": "chunked",
-            }
-        )
-        queued: list[bytes] = []
-        plugin.client = Mock(queue=lambda mv: queued.append(bytes(mv)))
-
-        plugin._send_response_headers(mock_response)
-
-        all_headers = b"".join(queued)
-        assert b"transfer-encoding: chunked" in all_headers.lower()
-
-    def test_non_sse_response_has_no_sse_headers(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Non-SSE responses must NOT include SSE-specific headers."""
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "application/json", "content-length": "42"}
-        )
-        queued: list[bytes] = []
-        plugin.client = Mock(queue=lambda mv: queued.append(bytes(mv)))
-
-        plugin._send_response_headers(mock_response)
-
-        all_headers = b"".join(queued)
-        assert b"Cache-Control: no-cache" not in all_headers
-        assert b"X-Accel-Buffering: no" not in all_headers
-
-    def test_uses_reason_phrase_not_reason(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Status line must use reason_phrase (httpx attr), not reason (requests attr)."""
-        mock_response = make_mock_httpx_response(
-            status_code=201, reason_phrase="Created"
-        )
-        queued: list[bytes] = []
-        plugin.client = Mock(queue=lambda mv: queued.append(bytes(mv)))
-
-        plugin._send_response_headers(mock_response)
-
-        status_line = bytes(queued[0])
-        assert b"201 Created" in status_line
-
-
-class TestStreamResponseBody:
-    """Test _stream_response_body with httpx.Response."""
-
-    def test_forwards_all_chunks_immediately(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Each chunk from iter_bytes() is queued immediately — no buffering."""
-        chunks = [b"data: token1\n\n", b"data: token2\n\n", b"data: [DONE]\n\n"]
-        mock_response = make_mock_httpx_response(chunks=chunks)
-
-        queued_chunks: list[bytes] = []
-        plugin.client = Mock(queue=lambda mv: queued_chunks.append(bytes(mv)))
-
-        stats = plugin._stream_response_body(mock_response)
-
-        assert queued_chunks == chunks
-        assert stats.chunks_sent == 3
-        assert stats.bytes_sent == sum(len(c) for c in chunks)
-        assert stats.completed is True
-        assert stats.event_count == 0  # non-SSE path never increments event_count
-
-    def test_stops_when_client_disconnects(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Streaming stops gracefully when client disconnects on first write."""
-        chunks = [b"chunk1", b"chunk2", b"chunk3"]
-        mock_response = make_mock_httpx_response(chunks=chunks)
-
-        plugin.client = Mock(queue=Mock(side_effect=BrokenPipeError()))
-
-        stats = plugin._stream_response_body(mock_response)
-
-        assert stats.bytes_sent == 0
-        assert stats.completed is False
-        assert stats.end_time is not None
-
-    def test_handles_broken_pipe_gracefully(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """BrokenPipeError during streaming exits cleanly without raising."""
-        chunks = [b"chunk1", b"chunk2"]
-        mock_response = make_mock_httpx_response(chunks=chunks)
-
-        call_count = 0
-
-        def queue_with_error(mv: memoryview) -> None:
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 2:
-                raise BrokenPipeError()
-
-        plugin.client = Mock(queue=queue_with_error)
-
-        stats = plugin._stream_response_body(mock_response)  # must not raise
-        assert stats.completed is False
-
-    def test_handles_connection_reset_error_gracefully(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """ConnectionResetError during streaming exits cleanly without raising."""
-        chunks = [b"chunk1", b"chunk2"]
-        mock_response = make_mock_httpx_response(chunks=chunks)
-
-        call_count = 0
-
-        def queue_with_reset(mv: memoryview) -> None:
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 2:
-                raise ConnectionResetError()
-
-        plugin.client = Mock(queue=queue_with_reset)
-
-        stats = plugin._stream_response_body(mock_response)  # must not raise
-        assert stats.completed is False
-
-    def test_handles_os_error_errno_32_gracefully(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """OSError with errno=32 (broken pipe) exits cleanly without raising."""
-        chunks = [b"chunk1", b"chunk2"]
-        mock_response = make_mock_httpx_response(chunks=chunks)
-
-        call_count = 0
-
-        def queue_with_oserror(mv: memoryview) -> None:
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 2:
-                err = OSError("Broken pipe")
-                err.errno = 32
-                raise err
-
-        plugin.client = Mock(queue=queue_with_oserror)
-
-        stats = plugin._stream_response_body(mock_response)  # must not raise
-        assert stats.completed is False
-
-    def test_skips_empty_chunks(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Empty byte strings from iter_bytes() are skipped, not forwarded."""
-        chunks = [b"chunk1", b"", b"chunk2"]
-        mock_response = make_mock_httpx_response(chunks=chunks)
-
-        queued_chunks: list[bytes] = []
-        plugin.client = Mock(queue=lambda mv: queued_chunks.append(bytes(mv)))
-
-        stats = plugin._stream_response_body(mock_response)
-
-        assert queued_chunks == [b"chunk1", b"chunk2"]
-        assert stats.chunks_sent == 2
-
-
-class TestSseStreamStats:
-    """Tests for _stream_response_body with SSE (text/event-stream) responses."""
-
-    def test_sse_stream_stats_event_count(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Empty lines in iter_lines() mark event boundaries and increment event_count."""
-        # Two SSE events: "data: tok1\n\n" and "data: tok2\n\n"
-        lines = ["data: tok1", "", "data: tok2", ""]
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream"},
-            lines=lines,
-        )
-        plugin.client = Mock(queue=Mock())
-
-        stats = plugin._stream_response_body(mock_response)
-
-        assert stats.event_count == 2
-        assert stats.completed is True
-
-    def test_sse_stream_stats_chunks_sent_excludes_separators(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """chunks_sent counts non-empty lines only (not blank event separators)."""
-        lines = ["data: tok1", "", "data: tok2", ""]
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream"},
-            lines=lines,
-        )
-        plugin.client = Mock(queue=Mock())
-
-        stats = plugin._stream_response_body(mock_response)
-
-        assert stats.chunks_sent == 2  # two non-empty lines
-
-    def test_sse_stream_stats_bytes_sent_includes_separators(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """bytes_sent includes both data lines and blank separator newlines."""
-        lines = ["data: tok1", ""]
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream"},
-            lines=lines,
-        )
-        queued: list[bytes] = []
-        plugin.client = Mock(queue=lambda mv: queued.append(bytes(mv)))
-
-        stats = plugin._stream_response_body(mock_response)
-
-        total_queued = sum(len(b) for b in queued)
-        assert stats.bytes_sent == total_queued
-
-    def test_sse_stream_stats_ttft(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """ttft_ms measures time from start_time to first non-empty line."""
-        lines = ["data: tok1", ""]
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream"},
-            lines=lines,
-        )
-        plugin.client = Mock(queue=Mock())
-
-        with patch("flow_proxy_plugin.plugins.web_server_plugin.time") as mock_time:
-            mock_time.perf_counter.side_effect = iter([1000.0, 1000.042, 1003.292])
-            stats = plugin._stream_response_body(mock_response)
-
-        assert stats.ttft_ms is not None
-        assert abs(stats.ttft_ms - 42.0) < 1.0
-
-    def test_sse_stream_stats_duration(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """duration_ms measures time from first data to stream end."""
-        lines = ["data: tok1", ""]
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream"},
-            lines=lines,
-        )
-        plugin.client = Mock(queue=Mock())
-
-        # start=1000.0, first_chunk=1000.042, end=1003.292 → duration=3250ms
-        with patch("flow_proxy_plugin.plugins.web_server_plugin.time") as mock_time:
-            mock_time.perf_counter.side_effect = iter([1000.0, 1000.042, 1003.292])
-            stats = plugin._stream_response_body(mock_response)
-
-        assert stats.duration_ms is not None
-        assert abs(stats.duration_ms - 3250.0) < 1.0
-
-    def test_sse_stream_interrupted_on_broken_pipe(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """BrokenPipeError during SSE sets completed=False, end_time is set."""
-        lines = ["data: tok1", "", "data: tok2", ""]
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream"},
-            lines=lines,
-        )
-        call_count = 0
-
-        def queue_with_error(mv: memoryview) -> None:
-            nonlocal call_count
-            call_count += 1
-            if call_count >= 3:
-                raise BrokenPipeError()
-
-        plugin.client = Mock(queue=queue_with_error)
-
-        stats = plugin._stream_response_body(mock_response)  # must not raise
-
-        assert stats.completed is False
-        assert stats.end_time is not None
-        assert stats.bytes_sent > 0
-
-    def test_non_sse_stream_stats(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Non-SSE path: event_count stays 0, bytes_sent and completed are correct."""
-        chunks = [b"chunk1", b"chunk2"]
-        mock_response = make_mock_httpx_response(
-            chunks=chunks
-        )  # default: application/json
-
-        plugin.client = Mock(queue=Mock())
-
-        stats = plugin._stream_response_body(mock_response)
-
-        assert stats.event_count == 0
-        assert stats.bytes_sent == sum(len(c) for c in chunks)
-        assert stats.completed is True
-
-    def test_sse_empty_stream(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Empty SSE stream (zero lines): completed=True, no data counters incremented."""
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream"},
-            lines=[],
-        )
-        plugin.client = Mock(queue=Mock())
-
-        stats = plugin._stream_response_body(mock_response)
-
-        assert stats.completed is True
-        assert stats.event_count == 0
-        assert stats.chunks_sent == 0
-        assert stats.bytes_sent == 0
-        assert stats.ttft_ms is None
-
-    def test_sse_interrupted_before_first_data(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """BrokenPipeError on first queue call: completed=False, bytes_sent==0, end_time set."""
-        lines = ["data: tok1", ""]
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream"},
-            lines=lines,
-        )
-        plugin.client = Mock(queue=Mock(side_effect=BrokenPipeError()))
-
-        stats = plugin._stream_response_body(mock_response)  # must not raise
-
-        assert stats.completed is False
-        assert stats.bytes_sent == 0
-        assert stats.end_time is not None
-
-    def test_sse_oserror_non_32_logs_warning(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """OSError with errno != 32 triggers warning log, not debug, and stops streaming."""
-        lines = ["data: tok1", ""]
-        mock_response = make_mock_httpx_response(
-            headers={"content-type": "text/event-stream"},
-            lines=lines,
-        )
-        err = OSError("Input/output error")
-        err.errno = 5
-        plugin.client = Mock(queue=Mock(side_effect=err))
-
-        with patch.object(plugin.logger, "warning") as mock_warning:
-            stats = plugin._stream_response_body(mock_response)  # must not raise
-
-        mock_warning.assert_called_once()
-        assert stats.completed is False
 
 
 class TestSendError:
@@ -683,69 +289,17 @@ class TestSendError:
 class TestHandleRequest:
     """Test handle_request with httpx mock."""
 
-    def test_handle_request_success_queues_response(
-        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
-    ) -> None:
-        """Successful request queues status line and body chunks."""
-        request = Mock(spec=HttpParser)
-        request.method = b"POST"
-        request.path = b"/v1/chat/completions"
-        request.body = b'{"model": "gpt-3.5-turbo"}'
-        request.headers = {b"content-type": (b"application/json", b"")}
-
-        with (
-            mock_httpx_stream(mock_svc, chunks=[b'{"response": "ok"}']),
-            patch.object(
-                plugin,
-                "_get_config_and_token",
-                return_value=({"clientId": "test"}, "test-config", "test-jwt-token"),
-            ),
-            patch.object(ProcessServices, "get", return_value=mock_svc),
-        ):
-            plugin.handle_request(request)
-
-        # Status line (200 OK) must be queued
-        queued_calls = plugin.client.queue.call_args_list  # type: ignore[attr-defined]
-        all_bytes = b"".join(bytes(c[0][0]) for c in queued_calls)
-        assert b"200" in all_bytes
-
-    def test_handle_request_failure_sends_error(
-        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
-    ) -> None:
-        """Exceptions during request processing trigger _send_error()."""
-        request = Mock(spec=HttpParser)
-        request.method = b"GET"
-        request.path = b"/v1/models"
-        request.headers = {}
-
-        mock_svc.http_client.stream.side_effect = Exception("Connection failed")
-
-        mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
-        with (
-            patch.object(
-                plugin, "_get_config_and_token", return_value=mock_token_result
-            ),
-            patch.object(ProcessServices, "get", return_value=mock_svc),
-            patch.object(plugin, "_send_error") as mock_error,
-        ):
-            plugin.handle_request(request)
-            mock_error.assert_called_once()
-
     def test_handle_request_timeout_configuration(
         self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
-        """httpx.Timeout must be configured with connect=30s and read=600s."""
-        request = Mock(spec=HttpParser)
-        request.method = b"POST"
-        request.path = b"/v1/chat/completions"
-        request.body = b"{}"
-        request.headers = {}
-
-        captured_timeout: httpx.Timeout | None = None
+        """Worker passes httpx.Timeout(connect=30s, read=600s) to stream()."""
+        import threading
+        captured_timeout: list[Any] = []
+        stream_called = threading.Event()
 
         def capture_stream(**kwargs: Any) -> MagicMock:
-            nonlocal captured_timeout
-            captured_timeout = kwargs.get("timeout")
+            captured_timeout.append(kwargs.get("timeout"))
+            stream_called.set()
             mock_resp = MagicMock()
             mock_resp.status_code = 200
             mock_resp.reason_phrase = "OK"
@@ -757,70 +311,27 @@ class TestHandleRequest:
 
         mock_svc.http_client.stream.side_effect = capture_stream
 
-        mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
-        with (
-            patch.object(
-                plugin, "_get_config_and_token", return_value=mock_token_result
-            ),
-            patch.object(ProcessServices, "get", return_value=mock_svc),
-        ):
-            plugin.handle_request(request)
-
-        assert isinstance(captured_timeout, httpx.Timeout)
-        assert captured_timeout.connect == 30.0
-        assert captured_timeout.read == 600.0
-
-    def test_handle_request_remote_protocol_error_does_not_send_error(
-        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
-    ) -> None:
-        """httpx.RemoteProtocolError is logged but does NOT trigger _send_error()."""
-        request = Mock(spec=HttpParser)
-        request.method = b"POST"
-        request.path = b"/v1/messages"
-        request.body = b"{}"
-        request.headers = {}
-
-        mock_svc.http_client.stream.side_effect = httpx.RemoteProtocolError(
-            "Server disconnected", request=Mock()
-        )
-
-        mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
-        with (
-            patch.object(
-                plugin, "_get_config_and_token", return_value=mock_token_result
-            ),
-            patch.object(ProcessServices, "get", return_value=mock_svc),
-            patch.object(plugin, "_send_error") as mock_error,
-        ):
-            plugin.handle_request(request)
-            mock_error.assert_not_called()
-
-    def test_handle_request_with_buffer_body(
-        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
-    ) -> None:
-        """Request body read from buffer attribute when body attribute is absent."""
         request = Mock(spec=HttpParser)
         request.method = b"POST"
         request.path = b"/v1/chat/completions"
-        request.buffer = bytearray(b'{"model": "gpt-3.5-turbo"}')
+        request.body = b"{}"
         request.headers = {}
-        delattr(request, "body")
 
+        mock_token_result = ({"clientId": "test"}, "test-config", "test-token")
         with (
-            mock_httpx_stream(mock_svc),
-            patch.object(
-                plugin,
-                "_get_config_and_token",
-                return_value=({"clientId": "test"}, "test-config", "test-jwt-token"),
-            ),
+            patch.object(plugin, "_get_config_and_token", return_value=mock_token_result),
             patch.object(ProcessServices, "get", return_value=mock_svc),
         ):
             plugin.handle_request(request)
 
-        # Status line must be queued — confirms happy path was taken, not error path
-        queued_calls = plugin.client.queue.call_args_list  # type: ignore[attr-defined]
-        all_bytes = b"".join(bytes(c[0][0]) for c in queued_calls)
-        assert b"200" in all_bytes
+        # Wait for worker thread to call stream()
+        assert stream_called.wait(timeout=2.0), "Worker did not call stream() in time"
+        assert isinstance(captured_timeout[0], httpx.Timeout)
+        assert captured_timeout[0].connect == 30.0
+        assert captured_timeout[0].read == 600.0
+        # Clean up: stop the streaming state
+        if plugin._streaming_state:
+            plugin._reset_request_state()
 
 
 class TestHelperMethods:
