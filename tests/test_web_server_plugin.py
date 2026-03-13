@@ -337,13 +337,14 @@ class TestHelperMethods:
         calls = [bytes(c.args[0]) for c in plugin.client.queue.call_args_list]  # type: ignore[attr-defined]
         assert not any(b"transfer-encoding" in c.lower() for c in calls)
 
-    def test_send_response_headers_from_keeps_transfer_encoding_for_sse(
+    def test_send_response_headers_from_strips_transfer_encoding_for_sse(
         self, plugin: FlowProxyWebServerPlugin
     ) -> None:
+        """We stream raw bytes, not chunked framing; client would fail on raw SSE otherwise."""
         h = _ResponseHeaders(200, "OK", {"transfer-encoding": "chunked", "content-type": "text/event-stream"}, True)
         plugin._send_response_headers_from(h)
         calls = [bytes(c.args[0]) for c in plugin.client.queue.call_args_list]  # type: ignore[attr-defined]
-        assert any(b"transfer-encoding" in c.lower() for c in calls)
+        assert not any(b"transfer-encoding" in c.lower() for c in calls)
 
     def test_send_response_headers_from_adds_sse_anti_buffer_headers(
         self, plugin: FlowProxyWebServerPlugin

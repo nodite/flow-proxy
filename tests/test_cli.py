@@ -113,6 +113,53 @@ class TestCLI:
                 # Should NOT have --threaded
                 assert "--threaded" not in args
 
+    def test_client_timeout_default(self) -> None:
+        """Test that default client timeout is passed to proxy.py as --timeout."""
+        from flow_proxy_plugin.cli import main
+
+        with (
+            patch("flow_proxy_plugin.cli.Proxy"),
+            patch("flow_proxy_plugin.cli.sleep_loop"),
+            patch("flow_proxy_plugin.cli.Path.exists", return_value=True),
+            patch("sys.argv", ["flow-proxy-plugin"]),
+        ):
+            with patch("flow_proxy_plugin.cli.Proxy") as mock_proxy:
+                mock_proxy_instance = MagicMock()
+                mock_proxy.return_value.__enter__.return_value = mock_proxy_instance
+
+                try:
+                    main()
+                except SystemExit:
+                    pass
+
+                args = mock_proxy.call_args[1]["input_args"]
+                assert "--timeout" in args
+                idx = args.index("--timeout")
+                assert args[idx + 1] == "120"
+
+    def test_client_timeout_custom(self) -> None:
+        """Test custom client timeout via CLI and env."""
+        from flow_proxy_plugin.cli import main
+
+        with (
+            patch("flow_proxy_plugin.cli.Proxy"),
+            patch("flow_proxy_plugin.cli.sleep_loop"),
+            patch("flow_proxy_plugin.cli.Path.exists", return_value=True),
+            patch("sys.argv", ["flow-proxy-plugin", "--client-timeout", "300"]),
+        ):
+            with patch("flow_proxy_plugin.cli.Proxy") as mock_proxy:
+                mock_proxy_instance = MagicMock()
+                mock_proxy.return_value.__enter__.return_value = mock_proxy_instance
+
+                try:
+                    main()
+                except SystemExit:
+                    pass
+
+                args = mock_proxy.call_args[1]["input_args"]
+                idx = args.index("--timeout")
+                assert args[idx + 1] == "300"
+
     def test_env_num_workers(self) -> None:
         """Test num_workers from environment variable."""
         from flow_proxy_plugin.cli import main

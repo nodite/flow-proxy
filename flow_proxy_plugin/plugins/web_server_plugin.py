@@ -393,9 +393,11 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         status_line = f"HTTP/1.1 {item.status_code} {item.reason_phrase}\r\n"
         self.client.queue(memoryview(status_line.encode()))
 
-        skip_headers = {"connection"}
-        if not item.is_sse:
-            skip_headers.add("transfer-encoding")
+        # Always strip connection and transfer-encoding: we stream raw bytes to the
+        # client, not chunked framing (hex size + CRLF per chunk). Keeping
+        # transfer-encoding would cause clients to expect chunked format and
+        # raise InvalidHTTPResponse when they see raw SSE/body bytes.
+        skip_headers = {"connection", "transfer-encoding"}
 
         for name, value in item.headers.items():
             if name.lower() not in skip_headers:

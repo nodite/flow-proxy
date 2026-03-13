@@ -18,6 +18,51 @@ except Exception:
     __version__ = "unknown"
 
 
+def _resolve_runtime_config(
+    args: argparse.Namespace, logger: logging.Logger
+) -> tuple[int, bool, int]:
+    """Resolve num_workers, threaded, and client_timeout (clamped); log clamp warning."""
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = (
+            int(os.getenv("FLOW_PROXY_NUM_WORKERS", "0")) or multiprocessing.cpu_count()
+        )
+    threaded = not args.no_threaded and os.getenv("FLOW_PROXY_THREADED", "1") == "1"
+    client_timeout = max(1, min(86400, int(args.client_timeout)))
+    if client_timeout != int(args.client_timeout):
+        logger.warning(
+            "Client timeout %s clamped to %ds (valid range 1–86400)",
+            args.client_timeout,
+            client_timeout,
+        )
+    return (num_workers, threaded, client_timeout)
+
+
+def _build_proxy_args(
+    args: argparse.Namespace,
+    num_workers: int,
+    threaded: bool,
+    client_timeout: int,
+) -> list[str]:
+    """Build proxy.py command-line argument list."""
+    proxy_args = [
+        "--hostname",
+        args.host,
+        "--port",
+        str(args.port),
+        "--num-workers",
+        str(num_workers),
+        "--timeout",
+        str(client_timeout),
+        "--plugins",
+        "flow_proxy_plugin.plugins.proxy_plugin.FlowProxyPlugin,flow_proxy_plugin.plugins.web_server_plugin.FlowProxyWebServerPlugin",
+        "--enable-web-server",
+    ]
+    if threaded:
+        proxy_args.append("--threaded")
+    return proxy_args
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     parser = argparse.ArgumentParser(description="Flow Proxy Plugin for proxy.py")
@@ -71,6 +116,14 @@ def main() -> None:
         help="Disable threaded mode (default: threaded enabled, env: FLOW_PROXY_THREADED=0)",
     )
 
+    parser.add_argument(
+        "--client-timeout",
+        type=float,
+        default=float(os.getenv("FLOW_PROXY_CLIENT_TIMEOUT", "120")),
+        help="Client connection inactivity timeout in seconds (default: 120, env: FLOW_PROXY_CLIENT_TIMEOUT). "
+        "Must be >= backend TTFB for streaming; proxy.py default is 10s which can close before first byte.",
+    )
+
     args = parser.parse_args()
 
     # Setup logging
@@ -84,15 +137,7 @@ def main() -> None:
         logger.error(f"Please create {args.secrets_file} from secrets.json.template")
         sys.exit(1)
 
-    # Determine num_workers (default: CPU count)
-    num_workers = args.num_workers
-    if num_workers is None:
-        num_workers = (
-            int(os.getenv("FLOW_PROXY_NUM_WORKERS", "0")) or multiprocessing.cpu_count()
-        )
-
-    # Determine threaded mode (default: enabled)
-    threaded = not args.no_threaded and os.getenv("FLOW_PROXY_THREADED", "1") == "1"
+    num_workers, threaded, client_timeout = _resolve_runtime_config(args, logger)
 
     # Log startup information
     logger.info("=" * 60)
@@ -102,6 +147,7 @@ def main() -> None:
     logger.info(f"  Port: {args.port}")
     logger.info(f"  Workers: {num_workers}")
     logger.info(f"  Threaded: {'enabled' if threaded else 'disabled'}")
+    logger.info(f"  Client timeout: {client_timeout}s")
     logger.info(f"  Secrets: {args.secrets_file}")
     logger.info(f"  Log level: {args.log_level}")
     logger.info("=" * 60)
@@ -111,21 +157,7 @@ def main() -> None:
     os.environ["FLOW_PROXY_LOG_LEVEL"] = args.log_level
     os.environ["FLOW_PROXY_LOG_DIR"] = args.log_dir
 
-    # Build proxy.py arguments
-    proxy_args = [
-        "--hostname",
-        args.host,
-        "--port",
-        str(args.port),
-        "--num-workers",
-        str(num_workers),
-        "--plugins",
-        "flow_proxy_plugin.plugins.proxy_plugin.FlowProxyPlugin,flow_proxy_plugin.plugins.web_server_plugin.FlowProxyWebServerPlugin",
-        "--enable-web-server",
-    ]
-
-    if threaded:
-        proxy_args.append("--threaded")
+    proxy_args = _build_proxy_args(args, num_workers, threaded, client_timeout)
 
     # Start proxy with plugin
     try:

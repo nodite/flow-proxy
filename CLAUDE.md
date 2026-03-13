@@ -98,7 +98,11 @@ The codebase follows a modular architecture built on top of the proxy.py framewo
 
 - **FlowProxyWebServerPlugin** (`web_server_plugin.py`): Reverse proxy mode implementation
   - Extends `HttpWebServerBasePlugin` from proxy.py
-  - Hook: `handle_request()` — uses `ProcessServices.get().get_http_client().stream()` for SSE streaming (connect=30s, read=600s); `httpx.TransportError` marks client dirty for rebuild
+  - Hook: `handle_request()` — authenticates, builds params, launches `_streaming_worker` daemon thread, returns immediately (non-blocking)
+  - **B3 async pipe-mediated streaming**: worker → `chunk_queue` + `os.pipe()` notification → `read_from_descriptors()` (main thread) → `self.client.queue()`. Only the main thread ever calls `self.client.queue()`
+  - `StreamingState` dataclass holds `pipe_r/w`, `chunk_queue`, `cancel` event, `thread`, per-request metadata; stored as `self._streaming_state`
+  - `get_descriptors()` registers `pipe_r` with proxy.py's selector while streaming is active
+  - On `httpx.TransportError`, worker calls `mark_http_client_dirty()` for client rebuild
   - Pool-enabled: `__new__` routes through `_web_pool`, `__init__` guarded by `if self._pooled: return`
   - Releases to pool in `on_client_connection_close()`
 
@@ -114,6 +118,7 @@ The codebase follows a modular architecture built on top of the proxy.py framewo
 
 - **process_services.py**: `ProcessServices` singleton — lazily initialized per-process (fork-safe), owns all shared resources: `logger`, `secrets_manager`, `configs`, `load_balancer`, `jwt_generator`, `request_forwarder`, `request_filter`, and a persistent `httpx.Client`. Use `ProcessServices.get()` to access; `ProcessServices.reset()` in tests only.
 - **plugin_pool.py**: `PluginPool[T]` — thread-safe generic instance pool. `acquire(*args)` returns a pooled instance (calling `_rebind()`) or creates a new one via `object.__new__()` to avoid recursion. `release(instance)` calls `_reset_request_state()` then returns to pool.
+- **log_context.py**: Thread-local request context for log grouping. `set_request_context(req_id, component)` / `clear_request_context()` bracket each request; `component_context(name)` is a context manager for sub-component tagging. Logs emit `[req_id][COMPONENT] ` prefix automatically via log filter.
 - **logging.py**: Sets up colored console + rotating file handlers; file handler must be re-created in child processes after `fork()`
 - **log_cleaner.py**: Scheduled cleanup of old log files; configurable via env vars
 - **log_filter.py**: Suppresses noisy third-party log messages
@@ -144,6 +149,7 @@ All environment variables are prefixed with `FLOW_PROXY_`:
 - `FLOW_PROXY_HOST=127.0.0.1`: Bind address
 - `FLOW_PROXY_NUM_WORKERS`: Worker processes (default: CPU count)
 - `FLOW_PROXY_THREADED=1`: Enable threaded mode (1=on, 0=off)
+- `FLOW_PROXY_CLIENT_TIMEOUT=120`: Client inactivity timeout (seconds); must be ≥ backend TTFB for streaming
 - `FLOW_PROXY_LOG_LEVEL=INFO`: Logging level
 - `FLOW_PROXY_SECRETS_FILE=secrets.json`: Path to secrets file
 - `FLOW_PROXY_LOG_DIR=logs`: Log directory
@@ -262,7 +268,7 @@ Default configuration is optimized for performance:
 ### Modifying Request Processing
 1. Update `RequestForwarder` for header/URL modifications
 2. Update `FlowProxyPlugin.before_upstream_connection()` for forward proxy changes
-3. Update `FlowProxyWebServerPlugin.handle_client_request()` for reverse proxy changes
+3. Update `FlowProxyWebServerPlugin.handle_request()` for reverse proxy changes
 4. Add tests to verify both proxy modes work correctly
 
 ### Environment Variable Configuration
