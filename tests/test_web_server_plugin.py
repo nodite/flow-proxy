@@ -1031,3 +1031,247 @@ class TestStreamingWorker:
         assert state.chunk_queue.get_nowait() is None
         os.close(state.pipe_r)
         os.close(state.pipe_w)
+
+
+class TestEventLoopHooks:
+    """Tests for get_descriptors, read_from_descriptors, _finish_stream, _reset_request_state."""
+
+    def _make_state_with_pipe(self) -> tuple["StreamingState", int, int]:
+        import os
+        import queue as q
+        import threading
+
+        pipe_r, pipe_w = os.pipe()
+        state = StreamingState(
+            pipe_r=pipe_r, pipe_w=pipe_w,
+            chunk_queue=q.Queue(),
+            thread=None,
+            cancel=threading.Event(),
+            req_id="abc",
+            config_name="cfg",
+        )
+        return state, pipe_r, pipe_w
+
+    def test_get_descriptors_empty_when_no_state(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        import asyncio
+        plugin._streaming_state = None
+        r, w = asyncio.run(plugin.get_descriptors())
+        assert r == []
+        assert w == []
+
+    def test_get_descriptors_returns_pipe_r_when_streaming(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        plugin._streaming_state = state
+        try:
+            r, w = asyncio.run(plugin.get_descriptors())
+            assert r == [pipe_r]
+            assert w == []
+        finally:
+            plugin._streaming_state = None
+            os.close(pipe_r)
+            os.close(pipe_w)
+
+    def test_read_from_descriptors_noop_when_pipe_not_in_readables(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        plugin._streaming_state = state
+        try:
+            result = asyncio.run(
+                plugin.read_from_descriptors([999])  # wrong fd
+            )
+            assert result is False
+        finally:
+            plugin._streaming_state = None
+            os.close(pipe_r)
+            os.close(pipe_w)
+
+    def test_read_from_descriptors_queues_each_chunk(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.chunk_queue.put(_ResponseHeaders(200, "OK", {}, False))
+        state.chunk_queue.put(b"hello")
+        state.chunk_queue.put(b"world")
+        plugin._streaming_state = state
+        # Write notification bytes so os.read doesn't block
+        os.write(pipe_w, b"\x00\x00\x00")
+        try:
+            result = asyncio.run(
+                plugin.read_from_descriptors([pipe_r])
+            )
+            assert result is False
+            # _send_response_headers_from({}, not SSE) queues: status line + blank line = 2 calls
+            # Plus 2 byte chunks = 4 total
+            assert plugin.client.queue.call_count == 4  # type: ignore[attr-defined]
+        finally:
+            plugin._streaming_state = None
+            os.close(pipe_r)
+            os.close(pipe_w)
+
+    def test_read_from_descriptors_sends_headers_on_first_item(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_send_response_headers_from is called exactly once, before any byte chunks."""
+        import asyncio
+        import os
+        from unittest.mock import call, patch
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.chunk_queue.put(_ResponseHeaders(200, "OK", {}, False))
+        state.chunk_queue.put(b"first-chunk")
+        plugin._streaming_state = state
+        os.write(pipe_w, b"\x00\x00")
+        try:
+            with patch.object(plugin, "_send_response_headers_from") as mock_send_headers:
+                asyncio.run(plugin.read_from_descriptors([pipe_r]))
+            # Headers sent exactly once
+            assert mock_send_headers.call_count == 1
+            # Headers sent before the byte chunk (queue called once for the chunk)
+            assert plugin.client.queue.call_count == 1  # type: ignore[attr-defined]
+            assert plugin.client.queue.call_args == call(memoryview(b"first-chunk"))  # type: ignore[attr-defined]
+        finally:
+            plugin._streaming_state = None
+            os.close(pipe_r)
+            os.close(pipe_w)
+
+    def test_read_from_descriptors_returns_true_on_sentinel(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.status_code = 200
+        state.config_name = "cfg"
+        state.chunk_queue.put(None)  # sentinel only
+        plugin._streaming_state = state
+        os.write(pipe_w, b"\x00")
+        result = asyncio.run(
+            plugin.read_from_descriptors([pipe_r])
+        )
+        assert result is True
+        assert plugin._streaming_state is None  # _finish_stream cleared it
+
+    def test_get_descriptors_empty_after_stream_finishes(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """After sentinel is processed, get_descriptors() returns []."""
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.status_code = 200
+        state.chunk_queue.put(None)
+        plugin._streaming_state = state
+        os.write(pipe_w, b"\x00")
+        asyncio.run(
+            plugin.read_from_descriptors([pipe_r])
+        )
+        r, w = asyncio.run(plugin.get_descriptors())
+        assert r == []
+
+    def test_reset_request_state_sets_cancel_and_closes_fds(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        import os
+        import threading
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        t = threading.Thread(target=lambda: None, daemon=True)
+        t.start()
+        state.thread = t
+        plugin._streaming_state = state
+        plugin._reset_request_state()
+        assert state.cancel.is_set()
+        assert plugin._streaming_state is None
+        # fds should be closed — attempting to close them again should raise OSError
+        with pytest.raises(OSError):
+            os.close(pipe_r)
+        with pytest.raises(OSError):
+            os.close(pipe_w)
+
+    def test_reset_is_idempotent_when_state_is_none(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        plugin._streaming_state = None
+        plugin._reset_request_state()  # should not raise
+
+    def test_reset_is_safe_when_join_times_out(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_reset_request_state closes fds even when join() times out (blocked worker)."""
+        import os
+        import threading
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        # Thread that blocks until cancel is set — simulates unresponsive upstream
+        block = threading.Event()
+        t = threading.Thread(target=lambda: block.wait(timeout=60), daemon=True)
+        t.start()
+        state.thread = t
+        plugin._streaming_state = state
+        # join(timeout=2.0) would block for 2s; patch it to return immediately
+        from unittest.mock import patch  # noqa: PLC0415
+
+        with patch.object(t, "join", return_value=None):
+            plugin._reset_request_state()
+        # fds must be closed regardless of join timeout
+        with pytest.raises(OSError):
+            os.close(pipe_r)
+        with pytest.raises(OSError):
+            os.close(pipe_w)
+        assert plugin._streaming_state is None
+        block.set()  # let daemon thread exit cleanly
+
+    def test_worker_error_before_headers_sends_503(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.error = RuntimeError("boom")
+        state.headers_sent = False
+        state.chunk_queue.put(None)
+        plugin._streaming_state = state
+        os.write(pipe_w, b"\x00")
+        asyncio.run(
+            plugin.read_from_descriptors([pipe_r])
+        )
+        # _send_error should have been called — client.queue should contain error response
+        assert plugin.client.queue.called  # type: ignore[attr-defined]
+
+    def test_worker_error_after_headers_does_not_send_error_response(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.error = RuntimeError("boom after headers")
+        state.headers_sent = True
+        state.chunk_queue.put(None)
+        plugin._streaming_state = state
+        os.write(pipe_w, b"\x00")
+        plugin.client.queue.reset_mock()  # type: ignore[attr-defined]
+        asyncio.run(
+            plugin.read_from_descriptors([pipe_r])
+        )
+        # No error response queued when headers already sent
+        assert not plugin.client.queue.called  # type: ignore[attr-defined]
+        # Error must be logged (warning-level when headers already committed)
+        plugin.logger.warning.assert_called()  # type: ignore[attr-defined]

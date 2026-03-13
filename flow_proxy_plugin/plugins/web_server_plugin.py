@@ -141,6 +141,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             self, uid, flags, client, event_queue, upstream_conn_pool
         )
         self._init_services()
+        self._streaming_state: StreamingState | None = None
         self._pooled = True
         if not FlowProxyWebServerPlugin._log_once:
             FlowProxyWebServerPlugin._log_once = True
@@ -159,11 +160,89 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             self, uid, flags, client, event_queue, upstream_conn_pool
         )
         self._pooled = True  # Ensure flag stays True
+        self._streaming_state = None
 
     def on_client_connection_close(self) -> None:
         """Return instance to pool when connection closes."""
         if _web_pool is not None and self._pooled:
             _web_pool.release(self)
+
+    async def get_descriptors(self) -> tuple[list[int], list[int]]:
+        """Register pipe_r with proxy.py's selector while streaming is active."""
+        if self._streaming_state is not None:
+            return [self._streaming_state.pipe_r], []
+        return [], []
+
+    async def read_from_descriptors(self, r: list[int]) -> bool:
+        """Drain chunk_queue when pipe_r is readable; queue chunks to self.client.
+
+        Returns True (teardown signal) when the sentinel is processed.
+        Invariant: only this method (main thread) calls self.client.queue().
+        """
+        state = self._streaming_state
+        if state is None or state.pipe_r not in r:
+            return False
+
+        # Drain notification bytes (batch). More bytes than 256 cause harmless
+        # re-entry on the next select cycle with an empty queue — self-correcting.
+        os.read(state.pipe_r, 256)
+        set_request_context(state.req_id, "WS")
+
+        while not state.chunk_queue.empty():
+            item = state.chunk_queue.get_nowait()
+
+            if isinstance(item, _ResponseHeaders):
+                state.status_code = item.status_code
+                self._send_response_headers_from(item)
+                state.headers_sent = True
+
+            elif item is None:  # sentinel — stream ended or errored
+                self._finish_stream(state)
+                return True     # signal proxy.py to close connection
+
+            else:  # bytes chunk
+                self.client.queue(memoryview(item))
+
+        return False
+
+    def _finish_stream(self, state: StreamingState) -> None:
+        """Close pipe fds, clear state, log completion. Called from main thread only."""
+        # Clear first so get_descriptors() immediately returns [] on next call
+        self._streaming_state = None
+        for fd in (state.pipe_r, state.pipe_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+        if state.error:
+            if not state.headers_sent:
+                self._send_error(503, "Upstream error")
+            log_func = self.logger.warning if state.headers_sent else self.logger.error
+            log_func("Stream ended with error: %s", state.error)
+        else:
+            log_func = (
+                self.logger.info if state.status_code < 400 else self.logger.warning
+            )
+            log_func("← %d [%s]", state.status_code, state.config_name)
+        clear_request_context()
+
+    def _reset_request_state(self) -> None:
+        """Cancel and join worker thread; close pipe fds. Called by PluginPool.release()."""
+        state = self._streaming_state
+        if state is None:
+            return
+        state.cancel.set()
+        if state.thread is not None:
+            state.thread.join(timeout=2.0)
+            # If join times out, thread is abandoned as daemon; it holds no reference
+            # to self.client so no further socket writes occur.
+        for fd in (state.pipe_r, state.pipe_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._streaming_state = None
 
     def routes(self) -> list[tuple[int, str]]:
         """Define routes that this plugin handles."""
