@@ -241,12 +241,12 @@ async def get_descriptors(self) -> tuple[list[int], list[int]]:
 ### `read_from_descriptors()` (new override)
 
 ```python
-async def read_from_descriptors(self, readables: list[int]) -> bool:
+async def read_from_descriptors(self, r: list[int]) -> bool:
     state = self._streaming_state
-    if not state or state.pipe_r not in readables:
+    if not state or state.pipe_r not in r:
         return False
 
-    os.read(state.pipe_r, 256)          # drain notification bytes (batch)
+    os.read(state.pipe_r, 256)   # drain notification bytes; see batch-read note below
     set_request_context(state.req_id, "WS")
 
     while not state.chunk_queue.empty():
