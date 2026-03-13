@@ -75,7 +75,7 @@ class StreamingState:
     pipe_r: int                          # registered with selector as readable fd
     pipe_w: int                          # worker writes notification bytes here
     chunk_queue: queue.Queue             # _ResponseHeaders | bytes | None
-    thread: threading.Thread
+    thread: threading.Thread | None      # None until assigned in handle_request()
     cancel: threading.Event              # set by _reset_request_state() on disconnect
     req_id: str                          # for log context
     config_name: str                     # for final access log line
@@ -144,20 +144,15 @@ def handle_request(self, request: HttpParser) -> None:
 
     pipe_r, pipe_w = os.pipe()
     try:
+        # Construct state first (thread=None), then assign thread with state in args.
         state = StreamingState(
             pipe_r=pipe_r, pipe_w=pipe_w,
             chunk_queue=queue.Queue(),
             cancel=threading.Event(),
             req_id=req_id,
             config_name=config_name,
-            thread=threading.Thread(
-                target=self._streaming_worker,
-                args=(method, target_url, headers, body),  # state injected after
-                name=f"streaming-{req_id}",
-                daemon=True,
-            ),
+            thread=None,  # type: ignore[arg-type] — assigned on next line
         )
-        # Re-create with state in args now that state exists
         state.thread = threading.Thread(
             target=self._streaming_worker,
             args=(method, target_url, headers, body, state),
@@ -295,7 +290,7 @@ def _finish_stream(self, state: StreamingState) -> None:
     clear_request_context()
 ```
 
-Because `_finish_stream()` closes the fds and clears `self._streaming_state`, subsequent calls to `get_descriptors()` return `[]`. `_reset_request_state()` checks for `None` before acting, so the double-close is harmless.
+Because `_finish_stream()` sets `self._streaming_state = None` first, subsequent calls to `get_descriptors()` return `[]` immediately. When `_reset_request_state()` is later called by `PluginPool.release()`, it returns early at `if state is None: return` — so the `os.close()` calls in `_reset_request_state()` are never reached for a normally-completed stream. There is no double-close.
 
 ### `_reset_request_state()` (new override)
 
@@ -327,7 +322,7 @@ Replaces `_send_response_headers(response: httpx.Response)` for the B3 path. Cal
 
 Writes to `self.client` in this order:
 1. Status line: `HTTP/1.1 {status_code} {reason_phrase}\r\n`
-2. Each response header from `item.headers`, excluding `connection` and (for non-SSE) `transfer-encoding`
+2. Each response header from `item.headers`, excluding `connection` always, and excluding `transfer-encoding` **for non-SSE only** (SSE responses retain `transfer-encoding: chunked` because they are delivered as a persistent chunked stream)
 3. For SSE: additionally queue `Cache-Control: no-cache\r\n` and `X-Accel-Buffering: no\r\n`
 4. Blank line: `\r\n`
 
