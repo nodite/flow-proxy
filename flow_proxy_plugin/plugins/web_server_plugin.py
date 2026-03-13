@@ -5,7 +5,6 @@ import os
 import queue
 import secrets
 import threading
-import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -26,44 +25,6 @@ from .request_filter import FilterRule
 _web_pool: Optional["PluginPool[FlowProxyWebServerPlugin]"] = None
 _web_pool_lock = threading.Lock()
 _WEB_POOL_SIZE = int(os.getenv("FLOW_PROXY_PLUGIN_POOL_SIZE", "64"))
-
-
-@dataclass
-class StreamStats:
-    """Metrics collected during a single streaming response."""
-
-    start_time: float
-    first_chunk_time: float | None = None
-    end_time: float | None = None
-    bytes_sent: int = 0
-    chunks_sent: int = 0  # non-empty payload writes only
-    event_count: int = 0  # SSE only: incremented at each empty-line boundary
-    completed: bool = False  # True only if stream finished without interruption
-
-    @property
-    def ttft_ms(self) -> float | None:
-        """Time from stream iteration start to first data byte, in ms.
-
-        Measures how long iter_bytes()/iter_lines() blocked before yielding the
-        first non-empty chunk. Returns None if no data was received.
-        Note: this does not include network round-trip time; it reflects buffering
-        latency within the httpx streaming iterator.
-        """
-        if self.first_chunk_time is None:
-            return None
-        return (self.first_chunk_time - self.start_time) * 1000
-
-    @property
-    def duration_ms(self) -> float | None:
-        """Stream duration (first data -> streaming end) in ms.
-
-        Returns None only if no data was received (first_chunk_time is None).
-        Always set for completed and interrupted streams that received at least
-        one chunk, because end_time is set unconditionally in the finally block.
-        """
-        if self.end_time is None or self.first_chunk_time is None:
-            return None
-        return (self.end_time - self.first_chunk_time) * 1000
 
 
 @dataclass
@@ -356,13 +317,6 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
         return headers
 
-    def _prepare_headers(self, request: HttpParser, jwt_token: str) -> dict[str, str]:
-        """Prepare headers for forwarding request.
-
-        Deprecated: Use _build_headers instead. Kept for backward compatibility.
-        """
-        return self._build_headers(request, jwt_token)
-
     def _get_request_body(
         self, request: HttpParser, filter_rule: FilterRule | None = None
     ) -> bytes | None:
@@ -419,49 +373,6 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         else:
             self.logger.debug("  Body: None")
 
-    def _log_response_details(self, response: httpx.Response) -> None:
-        """Log detailed response information in DEBUG mode."""
-        self.logger.debug(
-            "Response: %d %s", response.status_code, response.reason_phrase
-        )
-        self.logger.debug("  Response Headers: %s", dict(response.headers))
-
-        content_type = response.headers.get("content-type", "unknown")
-        if "text/event-stream" in content_type:
-            self.logger.debug("  Response Body: <SSE streaming response>")
-        else:
-            content_length = response.headers.get("content-length", "unknown")
-            self.logger.debug(
-                "  Response Body: Content-Type=%s, Content-Length=%s",
-                content_type,
-                content_length,
-            )
-
-    def _send_response_headers(self, response: httpx.Response) -> None:
-        """Send HTTP status line and headers."""
-        is_sse = "text/event-stream" in response.headers.get("content-type", "")
-
-        # Status line
-        status_line = f"HTTP/1.1 {response.status_code} {response.reason_phrase}\r\n"
-        self.client.queue(memoryview(status_line.encode()))
-
-        # Headers
-        skip_headers = {"connection"}
-        if not is_sse:
-            skip_headers.add("transfer-encoding")
-
-        for name, value in response.headers.items():
-            if name.lower() not in skip_headers:
-                self.client.queue(memoryview(f"{name}: {value}\r\n".encode()))
-
-        # SSE-specific headers to prevent intermediate proxy buffering
-        if is_sse:
-            self.client.queue(memoryview(b"Cache-Control: no-cache\r\n"))
-            self.client.queue(memoryview(b"X-Accel-Buffering: no\r\n"))
-
-        # End of headers
-        self.client.queue(memoryview(b"\r\n"))
-
     @staticmethod
     def _encode_sse_line(raw: str) -> bytes:
         """Encode a single SSE line to bytes.
@@ -477,8 +388,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         """Send HTTP status line and headers from a _ResponseHeaders item.
 
         Called from the main thread only (read_from_descriptors path).
-        Mirrors _send_response_headers() but accepts plain-data _ResponseHeaders
-        instead of an httpx.Response.
+        Accepts plain-data _ResponseHeaders — no httpx objects cross thread boundaries.
         """
         status_line = f"HTTP/1.1 {item.status_code} {item.reason_phrase}\r\n"
         self.client.queue(memoryview(status_line.encode()))
@@ -592,136 +502,6 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 os.write(state.pipe_w, b"\x00")
             except OSError:
                 pass  # pipe may already be closed (client disconnected)
-
-    def _stream_response_body(self, response: httpx.Response) -> StreamStats:
-        """Stream response body to client; returns stats for the completed stream.
-
-        stats.completed is set inside _stream_bytes/_stream_sse only when the
-        iterator exhausts cleanly. The dispatcher does not set it — this lets
-        disconnect-interrupted streams correctly have completed=False.
-        """
-        is_sse = "text/event-stream" in response.headers.get("content-type", "")
-        stats = StreamStats(start_time=time.perf_counter())
-        try:
-            if is_sse:
-                self._stream_sse(response, stats)
-            else:
-                self._stream_bytes(response, stats)
-        finally:
-            stats.end_time = time.perf_counter()
-            self._log_stream_stats(stats, is_sse)
-        return stats
-
-    def _stream_bytes(self, response: httpx.Response, stats: StreamStats) -> None:
-        """Stream non-SSE response body to client, updating stats in place.
-
-        Sets stats.completed = True only if the iterator is exhausted without
-        interruption. Returns early (completed stays False) on disconnect.
-        """
-        for chunk in response.iter_bytes():
-            if not chunk:
-                continue
-            if stats.first_chunk_time is None:
-                stats.first_chunk_time = time.perf_counter()
-                self.logger.info(
-                    "Received first chunk from backend: %d bytes", len(chunk)
-                )
-            try:
-                self.client.queue(memoryview(chunk))
-                stats.bytes_sent += len(chunk)
-                stats.chunks_sent += 1
-            except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                if (
-                    not isinstance(e, (BrokenPipeError, ConnectionResetError))
-                    and e.errno != 32
-                ):
-                    self.logger.warning("OS error during streaming: %s", e)
-                else:
-                    self.logger.debug(
-                        "Client disconnected during streaming - sent %d bytes",
-                        stats.bytes_sent,
-                    )
-                return  # completed stays False
-        stats.completed = True  # loop exhausted cleanly
-
-    def _stream_sse(self, response: httpx.Response, stats: StreamStats) -> None:
-        """Stream SSE response body to client, updating stats in place.
-
-        Uses iter_lines() (yields str) to iterate line-by-line.
-        Empty strings mark SSE event boundaries (\\n\\n separators).
-        Each non-empty line is encoded and queued as '<line>\\n'.
-        Each empty-string boundary is queued as b'\\n' and increments event_count.
-        chunks_sent counts non-empty lines only.
-        Sets stats.completed = True only when the iterator exhausts cleanly.
-        """
-        for line in response.iter_lines():
-            is_separator = line == ""
-            if is_separator:
-                # SSE event boundary separator
-                data = b"\n"
-            else:
-                if stats.first_chunk_time is None:
-                    stats.first_chunk_time = time.perf_counter()
-                    self.logger.info(
-                        "Received first SSE line from backend: %d chars", len(line)
-                    )
-                data = (line + "\n").encode()
-            try:
-                self.client.queue(memoryview(data))
-                stats.bytes_sent += len(data)
-                if is_separator:
-                    stats.event_count += 1  # count only after successful delivery
-                else:
-                    stats.chunks_sent += 1
-            except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                if (
-                    not isinstance(e, (BrokenPipeError, ConnectionResetError))
-                    and e.errno != 32
-                ):
-                    self.logger.warning("OS error during SSE streaming: %s", e)
-                else:
-                    self.logger.debug(
-                        "Client disconnected during SSE streaming - sent %d bytes",
-                        stats.bytes_sent,
-                    )
-                return  # completed stays False
-        stats.completed = True  # loop exhausted cleanly
-
-    def _log_stream_stats(self, stats: StreamStats, is_sse: bool) -> None:
-        """Log a single summary line after streaming completes or is interrupted."""
-        if is_sse:
-            if stats.completed:
-                if stats.ttft_ms is not None:
-                    self.logger.info(
-                        "SSE stream complete: first_byte=%.0fms, duration=%.0fms, events=%d, bytes=%d",
-                        stats.ttft_ms,
-                        stats.duration_ms,
-                        stats.event_count,
-                        stats.bytes_sent,
-                    )
-                else:
-                    self.logger.info(
-                        "SSE stream complete: no data received, bytes=%d",
-                        stats.bytes_sent,
-                    )
-            else:
-                if stats.ttft_ms is not None:
-                    self.logger.info(
-                        "SSE stream interrupted: first_byte=%.0fms, events=%d, bytes=%d",
-                        stats.ttft_ms,
-                        stats.event_count,
-                        stats.bytes_sent,
-                    )
-                else:
-                    self.logger.info(
-                        "SSE stream interrupted: no data received, bytes=%d",
-                        stats.bytes_sent,
-                    )
-        else:
-            prefix = "Stream complete" if stats.completed else "Stream interrupted"
-            self.logger.info(
-                "%s: bytes=%d, chunks=%d", prefix, stats.bytes_sent, stats.chunks_sent
-            )
 
     def _send_error(
         self, status_code: int = 500, message: str = "Internal server error"

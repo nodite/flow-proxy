@@ -220,40 +220,6 @@ class TestFlowProxyWebServerPluginInitialization:
         assert routes[0][1] == r"/.*"
 
 
-class TestPrepareHeaders:
-    """Test header preparation."""
-
-    def test_prepare_headers_basic(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Test basic header preparation."""
-        request = Mock(spec=HttpParser)
-        request.headers = {}
-
-        headers = plugin._prepare_headers(request, "test-jwt-token")
-
-        assert headers["Authorization"] == "Bearer test-jwt-token"
-        assert headers["Host"] == "flow.ciandt.com"
-
-    def test_prepare_headers_with_existing_headers(
-        self, plugin: FlowProxyWebServerPlugin
-    ) -> None:
-        """Test header preparation with existing headers."""
-        request = Mock(spec=HttpParser)
-        request.headers = {
-            b"content-type": (b"application/json", b""),
-            b"user-agent": (b"test-agent", b""),
-            b"host": (b"old-host", b""),  # Should be skipped
-            b"authorization": (b"old-auth", b""),  # Should be skipped
-        }
-
-        headers = plugin._prepare_headers(request, "test-jwt-token")
-
-        assert headers["Authorization"] == "Bearer test-jwt-token"
-        assert headers["Host"] == "flow.ciandt.com"
-        assert headers["content-type"] == "application/json"
-        assert headers["user-agent"] == "test-agent"
-
-
-
 
 
 class TestSendError:
