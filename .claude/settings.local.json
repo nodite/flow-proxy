@@ -8,7 +8,11 @@
       "Bash(make test:*)",
       "Bash(make lint:*)",
       "Bash(python -m pytest:*)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:litellm-api.up.railway.app)",
+      "WebSearch",
+      "WebFetch(domain:docs.litellm.ai)",
+      "WebFetch(domain:pypi.org)"
     ]
   }
 }
