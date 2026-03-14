@@ -224,7 +224,7 @@ These are considered the implemented part of Phase 1 “client correctness” an
 5. **Metrics semantics and extension point**
    In code or a short design paragraph, define the pluggable callback or read-only stats interface (4.2, 4.3). Add a commented stub in `_finish_stream()` so Phase 2 can hook in without a search. Do not implement Prometheus or other export in Phase 1.
 
-4. **Phase 2**
+6. **Phase 2**
    Optional pre-first-byte retry, metrics export (e.g. `/metrics`), TTFB/duration histograms; kept in a “Phase 2” subsection with no fixed timeline.
 
 ### 5.3 Acceptance
