@@ -171,7 +171,33 @@ class PricingCache:
 
 ### 3.4 `StreamingState` additions
 
-Three new fields added to the existing `StreamingState` dataclass. `usage_queue` and `start_time` are **required constructor arguments** (no default), consistent with `pipe_r`/`pipe_w`/`chunk_queue`. Only `request_model` has a default.
+Five new fields added to the existing `StreamingState` dataclass. The existing dataclass definition ends with three defaulted fields (`headers_sent=False`, `status_code=0`, `error=None`). Two new **required** fields (`usage_queue`, `start_time`) must be inserted **before** those existing defaulted fields to satisfy Python dataclass ordering rules (required fields cannot follow defaulted fields). Three new optional fields (`request_model`, `usage_parser_thread`, `ttfb_ms`) are appended after the existing defaulted fields.
+
+**Insertion position** — the updated `StreamingState` field order:
+
+```python
+@dataclass
+class StreamingState:
+    # --- existing required fields (unchanged) ---
+    pipe_r: int
+    pipe_w: int
+    chunk_queue: "queue.Queue[_ResponseHeaders | bytes | None]"
+    thread: threading.Thread | None
+    cancel: threading.Event
+    req_id: str
+    config_name: str
+    # --- NEW required fields (inserted here, before existing defaults) ---
+    usage_queue: "queue.Queue[bytes | None]"
+    start_time: float
+    # --- existing defaulted fields (unchanged) ---
+    headers_sent: bool = False
+    status_code: int = 0
+    error: BaseException | None = None
+    # --- NEW optional fields (appended after existing defaults) ---
+    request_model: str = ""
+    usage_parser_thread: "threading.Thread | None" = None
+    ttfb_ms: "float | None" = None
+```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -179,7 +205,7 @@ Three new fields added to the existing `StreamingState` dataclass. `usage_queue`
 | `start_time` | `float` | — (required) | `time.monotonic()` recorded at start of `handle_request()`. |
 | `request_model` | `str` | `""` | Model name extracted from request body; empty string if absent. |
 | `usage_parser_thread` | `threading.Thread \| None` | `None` | Set by `read_from_descriptors()` when `_ResponseHeaders` is first dequeued; joined by `_reset_request_state()`. |
-| `ttfb_ms` | `float \| None` | `None` | Set by worker on first byte/line; read by `_finish_stream()` after worker join (GIL-visibility, same pattern as `state.error`). |
+| `ttfb_ms` | `float \| None` | `None` | Set by worker before first `chunk_queue.put(chunk)` call; read by main thread in `_finish_stream()`. GIL-visibility guaranteed by queue happens-before relationship. |
 
 ### 3.5 Log Format
 
@@ -250,6 +276,7 @@ On pipe/`thread.start()` failure, `_streaming_state` is set to `None` and `clear
 
 ### 5.3 `_streaming_worker()` changes
 
+- **TTFB**: On first byte/line, compute `state.ttfb_ms = (time.monotonic() - state.start_time) * 1000` **before** calling `state.chunk_queue.put(chunk)` or `state.usage_queue.put(chunk)`. This ordering guarantees GIL-visibility to the main thread via the queue happens-before relationship.
 - For each `bytes` chunk: call `state.usage_queue.put(chunk)` **immediately after** `state.chunk_queue.put(chunk)` and **before** the `os.write(state.pipe_w, ...)` notification call. This ordering ensures that an `OSError` on `os.write` (early-return on client disconnect) does not leave a chunk in `chunk_queue` but missing from `usage_queue`.
 - This applies only to `bytes` chunks — the `_ResponseHeaders` item put at the top of the worker is **not** put into `usage_queue`.
 - In `finally`: after `chunk_queue.put(None)`, also call `state.usage_queue.put(None)`.
@@ -357,8 +384,8 @@ Location: `~/.flow-proxy/stats.json` (created with parent dir on first flush).
 | `total_completion_tokens` | int | Same | Same. |
 | `total_tokens` | int | Same | Same. |
 | `total_cost_usd` | float | Same | Sum; `None` skipped. |
-| `by_model` | dict[str, bucket] | `UsageParser` via `record()` | Per-model breakdown: `stream_requests`, token fields, `total_cost_usd`. |
-| `by_config` | dict[str, bucket] | Both paths | Per-config breakdown: same fields as top-level bucket. |
+| `by_model` | dict[str, sub-bucket] | `UsageParser` via `record()` | Per-model breakdown. Sub-bucket fields: `stream_requests`, `total_prompt_tokens`, `total_completion_tokens`, `total_tokens`, `total_cost_usd`. `stream_requests` here is set by `record_stream_event("started")` (keyed by model if known from request body, else skipped). |
+| `by_config` | dict[str, sub-bucket] | Both paths | Per-config breakdown. Sub-bucket fields: `stream_requests`, `stream_responses`, `stream_errors`, `total_prompt_tokens`, `total_completion_tokens`, `total_tokens`, `total_cost_usd`. |
 
 **Retention policy:**
 - `all_time`: cumulative, never trimmed.
@@ -405,7 +432,7 @@ class UsageStats:
 **`record()` internals:**
 - Acquires `self._lock` (brief critical section: a few dict lookups and integer increments).
 - Updates three buckets: `_pending["all_time"]`, `_pending["daily"][ts.strftime("%Y-%m-%d")]`, `_pending["hourly"][ts.strftime("%Y-%m-%dT%H")]`.
-- Increments `stream_requests` (via `by_model` and `by_config`), token fields.
+- Increments only token/cost fields and `by_model` / `by_config` sub-bucket token/cost fields. **Does NOT touch `stream_requests`** — that counter is owned exclusively by `record_stream_event("started")` to prevent double-counting.
 
 **`record_stream_event()` internals:**
 - Same lock and three-bucket update.
@@ -428,13 +455,13 @@ class UsageStats:
 
 ### 6.4 `StreamingState` addition for TTFB
 
-One new field added to `StreamingState`:
+The `ttfb_ms` field (listed in §3.4) is set by the worker on first byte/line using `(time.monotonic() - state.start_time) * 1000`.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `ttfb_ms` | `float \| None` | `None` | Set by worker on first byte/line using `(time.monotonic() - state.start_time) * 1000`. Read by main thread in `_finish_stream()` after worker join. Thread-safety: same GIL-visibility pattern as `state.error`. |
+**Visibility guarantee:** The worker sets `state.ttfb_ms` **before** the first `state.chunk_queue.put(chunk)` call. The main thread reads `state.ttfb_ms` in `_finish_stream()` only after the `None` sentinel is received from `chunk_queue` (which is after all `bytes` chunks, which are after `ttfb_ms` was set). The `queue.put()` / `queue.get()` pair forms a happens-before boundary; CPython's GIL guarantees that the write to `state.ttfb_ms` is visible to the main thread once `chunk_queue.get()` returns `None`. This is the same pattern as `state.error`, which is also written by the worker before `chunk_queue.put(None)` and read by the main thread after `chunk_queue.get()` returns `None`.
 
-The worker sets `state.ttfb_ms` immediately before logging `"Received first SSE line…"` / `"Received first chunk…"`.
+**`_finish_stream()` does NOT join the worker thread.** It only closes fds and clears `_streaming_state`. The worker join (with `timeout=2.0s`) happens in `_reset_request_state()`. `ttfb_ms` visibility does NOT depend on the join — it depends only on the queue happens-before relationship described above.
+
+The worker sets `state.ttfb_ms` immediately before logging `"Received first SSE line…"` / `"Received first chunk…"`, and **before** `state.chunk_queue.put(chunk)` and `state.usage_queue.put(chunk)`.
 
 ### 6.5 `record_stream_event()` Call Sites
 
@@ -472,25 +499,11 @@ This call happens after the USAGE log line is emitted. If `record()` raises (sho
 
 ### 6.8 Integration with `LogCleaner`
 
-`LogCleaner` receives a `usage_stats: UsageStats | None = None` constructor argument. When set, `cleanup_logs()` calls `usage_stats.flush(stats_file)` **once before** any `log_file.unlink()` call. This ensures in-memory data accumulated since the last periodic flush is persisted before old logs are removed.
+**No integration.** `LogCleaner` and `UsageStats` are independent subsystems.
 
-`init_log_cleaner()` and `LogSetup.initialize_cleaner()` pass `usage_stats=ProcessServices.get().usage_stats` and `stats_file=Path.home() / ".flow-proxy" / "stats.json"` by default.
+**Rationale:** `LogCleaner` is initialized in the **parent process** by `LogSetup.initialize_cleaner()` during `setup_logging()` in `cli.py` — before `fork()` and before `ProcessServices` exists. `UsageStats` is owned by `ProcessServices`, which initializes lazily in each **child process** on first `ProcessServices.get()` call. These two lifetimes never overlap safely; passing `ProcessServices.get().usage_stats` to `LogCleaner` in the parent process would create a cross-process reference that is invalid after fork.
 
-`LogCleaner` constructor additions:
-
-```python
-def __init__(
-    self,
-    *,
-    log_dir: Path,
-    retention_days: int = 7,
-    cleanup_interval_hours: int = 24,
-    max_size_mb: int = 0,
-    enabled: bool = True,
-    usage_stats: "UsageStats | None" = None,   # new
-    stats_file: Path | None = None,             # new
-):
-```
+The `StatsFlushThread` (§6.3) already provides regular persistence. At-most `flush_interval` seconds of data may be lost on hard crash, which is acceptable for usage statistics. No additional flush trigger from `LogCleaner` is needed.
 
 ### 6.9 `ProcessServices` additions
 
@@ -502,16 +515,16 @@ def __init__(
 | Test | Assertion |
 |------|-----------|
 | `test_record_updates_all_buckets` | Single `record()` call; assert `_pending` has `all_time`, `daily`, `hourly` entries with correct values. |
-| `test_record_thread_safe` | 100 threads each call `record()` 10 times concurrently; assert `total_requests == 1000`. |
+| `test_record_thread_safe` | 100 threads each call `record()` 10 times concurrently; assert `total_prompt_tokens` correctly summed (no race corruption). |
 | `test_flush_creates_stats_file` | No `stats.json`; `flush()` creates it with correct structure. |
-| `test_flush_merges_increments` | Existing `stats.json` with `total_requests=5`; `flush()` with 3 new requests; assert `total_requests==8`. |
+| `test_flush_merges_increments` | Existing `stats.json` with `stream_requests=5`; `record_stream_event("started")` 3 times + `flush()`; assert `stream_requests==8`. |
 | `test_flush_resets_pending` | After `flush()`, `_pending` is empty; second `flush()` is a no-op (no file write). |
 | `test_flush_atomic_write` | Mock `os.replace` to raise; assert original `stats.json` unchanged. |
 | `test_flush_multiprocess_safe` | Two threads call `flush()` concurrently on the same file; assert no data corruption or lost increments. |
 | `test_hourly_trimmed_to_7_days` | Record events with 200 distinct hours; after `flush()`, only last 168 hourly keys remain. |
 | `test_none_fields_skipped` | `record()` with `None` tokens; assert token fields not present in pending bucket. |
 | `test_flush_interval_env_var` | `FLOW_PROXY_STATS_FLUSH_INTERVAL=10`; assert `StatsFlushThread` fires within ~15 s. |
-| `test_log_cleaner_flushes_before_delete` | Mock `usage_stats.flush`; assert called before `unlink()` in `cleanup_logs()`. |
+| `test_flush_thread_fires_on_interval` | `StatsFlushThread` with `flush_interval=1`; record an event; assert `stats.json` written within ~2 s. |
 | `test_record_stream_event_started` | `record_stream_event(event="started", ...)`; assert `stream_requests==1`, no `stream_errors`. |
 | `test_record_stream_event_response` | `record_stream_event(event="response", status_code=200, ttfb_ms=123.0, duration_ms=4000.0)`; assert `stream_responses==1`, `responses_by_status_class["2xx"]==1`, `ttfb_ms_sum==123.0`, `ttfb_ms_count==1`. |
 | `test_record_stream_event_error_reasons` | One event per error_reason; assert `stream_errors==5`, each key in `errors_by_reason==1`. |
@@ -570,15 +583,13 @@ def __init__(
 
 ---
 
-## 7. Backward Compatibility
+## 8. Backward Compatibility
 
-- No configuration changes to existing env vars; no new environment variables.
-- No changes to request or response wire format.
+- No changes to existing environment variables or request/response wire format.
+- **One new env var**: `FLOW_PROXY_STATS_FLUSH_INTERVAL` (default `300`, range `10`–`3600`, seconds). All other env vars unchanged.
 - `PricingCache` uses `target_base_url` from `RequestForwarder`; no new secrets or endpoints required.
-- `usage_queue` and `start_time` are required `StreamingState` constructor arguments (no default); `request_model` defaults to `""`; `usage_parser_thread` defaults to `None`. `usage_queue` and `start_time` are constructed in `handle_request()`; `usage_parser_thread` is set in `read_from_descriptors()`.
-- `StreamingState` gains `ttfb_ms: float | None = None`; existing construction code unchanged (default handles it).
-- `LogCleaner` gains two optional constructor arguments (`usage_stats`, `stats_file`), both defaulting to `None`; existing callers are unaffected. When both are provided, `cleanup_logs()` calls `usage_stats.flush(stats_file)` once before deletions — no log file scanning.
-- New env var `FLOW_PROXY_STATS_FLUSH_INTERVAL` (default 300 s, range 10–3600); all other env vars unchanged.
+- `StreamingState` gains two new required fields (`usage_queue`, `start_time`) inserted before existing defaulted fields (see §3.4 for exact ordering), plus three new optional fields (`request_model=""`, `usage_parser_thread=None`, `ttfb_ms=None`). All `StreamingState` construction sites (in `handle_request()`) must be updated to supply `usage_queue` and `start_time`. The `ttfb_ms`, `usage_parser_thread`, and `request_model` fields use defaults and require no changes at construction.
+- `LogCleaner` signature is **unchanged** (§6.8 integration removed). Existing callers unaffected.
 - `~/.flow-proxy/` directory is created on first flush; no pre-existing configuration required.
 
 ---
