@@ -22,6 +22,9 @@
 - **Structured log output**
   Emit one structured `USAGE` log line per request into the existing log system, queryable by `req_id`, `config_name`, and `model`.
 
+- **Persistent stats aggregation**
+  During each `LogCleaner` run, aggregate all new USAGE log lines into `~/.flow-proxy/stats.json` with three time granularities: `hourly` (last 7 days), `daily` (indefinite), and `all_time` (cumulative). Aggregation happens before log deletion to prevent data loss.
+
 ### 1.2 Non-Goals
 
 - Real-time aggregation dashboards or metrics export (Phase 2).
@@ -32,8 +35,8 @@
 ### 1.3 Scope
 
 - Applies only to the **B3 async streaming path**: `FlowProxyWebServerPlugin`.
-- Two new modules: `flow_proxy_plugin/utils/usage_parser.py`, `flow_proxy_plugin/utils/pricing_cache.py`.
-- Minor additions to `StreamingState`, `ProcessServices`, and `_streaming_worker`.
+- Three new modules: `flow_proxy_plugin/utils/usage_parser.py`, `flow_proxy_plugin/utils/pricing_cache.py`, `flow_proxy_plugin/utils/usage_aggregator.py`.
+- Minor additions to `StreamingState`, `ProcessServices`, `_streaming_worker`, and `LogCleaner`.
 
 ---
 
@@ -264,7 +267,141 @@ remains unchanged. The `UsageRecord` emitted by `UsageParser` provides the data 
 
 ---
 
-## 6. Testing
+## 6. Stats Persistence (`~/.flow-proxy/stats.json`)
+
+### 6.1 Purpose and Trigger
+
+`stats.json` provides long-term, process-restart-safe aggregated usage statistics. It is updated during every `LogCleaner.cleanup_logs()` run by a new `UsageAggregator` component. Aggregation happens **before** any log file is deleted, so no USAGE lines are lost.
+
+### 6.2 `stats.json` Schema
+
+Location: `~/.flow-proxy/stats.json` (user home directory, created on first cleanup run).
+
+```json
+{
+  "version": 1,
+  "last_aggregated_at": "2026-03-14T12:00:00",
+  "all_time": {
+    "total_requests": 1234,
+    "total_prompt_tokens": 1000000,
+    "total_completion_tokens": 500000,
+    "total_tokens": 1500000,
+    "total_cost_usd": 45.67,
+    "by_model": {
+      "claude-3-5-sonnet": {
+        "total_requests": 800,
+        "total_prompt_tokens": 700000,
+        "total_completion_tokens": 350000,
+        "total_tokens": 1050000,
+        "total_cost_usd": 30.0
+      }
+    },
+    "by_config": {
+      "prod-1": {
+        "total_requests": 600,
+        "total_prompt_tokens": 500000,
+        "total_completion_tokens": 250000,
+        "total_tokens": 750000,
+        "total_cost_usd": 22.5
+      }
+    }
+  },
+  "daily": {
+    "2026-03-14": { "...same structure as all_time bucket..." }
+  },
+  "hourly": {
+    "2026-03-14T12": { "...same structure as all_time bucket..." }
+  }
+}
+```
+
+**Bucket structure** (shared by `all_time`, each `daily` entry, each `hourly` entry):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `total_requests` | int | Count of USAGE lines processed. |
+| `total_prompt_tokens` | int | Sum; lines with `None` tokens skipped. |
+| `total_completion_tokens` | int | Sum; same. |
+| `total_tokens` | int | Sum; same. |
+| `total_cost_usd` | float | Sum; lines with `None` cost skipped. |
+| `by_model` | dict[str, bucket] | Per-model breakdown (same fields). |
+| `by_config` | dict[str, bucket] | Per-config breakdown (same fields). |
+
+**Retention policy:**
+- `all_time`: cumulative, never trimmed.
+- `daily`: kept indefinitely.
+- `hourly`: trimmed to the last 7 days (168 entries) on each cleanup run to bound file size.
+
+### 6.3 `UsageAggregator` (`flow_proxy_plugin/utils/usage_aggregator.py`)
+
+A standalone class with one public method:
+
+```python
+class UsageAggregator:
+    def aggregate(self, log_dir: Path, stats_file: Path) -> None:
+        """Scan log files for new USAGE lines and merge into stats_file."""
+```
+
+**Algorithm:**
+1. Load `stats.json` (or start with empty structure if absent).
+2. Read `last_aggregated_at` from the loaded stats (default: epoch).
+3. Scan all `*.log*` files in `log_dir`, sorted by modification time ascending.
+4. For each file, read line by line; parse the timestamp from the log format (`%Y-%m-%d %H:%M:%S`). Skip lines with timestamp ≤ `last_aggregated_at`.
+5. For lines matching the USAGE pattern, extract all key=value fields via regex.
+6. Accumulate into in-memory buckets: `all_time`, `daily["YYYY-MM-DD"]`, `hourly["YYYY-MM-DDTHH"]`.
+7. Trim `hourly` keys older than 7 days.
+8. Set `last_aggregated_at` to `datetime.now()` (ISO 8601, no timezone).
+9. Atomic write: serialise to JSON, write to `stats_file.with_suffix(".tmp")`, then `os.replace()` to the target path.
+
+**USAGE line regex** (applied to `record.message` after stripping the log prefix):
+```
+USAGE\s+model=(\S+)\s+config=(\S+)(?:\s+prompt_tokens=(\d+))?(?:\s+completion_tokens=(\d+))?(?:\s+total_tokens=(\d+))?(?:\s+cost_usd=([\d.]+))?
+```
+Fields absent from the line (None-valued at log time) are simply not present and are skipped during aggregation.
+
+**File locking:** `stats.json` may be written by multiple worker processes concurrently (each worker has a `LogCleaner`). An `fcntl.flock(LOCK_EX)` exclusive lock is held on the `.tmp` file during the write, and `os.replace()` is atomic on POSIX. The lock is acquired after loading and before writing, so the read-modify-write cycle is protected.
+
+### 6.4 Integration with `LogCleaner`
+
+`LogCleaner` receives a `stats_file: Path | None = None` constructor argument. When set, `cleanup_logs()` calls `UsageAggregator().aggregate(self.log_dir, self.stats_file)` **before** the first `log_file.unlink()` call, ensuring no USAGE lines are discarded before aggregation.
+
+Default `stats_file`: `Path.home() / ".flow-proxy" / "stats.json"`. Created (with parent directory) on first run.
+
+`LogCleaner` constructor update:
+
+```python
+def __init__(
+    self,
+    *,
+    log_dir: Path,
+    retention_days: int = 7,
+    cleanup_interval_hours: int = 24,
+    max_size_mb: int = 0,
+    enabled: bool = True,
+    stats_file: Path | None = None,   # new
+):
+```
+
+`init_log_cleaner()` passes `stats_file=Path.home() / ".flow-proxy" / "stats.json"` by default.
+
+### 6.5 Testing (`tests/test_usage_aggregator.py`)
+
+| Test | Assertion |
+|------|-----------|
+| `test_aggregate_creates_stats_file` | No `stats.json` initially; after `aggregate()`, file created with correct structure. |
+| `test_aggregate_parses_usage_lines` | Log file with 3 USAGE lines; assert `all_time.total_requests == 3`, correct token sums. |
+| `test_aggregate_skips_old_lines` | `last_aggregated_at` set to a past time; only newer lines counted. |
+| `test_aggregate_hourly_buckets` | Lines from two different hours; assert two `hourly` keys with correct counts. |
+| `test_aggregate_daily_buckets` | Lines from two different days; assert two `daily` keys. |
+| `test_hourly_trimmed_to_7_days` | Insert 200 hourly entries; after aggregate, only 168 (7 days) remain. |
+| `test_aggregate_none_fields_skipped` | USAGE line missing `cost_usd`; `total_cost_usd` not inflated. |
+| `test_aggregate_by_model_and_config` | Lines with two models and two configs; assert correct breakdown in `by_model` and `by_config`. |
+| `test_atomic_write` | Simulate crash mid-write (mock `os.replace` to fail); assert original `stats.json` unchanged. |
+| `test_log_cleaner_aggregates_before_delete` | Mock `UsageAggregator.aggregate`; assert called before `unlink()`. |
+
+---
+
+## 7. Testing
 
 ### 6.1 New: `tests/test_usage_parser.py`
 
@@ -310,10 +447,12 @@ remains unchanged. The `UsageRecord` emitted by `UsageParser` provides the data 
 
 ## 7. Backward Compatibility
 
-- No configuration changes; no new environment variables.
+- No configuration changes to existing env vars; no new environment variables.
 - No changes to request or response wire format.
 - `PricingCache` uses `target_base_url` from `RequestForwarder`; no new secrets or endpoints required.
 - `usage_queue` and `start_time` are required `StreamingState` constructor arguments (no default); `request_model` defaults to `""`; `usage_parser_thread` defaults to `None`. `usage_queue` and `start_time` are constructed in `handle_request()`; `usage_parser_thread` is set in `read_from_descriptors()`.
+- `LogCleaner` gains an optional `stats_file` constructor argument (default `~/.flow-proxy/stats.json`); existing callers passing no `stats_file` get the default. Existing behavior of `cleanup_logs()` is unchanged except for the pre-deletion aggregation step.
+- `~/.flow-proxy/` directory is created on first cleanup run; no pre-existing configuration required.
 
 ---
 
@@ -323,3 +462,5 @@ remains unchanged. The `UsageRecord` emitted by `UsageParser` provides the data 
 - B3 async streaming design: `docs/superpowers/specs/2026-03-13-async-streaming-design.md`
 - LiteLLM streaming usage: `stream_options: {include_usage: true}` / proxy `always_include_stream_usage: true`
 - LiteLLM pricing endpoint: `GET /model/info` → `data[].model_info.{input_cost_per_token, output_cost_per_token}`; match by `data[].model_name` or `data[].litellm_params.model`
+- Log file format: `%(asctime)s - %(name)s - %(levelname)s - %(message)s` (date format `%Y-%m-%d %H:%M:%S`); rotated daily with suffix `YYYY-MM-DD`
+- `stats.json` location: `~/.flow-proxy/stats.json`
