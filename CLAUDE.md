@@ -102,9 +102,10 @@ The codebase follows a modular architecture built on top of the proxy.py framewo
   - **B3 async pipe-mediated streaming**: worker → `chunk_queue` + `os.pipe()` notification → `read_from_descriptors()` (main thread) → `self.client.queue()`. Only the main thread ever calls `self.client.queue()`
   - `_ResponseHeaders` dataclass (plain Python types only — no httpx objects cross thread boundaries) carries `status_code`, `reason_phrase`, `headers`, `is_sse`; always the first item in `chunk_queue`
   - Worker queue protocol (strict order): `_ResponseHeaders` → `bytes` chunks → `None` sentinel (always last, even on error)
-  - `StreamingState` dataclass holds `pipe_r/w`, `chunk_queue`, `cancel` event, `thread`, per-request metadata; stored as `self._streaming_state`
+  - `StreamingState` dataclass holds `pipe_r/w`, `chunk_queue`, `cancel` event, `thread`, per-request metadata; stored as `self._streaming_state`. Fields `headers_sent`, `is_sse`, `status_code`, `error` tracked for error path branching in `_finish_stream()`
   - `get_descriptors()` registers `pipe_r` with proxy.py's selector while streaming is active
   - `_send_response_headers_from()` always strips `connection` and `transfer-encoding` to avoid chunked-encoding framing issues; adds SSE anti-buffering headers when `is_sse`
+  - **SSE mid-stream error injection**: `_finish_stream()` branches on `state.error` — no headers yet → 503, SSE headers sent → `_send_sse_error_event()` injects `event: error\ndata: {...}\n\n`, non-SSE headers sent → silent close
   - On `httpx.TransportError`, worker calls `mark_http_client_dirty()` for client rebuild
   - Pool-enabled: `__new__` routes through `_web_pool`, `__init__` guarded by `if self._pooled: return`
   - Releases to pool in `on_client_connection_close()`
