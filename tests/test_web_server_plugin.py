@@ -866,11 +866,17 @@ class TestHandleRequestAsync:
                 "flow_proxy_plugin.plugins.web_server_plugin.clear_request_context"
             ) as mock_clear,
         ):
+            plugin.logger = MagicMock()
             plugin.handle_request(request)
 
         assert plugin._streaming_state is None
         assert plugin.client.queue.called  # type: ignore[attr-defined]
         mock_clear.assert_called_once()  # cleanup invariant
+
+        # §4.1: stream setup failure must log ERROR with exc_info=True
+        plugin.logger.error.assert_called_once()
+        error_call = str(plugin.logger.error.call_args)
+        assert "Failed to start streaming" in error_call
 
         # Both pipe fds must have been closed — re-closing should raise OSError
         assert len(captured_fds) == 2
