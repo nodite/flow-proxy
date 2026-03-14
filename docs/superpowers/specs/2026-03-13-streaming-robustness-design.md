@@ -145,7 +145,7 @@
 | Worker error | worker | ERROR | `Transport error — marking httpx client dirty: {e}` or `Worker error: {e}` (with exc_info) |
 | Stream error (headers sent) | main | WARNING | `Stream ended with error: {e}` |
 | Stream error (headers not sent) | main | ERROR | Same message; 503 already sent. |
-| Stream setup failure | main | ERROR | Existing 500 path logs. |
+| Stream setup failure | main | ERROR | `"Failed to start streaming: {e}"` with `exc_info=True` |
 
 - **Principle**
   Prefer consistent semantics and fields (req_id, config_name, status, error when relevant) over adding many new log lines; support grep and future parsing.
@@ -204,6 +204,16 @@
   `_send_error()` uses `_REASON_PHRASES` dict: `500 → “Internal Server Error”`, `503 → “Service Unavailable”` (RFC 7231). Replaces previous `”Error”` placeholder.
 - **`clear_request_context()` on all exit paths**
   All streaming exit paths (auth failure, stream setup failure, `_finish_stream()`, `_reset_request_state()`) call `clear_request_context()` to prevent thread-local context leaks across requests in the pool.
+- **Stream setup exception logging**
+  `handle_request()` stream setup `except Exception` block now logs `ERROR` with `exc_info=True` (`”Failed to start streaming: {e}”`), consistent with auth-failure path and §4.1 log event table.
+- **Metrics extension point stub**
+  `_finish_stream()` now contains `# metrics hook (Phase 2): on_stream_finished(req_id, config_name, status_code, error)` as specified in §4.3.
+- **Test suite correctness**
+  `test_send_error_default` updated to assert `b”500 Internal Server Error”` (RFC 7231). `test_send_error_custom` renamed and documented to explicitly test the fallback path for status codes not in `_REASON_PHRASES`.
+- **Clamping tests**
+  `TestResolveRuntimeConfig` added to `test_cli.py`: covers below-min (0→1), above-max (100000→86400), in-range, and exact-boundary cases; verifies warning logged only when clamped.
+- **Cleanup invariant tests**
+  `test_handle_request_cleans_up_pipe_on_auth_failure` and `test_handle_request_cleans_up_pipe_on_setup_failure` updated to assert `clear_request_context()` is called, directly validating the §3.2 cleanup invariant.
 
 These are considered the implemented part of Phase 1 “client correctness” and “failure handling”; the spec lists them as done.
 
