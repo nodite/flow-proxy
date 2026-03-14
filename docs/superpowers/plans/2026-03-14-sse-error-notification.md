@@ -278,18 +278,26 @@ Add the new method after `_send_error`. `_send_error` ends at line 532; add imme
 
 **Sub-task B — Update `_finish_stream`**
 
-`_finish_stream` error branch is at lines 179–183:
+`_finish_stream` error branch is at lines 179–189. Replace the entire `if state.error: ... clear_request_context()` block:
 
+**Before:**
 ```python
         if state.error:
             if not state.headers_sent:
                 self._send_error(503, "Upstream error")
             log_func = self.logger.warning if state.headers_sent else self.logger.error
             log_func("Stream ended with error: %s", state.error)
+        else:
+            log_func = (
+                self.logger.info if state.status_code < 400 else self.logger.warning
+            )
+            log_func("← %d [%s]", state.status_code, state.config_name)
+        clear_request_context()
 ```
 
-- [ ] **Step 2: Insert `elif state.is_sse` branch between the 503 path and the log lines**
+- [ ] **Step 2: Replace with the block below — adds `elif state.is_sse` branch**
 
+**After:**
 ```python
         if state.error:
             if not state.headers_sent:
@@ -299,6 +307,12 @@ Add the new method after `_send_error`. `_send_error` ends at line 532; add imme
             # non-SSE + headers sent: silent close (unchanged)
             log_func = self.logger.warning if state.headers_sent else self.logger.error
             log_func("Stream ended with error: %s", state.error)
+        else:
+            log_func = (
+                self.logger.info if state.status_code < 400 else self.logger.warning
+            )
+            log_func("← %d [%s]", state.status_code, state.config_name)
+        clear_request_context()
 ```
 
 - [ ] **Step 3: Run all four new tests — verify they all pass**
