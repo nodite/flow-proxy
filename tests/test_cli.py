@@ -1,5 +1,6 @@
 """Tests for CLI module."""
 
+import argparse
 import multiprocessing
 import os
 from unittest.mock import MagicMock, patch
@@ -296,3 +297,78 @@ class TestCLI:
             # Should contain at least major.minor
             parts = __version__.split(".")
             assert len(parts) >= 2, f"Invalid version format: {__version__}"
+
+
+class TestResolveRuntimeConfig:
+    """Unit tests for _resolve_runtime_config() — clamping and warning behaviour."""
+
+    def _make_args(self, client_timeout: float, num_workers: int | None = None, no_threaded: bool = False) -> argparse.Namespace:
+        return argparse.Namespace(
+            client_timeout=client_timeout,
+            num_workers=num_workers,
+            no_threaded=no_threaded,
+        )
+
+    def test_timeout_below_min_clamped_to_1(self) -> None:
+        """client_timeout=0 is clamped to 1 and a warning is logged."""
+        from flow_proxy_plugin.cli import _resolve_runtime_config
+
+        mock_logger = MagicMock()
+        args = self._make_args(client_timeout=0)
+
+        _, _, timeout = _resolve_runtime_config(args, mock_logger)
+
+        assert timeout == 1
+        mock_logger.warning.assert_called_once()
+        warning_msg = str(mock_logger.warning.call_args)
+        assert "clamped" in warning_msg.lower() or "0" in warning_msg
+
+    def test_timeout_above_max_clamped_to_86400(self) -> None:
+        """client_timeout=100000 is clamped to 86400 and a warning is logged."""
+        from flow_proxy_plugin.cli import _resolve_runtime_config
+
+        mock_logger = MagicMock()
+        args = self._make_args(client_timeout=100000)
+
+        _, _, timeout = _resolve_runtime_config(args, mock_logger)
+
+        assert timeout == 86400
+        mock_logger.warning.assert_called_once()
+        warning_msg = str(mock_logger.warning.call_args)
+        assert "clamped" in warning_msg.lower() or "86400" in warning_msg
+
+    def test_timeout_in_range_no_warning(self) -> None:
+        """client_timeout=300 is within range; no warning logged."""
+        from flow_proxy_plugin.cli import _resolve_runtime_config
+
+        mock_logger = MagicMock()
+        args = self._make_args(client_timeout=300)
+
+        _, _, timeout = _resolve_runtime_config(args, mock_logger)
+
+        assert timeout == 300
+        mock_logger.warning.assert_not_called()
+
+    def test_timeout_boundary_min_no_warning(self) -> None:
+        """client_timeout=1 is exactly at lower bound; no warning."""
+        from flow_proxy_plugin.cli import _resolve_runtime_config
+
+        mock_logger = MagicMock()
+        args = self._make_args(client_timeout=1)
+
+        _, _, timeout = _resolve_runtime_config(args, mock_logger)
+
+        assert timeout == 1
+        mock_logger.warning.assert_not_called()
+
+    def test_timeout_boundary_max_no_warning(self) -> None:
+        """client_timeout=86400 is exactly at upper bound; no warning."""
+        from flow_proxy_plugin.cli import _resolve_runtime_config
+
+        mock_logger = MagicMock()
+        args = self._make_args(client_timeout=86400)
+
+        _, _, timeout = _resolve_runtime_config(args, mock_logger)
+
+        assert timeout == 86400
+        mock_logger.warning.assert_not_called()
