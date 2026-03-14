@@ -1,5 +1,6 @@
 """Web Server plugin for reverse proxy mode."""
 
+import json
 import logging
 import os
 import queue
@@ -58,6 +59,7 @@ class StreamingState:  # pylint: disable=too-many-instance-attributes
     req_id: str  # for log context
     config_name: str  # for final access log line
     headers_sent: bool = False  # guards error-response logic
+    is_sse: bool = False  # set by read_from_descriptors when _ResponseHeaders processed
     status_code: int = 0  # stored after _ResponseHeaders item is processed
     error: BaseException | None = None  # set by worker on exception
 
@@ -153,6 +155,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             item = state.chunk_queue.get_nowait()
 
             if isinstance(item, _ResponseHeaders):
+                state.is_sse = item.is_sse
                 state.status_code = item.status_code
                 self._send_response_headers_from(item)
                 state.headers_sent = True
@@ -179,6 +182,9 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         if state.error:
             if not state.headers_sent:
                 self._send_error(503, "Upstream error")
+            elif state.is_sse:
+                self._send_sse_error_event()
+            # non-SSE + headers sent: silent close (unchanged)
             log_func = self.logger.warning if state.headers_sent else self.logger.error
             log_func("Stream ended with error: %s", state.error)
         else:
@@ -516,6 +522,19 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         500: "Internal Server Error",
         503: "Service Unavailable",
     }
+
+    def _send_sse_error_event(self) -> None:
+        """Inject a synthetic SSE error event to notify the client of upstream failure.
+
+        Called from _finish_stream (main thread only).
+        Thread-safety: self.client.queue() is only called from the main thread.
+        """
+        payload = json.dumps({
+            "type": "error",
+            "error": {"type": "api_error", "message": "Upstream connection lost"},
+        })
+        event = f"event: error\ndata: {payload}\n\n".encode()
+        self.client.queue(memoryview(event))
 
     def _send_error(
         self, status_code: int = 500, message: str = "Internal server error"

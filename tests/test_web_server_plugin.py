@@ -749,6 +749,7 @@ class TestEventLoopHooks:
         state, pipe_r, pipe_w = self._make_state_with_pipe()
         state.error = RuntimeError("boom after headers")
         state.headers_sent = True
+        state.is_sse = False  # explicit: tests non-SSE silent-close path
         state.chunk_queue.put(None)
         plugin._streaming_state = state
         os.write(pipe_w, b"\x00")
@@ -760,6 +761,97 @@ class TestEventLoopHooks:
         assert not plugin.client.queue.called  # type: ignore[attr-defined]
         # Error must be logged (warning-level when headers already committed)
         plugin.logger.warning.assert_called()  # type: ignore[attr-defined]
+
+    def test_is_sse_propagated_to_state_when_response_headers_processed(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """read_from_descriptors sets state.is_sse=True from _ResponseHeaders(is_sse=True)."""
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        assert state.is_sse is False  # default
+        state.chunk_queue.put(_ResponseHeaders(200, "OK", {}, True))  # is_sse=True
+        plugin._streaming_state = state
+        os.write(pipe_w, b"\x00")
+        try:
+            asyncio.run(plugin.read_from_descriptors([pipe_r]))
+        finally:
+            plugin._streaming_state = None
+            for fd in (pipe_r, pipe_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        assert state.is_sse is True
+
+    def test_sse_error_event_sent_when_error_after_headers_on_sse_stream(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_finish_stream injects SSE error event when error occurs after headers on SSE stream."""
+        import asyncio
+        import json
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.error = RuntimeError("upstream boom")
+        state.headers_sent = True
+        state.is_sse = True
+        state.chunk_queue.put(None)
+        plugin._streaming_state = state
+        os.write(pipe_w, b"\x00")
+        plugin.client.queue.reset_mock()  # type: ignore[attr-defined]
+        asyncio.run(plugin.read_from_descriptors([pipe_r]))
+
+        # Must have queued exactly one item — the SSE error event
+        assert plugin.client.queue.call_count == 1  # type: ignore[attr-defined]
+        queued = bytes(plugin.client.queue.call_args[0][0])  # type: ignore[attr-defined]
+        expected_payload = json.dumps({
+            "type": "error",
+            "error": {"type": "api_error", "message": "Upstream connection lost"},
+        })
+        expected = f"event: error\ndata: {expected_payload}\n\n".encode()
+        assert queued == expected
+
+    def test_non_sse_error_after_headers_still_silent(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_finish_stream does NOT send anything when error occurs after headers on non-SSE stream."""
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.error = RuntimeError("upstream boom")
+        state.headers_sent = True
+        state.is_sse = False  # explicit — non-SSE path
+        state.chunk_queue.put(None)
+        plugin._streaming_state = state
+        os.write(pipe_w, b"\x00")
+        plugin.client.queue.reset_mock()  # type: ignore[attr-defined]
+        asyncio.run(plugin.read_from_descriptors([pipe_r]))
+
+        assert not plugin.client.queue.called  # type: ignore[attr-defined]
+        plugin.logger.warning.assert_called()  # type: ignore[attr-defined]
+
+    def test_error_before_headers_sends_503_bytes(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """Regression guard: _finish_stream sends a 503 response when error precedes headers."""
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.error = RuntimeError("pre-header boom")
+        state.headers_sent = False
+        state.is_sse = False
+        state.chunk_queue.put(None)
+        plugin._streaming_state = state
+        os.write(pipe_w, b"\x00")
+        asyncio.run(plugin.read_from_descriptors([pipe_r]))
+
+        assert plugin.client.queue.called  # type: ignore[attr-defined]
+        queued = bytes(plugin.client.queue.call_args_list[0][0][0])  # type: ignore[attr-defined]
+        assert b"503" in queued
 
 
 class TestHandleRequestAsync:
