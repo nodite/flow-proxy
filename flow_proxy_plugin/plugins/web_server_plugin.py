@@ -187,6 +187,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             )
             log_func("← %d [%s]", state.status_code, state.config_name)
         clear_request_context()
+        # metrics hook (Phase 2): on_stream_finished(req_id, config_name, status_code, error)
 
     def _reset_request_state(self) -> None:
         """Cancel and join worker thread; close pipe fds. Called by PluginPool.release()."""
@@ -214,7 +215,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         """Define routes that this plugin handles."""
         return [(httpProtocolTypes.HTTP, r"/.*")]
 
-    def handle_request(self, request: HttpParser) -> None:
+    def handle_request(self, request: HttpParser) -> None:  # pylint: disable=too-many-locals
         """Start async streaming: authenticate, build params, launch worker, return.
 
         Does NOT block waiting for the upstream response. The worker thread feeds
@@ -272,7 +273,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             )
             self._streaming_state = state
             state.thread.start()
-        except Exception:
+        except Exception as setup_exc:
+            self.logger.error("Failed to start streaming: %s", setup_exc, exc_info=True)
             try:
                 os.close(pipe_r)
             except OSError:
