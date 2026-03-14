@@ -809,7 +809,7 @@ class TestHandleRequestAsync:
     def test_handle_request_cleans_up_pipe_on_auth_failure(
         self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
-        """If auth fails, handle_request sends error and returns without leaking fds."""
+        """If auth fails, handle_request sends 503, clears context, and returns without leaking state."""
         mock_svc.load_balancer.get_next_config.side_effect = Exception("no config")
 
         request = Mock(spec=HttpParser)
@@ -819,17 +819,22 @@ class TestHandleRequestAsync:
         request.body = None
         request.buffer = None
 
-        with patch.object(ProcessServices, "get", return_value=mock_svc):
+        with (
+            patch.object(ProcessServices, "get", return_value=mock_svc),
+            patch(
+                "flow_proxy_plugin.plugins.web_server_plugin.clear_request_context"
+            ) as mock_clear,
+        ):
             plugin.handle_request(request)
 
         assert plugin._streaming_state is None
-        # _send_error should have been called
         assert plugin.client.queue.called  # type: ignore[attr-defined]
+        mock_clear.assert_called_once()  # cleanup invariant
 
     def test_handle_request_cleans_up_pipe_on_setup_failure(
         self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
-        """If threading.Thread.start() raises, pipe fds are closed and state is None."""
+        """If threading.Thread.start() raises, pipe fds are closed, state is None, context cleared."""
         mock_svc.load_balancer.get_next_config.return_value = {
             "name": "cfg", "clientId": "cid", "clientSecret": "s", "tenant": "t"
         }
@@ -853,14 +858,20 @@ class TestHandleRequestAsync:
             captured_fds.extend([r, w])
             return r, w
 
-        with patch("flow_proxy_plugin.plugins.web_server_plugin.os.pipe", side_effect=capturing_pipe):
-            with patch("threading.Thread.start", side_effect=RuntimeError("thread start failed")):
-                with patch.object(ProcessServices, "get", return_value=mock_svc):
-                    plugin.handle_request(request)
+        with (
+            patch("flow_proxy_plugin.plugins.web_server_plugin.os.pipe", side_effect=capturing_pipe),
+            patch("threading.Thread.start", side_effect=RuntimeError("thread start failed")),
+            patch.object(ProcessServices, "get", return_value=mock_svc),
+            patch(
+                "flow_proxy_plugin.plugins.web_server_plugin.clear_request_context"
+            ) as mock_clear,
+        ):
+            plugin.handle_request(request)
 
         assert plugin._streaming_state is None
-        # _send_error should have been called for the setup failure
         assert plugin.client.queue.called  # type: ignore[attr-defined]
+        mock_clear.assert_called_once()  # cleanup invariant
+
         # Both pipe fds must have been closed — re-closing should raise OSError
         assert len(captured_fds) == 2
         with pytest.raises(OSError):
