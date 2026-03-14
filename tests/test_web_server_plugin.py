@@ -235,11 +235,18 @@ class TestSendError:
         mock_queue.assert_called_once()
         call_args = mock_queue.call_args[0][0]
         response_bytes = bytes(call_args)
-        assert b"500 Error" in response_bytes
+        assert b"500 Internal Server Error" in response_bytes
         assert b"Internal server error" in response_bytes
 
-    def test_send_error_custom(self, plugin: FlowProxyWebServerPlugin) -> None:
-        """Test sending custom error response."""
+    def test_send_error_custom_uses_fallback_for_unknown_code(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """Status codes not in _REASON_PHRASES fall back to 'Error' as reason phrase.
+
+        NOTE: 404 is intentionally NOT in _REASON_PHRASES; this test validates the
+        fallback path. If 404 is ever added to _REASON_PHRASES, update this test
+        to use a different uncovered code (e.g. 418).
+        """
         mock_queue = Mock()
         plugin.client = Mock(queue=mock_queue)
 
@@ -248,7 +255,7 @@ class TestSendError:
         mock_queue.assert_called_once()
         call_args = mock_queue.call_args[0][0]
         response_bytes = bytes(call_args)
-        assert b"404 Error" in response_bytes
+        assert b"404 Error" in response_bytes  # fallback reason phrase
         assert b"Not found" in response_bytes
 
 
