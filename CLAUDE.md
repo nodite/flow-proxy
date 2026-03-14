@@ -98,10 +98,13 @@ The codebase follows a modular architecture built on top of the proxy.py framewo
 
 - **FlowProxyWebServerPlugin** (`web_server_plugin.py`): Reverse proxy mode implementation
   - Extends `HttpWebServerBasePlugin` from proxy.py
-  - Hook: `handle_request()` — authenticates, builds params, launches `_streaming_worker` daemon thread, returns immediately (non-blocking)
+  - Hook: `handle_request()` — authenticates, builds params, launches `_streaming_worker` daemon thread, returns immediately (non-blocking); on setup failure logs ERROR and sends 500 with `clear_request_context()`
   - **B3 async pipe-mediated streaming**: worker → `chunk_queue` + `os.pipe()` notification → `read_from_descriptors()` (main thread) → `self.client.queue()`. Only the main thread ever calls `self.client.queue()`
+  - `_ResponseHeaders` dataclass (plain Python types only — no httpx objects cross thread boundaries) carries `status_code`, `reason_phrase`, `headers`, `is_sse`; always the first item in `chunk_queue`
+  - Worker queue protocol (strict order): `_ResponseHeaders` → `bytes` chunks → `None` sentinel (always last, even on error)
   - `StreamingState` dataclass holds `pipe_r/w`, `chunk_queue`, `cancel` event, `thread`, per-request metadata; stored as `self._streaming_state`
   - `get_descriptors()` registers `pipe_r` with proxy.py's selector while streaming is active
+  - `_send_response_headers_from()` always strips `connection` and `transfer-encoding` to avoid chunked-encoding framing issues; adds SSE anti-buffering headers when `is_sse`
   - On `httpx.TransportError`, worker calls `mark_http_client_dirty()` for client rebuild
   - Pool-enabled: `__new__` routes through `_web_pool`, `__init__` guarded by `if self._pooled: return`
   - Releases to pool in `on_client_connection_close()`
@@ -149,7 +152,7 @@ All environment variables are prefixed with `FLOW_PROXY_`:
 - `FLOW_PROXY_HOST=127.0.0.1`: Bind address
 - `FLOW_PROXY_NUM_WORKERS`: Worker processes (default: CPU count)
 - `FLOW_PROXY_THREADED=1`: Enable threaded mode (1=on, 0=off)
-- `FLOW_PROXY_CLIENT_TIMEOUT=600`: Client inactivity timeout (seconds); must be ≥ backend TTFB for streaming
+- `FLOW_PROXY_CLIENT_TIMEOUT=600`: Client inactivity timeout (seconds, clamped 1–86400); must be ≥ backend TTFB for streaming; proxy.py default of 10s closes connections before first byte arrives
 - `FLOW_PROXY_LOG_LEVEL=INFO`: Logging level
 - `FLOW_PROXY_SECRETS_FILE=secrets.json`: Path to secrets file
 - `FLOW_PROXY_LOG_DIR=logs`: Log directory
