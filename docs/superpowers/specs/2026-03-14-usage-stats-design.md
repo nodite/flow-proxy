@@ -23,11 +23,14 @@
   Emit one structured `USAGE` log line per request into the existing log system, queryable by `req_id`, `config_name`, and `model`.
 
 - **Persistent stats aggregation**
-  During each `LogCleaner` run, aggregate all new USAGE log lines into `~/.flow-proxy/stats.json` with three time granularities: `hourly` (last 7 days), `daily` (indefinite), and `all_time` (cumulative). Aggregation happens before log deletion to prevent data loss.
+  In-memory counters flushed to `~/.flow-proxy/stats.json` every N minutes (default 5 min) with three time granularities: `hourly` (last 7 days), `daily` (indefinite), and `all_time` (cumulative).
+
+- **Full streaming observability** (implements robustness spec §4.2 Phase 1)
+  Track all metric semantics defined in `docs/superpowers/specs/2026-03-13-streaming-robustness-design.md §4.2`: `stream_requests_total`, `stream_responses_total` (by status class), `stream_errors_total` (by error reason), `stream_ttfb_ms`, `stream_duration_ms` — covering all exit paths including auth failure, setup failure, worker error, and client disconnect.
 
 ### 1.2 Non-Goals
 
-- Real-time aggregation dashboards or metrics export (Phase 2).
+- Real-time aggregation dashboards or Prometheus metrics export (Phase 2).
 - Per-user or per-team budgeting.
 - Non-streaming requests (forward proxy / `FlowProxyPlugin`); can be added later.
 - Modifying client requests to inject `stream_options: {include_usage: true}` — this is a separate concern; the design degrades gracefully when usage is absent.
@@ -176,6 +179,7 @@ Three new fields added to the existing `StreamingState` dataclass. `usage_queue`
 | `start_time` | `float` | — (required) | `time.monotonic()` recorded at start of `handle_request()`. |
 | `request_model` | `str` | `""` | Model name extracted from request body; empty string if absent. |
 | `usage_parser_thread` | `threading.Thread \| None` | `None` | Set by `read_from_descriptors()` when `_ResponseHeaders` is first dequeued; joined by `_reset_request_state()`. |
+| `ttfb_ms` | `float \| None` | `None` | Set by worker on first byte/line; read by `_finish_stream()` after worker join (GIL-visibility, same pattern as `state.error`). |
 
 ### 3.5 Log Format
 
@@ -292,14 +296,25 @@ Location: `~/.flow-proxy/stats.json` (created with parent dir on first flush).
   "version": 1,
   "last_flushed_at": "2026-03-14T12:00:00",
   "all_time": {
-    "total_requests": 1234,
+    "stream_requests": 1234,
+    "stream_responses": 1100,
+    "stream_errors": 134,
+    "responses_by_status_class": {"2xx": 980, "4xx": 100, "5xx": 20},
+    "errors_by_reason": {
+      "auth_error": 10, "setup_failed": 5,
+      "transport_error": 80, "worker_error": 30, "client_disconnect": 9
+    },
+    "ttfb_ms_sum": 250000,
+    "ttfb_ms_count": 1100,
+    "duration_ms_sum": 5000000,
+    "duration_ms_count": 1234,
     "total_prompt_tokens": 1000000,
     "total_completion_tokens": 500000,
     "total_tokens": 1500000,
     "total_cost_usd": 45.67,
     "by_model": {
       "claude-3-5-sonnet": {
-        "total_requests": 800,
+        "stream_requests": 800,
         "total_prompt_tokens": 700000,
         "total_completion_tokens": 350000,
         "total_tokens": 1050000,
@@ -308,7 +323,7 @@ Location: `~/.flow-proxy/stats.json` (created with parent dir on first flush).
     },
     "by_config": {
       "prod-1": {
-        "total_requests": 600,
+        "stream_requests": 600,
         "total_prompt_tokens": 500000,
         "total_completion_tokens": 250000,
         "total_tokens": 750000,
@@ -327,15 +342,23 @@ Location: `~/.flow-proxy/stats.json` (created with parent dir on first flush).
 
 **Bucket structure** (shared by `all_time`, each `daily` entry, each `hourly` entry):
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `total_requests` | int | Incremented on every `record()` call. |
-| `total_prompt_tokens` | int | Sum; `None` values skipped. |
-| `total_completion_tokens` | int | Sum; same. |
-| `total_tokens` | int | Sum; same. |
-| `total_cost_usd` | float | Sum; `None` values skipped. |
-| `by_model` | dict[str, bucket] | Per-model breakdown (same fields). |
-| `by_config` | dict[str, bucket] | Per-config breakdown (same fields). |
+| Field | Type | Call site | Notes |
+|-------|------|-----------|-------|
+| `stream_requests` | int | `handle_request()` after worker starts | All requests where worker thread started. |
+| `stream_responses` | int | `_finish_stream()` on no error | Requests that received ≥1 chunk from backend. |
+| `stream_errors` | int | All error exit paths | Auth failure, setup failure, worker error, client disconnect. |
+| `responses_by_status_class` | dict[str, int] | `_finish_stream()` on no error | Keys: `"2xx"`, `"4xx"`, `"5xx"`. |
+| `errors_by_reason` | dict[str, int] | All error exit paths | Keys: `"auth_error"`, `"setup_failed"`, `"transport_error"`, `"worker_error"`, `"client_disconnect"`. |
+| `ttfb_ms_sum` | float | `_finish_stream()` | Sum of TTFB values for computing average. `None` skipped. |
+| `ttfb_ms_count` | int | `_finish_stream()` | Count of requests with non-None TTFB. |
+| `duration_ms_sum` | float | `_finish_stream()` + `_reset_request_state()` | Sum of all durations. |
+| `duration_ms_count` | int | Same | Count of requests with duration. |
+| `total_prompt_tokens` | int | `UsageParser` via `record()` | Sum; `None` skipped. |
+| `total_completion_tokens` | int | Same | Same. |
+| `total_tokens` | int | Same | Same. |
+| `total_cost_usd` | float | Same | Sum; `None` skipped. |
+| `by_model` | dict[str, bucket] | `UsageParser` via `record()` | Per-model breakdown: `stream_requests`, token fields, `total_cost_usd`. |
+| `by_config` | dict[str, bucket] | Both paths | Per-config breakdown: same fields as top-level bucket. |
 
 **Retention policy:**
 - `all_time`: cumulative, never trimmed.
@@ -356,9 +379,21 @@ class UsageStats:
         completion_tokens: int | None,
         total_tokens: int | None,
         cost_usd: float | None,
-        ts: datetime,               # timestamp from UsageRecord (time.monotonic start → wall clock)
+        ts: datetime,
     ) -> None:
-        """Thread-safe in-memory increment. No I/O."""
+        """Token/cost data from UsageParser. Thread-safe in-memory increment. No I/O."""
+
+    def record_stream_event(
+        self,
+        config_name: str,
+        event: str,                     # "started" | "response" | "error"
+        status_code: int | None,        # for "response" event
+        error_reason: str | None,       # for "error" event; see errors_by_reason keys
+        ttfb_ms: float | None,          # for "response" event; None if not measured
+        duration_ms: float | None,      # for "response" and "error" events
+        ts: datetime,
+    ) -> None:
+        """Stream lifecycle event from main thread. Thread-safe in-memory increment. No I/O."""
 
     def flush(self, stats_file: Path) -> None:
         """Merge in-memory increments into stats_file and reset counters."""
@@ -370,7 +405,13 @@ class UsageStats:
 **`record()` internals:**
 - Acquires `self._lock` (brief critical section: a few dict lookups and integer increments).
 - Updates three buckets: `_pending["all_time"]`, `_pending["daily"][ts.strftime("%Y-%m-%d")]`, `_pending["hourly"][ts.strftime("%Y-%m-%dT%H")]`.
-- Each bucket has the same structure as the JSON schema above.
+- Increments `stream_requests` (via `by_model` and `by_config`), token fields.
+
+**`record_stream_event()` internals:**
+- Same lock and three-bucket update.
+- `"started"`: increments `stream_requests` and `by_config[config_name].stream_requests`.
+- `"response"`: increments `stream_responses`, `responses_by_status_class[status_class]`, adds to `ttfb_ms_sum/count` and `duration_ms_sum/count`.
+- `"error"`: increments `stream_errors`, `errors_by_reason[error_reason]`, adds to `duration_ms_sum/count` if `duration_ms` is not None.
 
 **`flush()` internals:**
 1. Under `self._lock`, swap `self._pending` with a fresh empty dict (atomic swap — minimises lock hold time; in-flight `record()` calls on other threads see the new empty dict immediately after).
@@ -385,7 +426,33 @@ class UsageStats:
 
 **`StatsFlushThread`** is a daemon `threading.Thread` started by `UsageStats.__init__()`. It calls `flush()` every `flush_interval` seconds (read from `FLOW_PROXY_STATS_FLUSH_INTERVAL` env var, default 300, valid range 10–3600). The thread exits on `reset()` or process exit.
 
-### 6.4 Integration with `UsageParser`
+### 6.4 `StreamingState` addition for TTFB
+
+One new field added to `StreamingState`:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ttfb_ms` | `float \| None` | `None` | Set by worker on first byte/line using `(time.monotonic() - state.start_time) * 1000`. Read by main thread in `_finish_stream()` after worker join. Thread-safety: same GIL-visibility pattern as `state.error`. |
+
+The worker sets `state.ttfb_ms` immediately before logging `"Received first SSE line…"` / `"Received first chunk…"`.
+
+### 6.5 `record_stream_event()` Call Sites
+
+| Call site | Event | Fields set |
+|-----------|-------|------------|
+| `handle_request()` — after `state.thread.start()` | `"started"` | `config_name`, `ts` |
+| `handle_request()` — auth failure before return | `"error"` | `config_name`, `error_reason="auth_error"`, `ts` |
+| `handle_request()` — setup failure before return | `"error"` | `config_name`, `error_reason="setup_failed"`, `ts` |
+| `_finish_stream()` — `state.error is None` | `"response"` | `config_name`, `status_code`, `ttfb_ms=state.ttfb_ms`, `duration_ms`, `ts` |
+| `_finish_stream()` — `isinstance(state.error, httpx.TransportError)` | `"error"` | `config_name`, `error_reason="transport_error"`, `duration_ms`, `ts` |
+| `_finish_stream()` — other `state.error` | `"error"` | `config_name`, `error_reason="worker_error"`, `duration_ms`, `ts` |
+| `_reset_request_state()` — client disconnect | `"error"` | `config_name`, `error_reason="client_disconnect"`, `duration_ms=(time.monotonic()-state.start_time)*1000`, `ts` |
+
+`duration_ms` in `_finish_stream()` is `(time.monotonic() - state.start_time) * 1000`, same calculation as `UsageParser`.
+
+`ProcessServices.get().usage_stats.record_stream_event(...)` is called from the main thread on all paths; no thread-boundary concerns.
+
+### 6.6 Integration with `UsageParser`
 
 After building `UsageRecord`, `UsageParser.run()` calls:
 
@@ -403,7 +470,7 @@ ProcessServices.get().usage_stats.record(
 
 This call happens after the USAGE log line is emitted. If `record()` raises (should never happen), the exception is swallowed by the existing `try/except Exception` wrapper in `run()`.
 
-### 6.5 Integration with `LogCleaner`
+### 6.8 Integration with `LogCleaner`
 
 `LogCleaner` receives a `usage_stats: UsageStats | None = None` constructor argument. When set, `cleanup_logs()` calls `usage_stats.flush(stats_file)` **once before** any `log_file.unlink()` call. This ensures in-memory data accumulated since the last periodic flush is persisted before old logs are removed.
 
@@ -425,12 +492,12 @@ def __init__(
 ):
 ```
 
-### 6.6 `ProcessServices` additions
+### 6.9 `ProcessServices` additions
 
 - Add `usage_stats: UsageStats` attribute, initialised in `_initialize()` with `stats_file=Path.home() / ".flow-proxy" / "stats.json"` and `flush_interval` from env.
 - Add `usage_stats.reset()` in `reset()` for test isolation.
 
-### 6.7 Testing (`tests/test_usage_stats.py`)
+### 6.10 Testing (`tests/test_usage_stats.py`)
 
 | Test | Assertion |
 |------|-----------|
@@ -445,6 +512,15 @@ def __init__(
 | `test_none_fields_skipped` | `record()` with `None` tokens; assert token fields not present in pending bucket. |
 | `test_flush_interval_env_var` | `FLOW_PROXY_STATS_FLUSH_INTERVAL=10`; assert `StatsFlushThread` fires within ~15 s. |
 | `test_log_cleaner_flushes_before_delete` | Mock `usage_stats.flush`; assert called before `unlink()` in `cleanup_logs()`. |
+| `test_record_stream_event_started` | `record_stream_event(event="started", ...)`; assert `stream_requests==1`, no `stream_errors`. |
+| `test_record_stream_event_response` | `record_stream_event(event="response", status_code=200, ttfb_ms=123.0, duration_ms=4000.0)`; assert `stream_responses==1`, `responses_by_status_class["2xx"]==1`, `ttfb_ms_sum==123.0`, `ttfb_ms_count==1`. |
+| `test_record_stream_event_error_reasons` | One event per error_reason; assert `stream_errors==5`, each key in `errors_by_reason==1`. |
+| `test_record_stream_event_4xx_status_class` | `status_code=429`; assert `responses_by_status_class["4xx"]==1`. |
+| `test_handle_request_records_started_and_errors` | Mock `usage_stats`; assert `record_stream_event("started")` called after `thread.start()`; assert `record_stream_event("error", error_reason="auth_error")` on auth failure. |
+| `test_finish_stream_records_response` | Mock `usage_stats`; assert `record_stream_event("response", status_code=200)` called in `_finish_stream()` when no error. |
+| `test_finish_stream_records_transport_error` | Mock `usage_stats`; `state.error = httpx.TransportError(...)`; assert `record_stream_event("error", error_reason="transport_error")`. |
+| `test_reset_request_state_records_client_disconnect` | Mock `usage_stats`; call `_reset_request_state()`; assert `record_stream_event("error", error_reason="client_disconnect")`. |
+| `test_worker_sets_ttfb_ms` | Worker thread sets `state.ttfb_ms` on first byte; assert non-None after stream completes. |
 
 ---
 
@@ -500,6 +576,7 @@ def __init__(
 - No changes to request or response wire format.
 - `PricingCache` uses `target_base_url` from `RequestForwarder`; no new secrets or endpoints required.
 - `usage_queue` and `start_time` are required `StreamingState` constructor arguments (no default); `request_model` defaults to `""`; `usage_parser_thread` defaults to `None`. `usage_queue` and `start_time` are constructed in `handle_request()`; `usage_parser_thread` is set in `read_from_descriptors()`.
+- `StreamingState` gains `ttfb_ms: float | None = None`; existing construction code unchanged (default handles it).
 - `LogCleaner` gains two optional constructor arguments (`usage_stats`, `stats_file`), both defaulting to `None`; existing callers are unaffected. When both are provided, `cleanup_logs()` calls `usage_stats.flush(stats_file)` once before deletions — no log file scanning.
 - New env var `FLOW_PROXY_STATS_FLUSH_INTERVAL` (default 300 s, range 10–3600); all other env vars unchanged.
 - `~/.flow-proxy/` directory is created on first flush; no pre-existing configuration required.
