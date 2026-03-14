@@ -321,7 +321,7 @@ class TestResolveRuntimeConfig:
         assert timeout == 1
         mock_logger.warning.assert_called_once()
         warning_msg = str(mock_logger.warning.call_args)
-        assert "clamped" in warning_msg.lower() or "0" in warning_msg
+        assert "clamped" in warning_msg.lower()
 
     def test_timeout_above_max_clamped_to_86400(self) -> None:
         """client_timeout=100000 is clamped to 86400 and a warning is logged."""
@@ -335,7 +335,7 @@ class TestResolveRuntimeConfig:
         assert timeout == 86400
         mock_logger.warning.assert_called_once()
         warning_msg = str(mock_logger.warning.call_args)
-        assert "clamped" in warning_msg.lower() or "86400" in warning_msg
+        assert "clamped" in warning_msg.lower()
 
     def test_timeout_in_range_no_warning(self) -> None:
         """client_timeout=300 is within range; no warning logged."""
