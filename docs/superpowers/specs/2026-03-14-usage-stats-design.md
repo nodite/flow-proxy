@@ -88,7 +88,7 @@
 
 ### 2.3 SSE vs Non-SSE Parsing
 
-`UsageParser` is told whether the response is SSE via the `is_sse: bool` argument passed at construction time (extracted from `_ResponseHeaders.is_sse` by the main thread before launching the `UsageParser` thread — see §5.2).
+`UsageParser` is told whether the response is SSE via the `is_sse: bool` argument passed to `run()` at thread launch time (extracted from `item.is_sse` where `item` is the `_ResponseHeaders` loop variable in `read_from_descriptors()` — see §5.2).
 
 - **SSE mode (`is_sse=True`)**: Worker feeds already-encoded SSE lines (output of `_encode_sse_line`). Each `bytes` item in `usage_queue` is one complete line (`b"data: {...}\n"` or `b"\n"` for blank separator lines). No cross-chunk buffering needed. `UsageParser` checks each item for a `data: ` prefix and attempts JSON parse. **Note:** this no-buffering guarantee holds only because the SSE path in `_streaming_worker` uses `response.iter_lines()` (one item per complete line). If that path is ever changed to `iter_bytes()`, line-buffer mode must be used regardless of `is_sse`.
 - **Non-SSE mode (`is_sse=False`)**: Worker feeds raw binary chunks of arbitrary size. `UsageParser` maintains an internal line buffer, appending each chunk and splitting on `b"\n"` to extract complete lines. Applies the same `data: ` prefix scan. This handles potential usage data in non-SSE JSON streaming responses.
@@ -135,10 +135,11 @@ Intended to be the target of a daemon `threading.Thread`. `UsageParser` has no s
 t = threading.Thread(
     target=parser.run,
     args=(state.usage_queue, state.req_id, state.config_name,
-          state.request_model, state.start_time, headers_item.is_sse),
+          state.request_model, state.start_time, item.is_sse),
     daemon=True,
 )
 ```
+(`item` is the `_ResponseHeaders` loop variable in `read_from_descriptors()` at the point where `isinstance(item, _ResponseHeaders)` matches.)
 All arguments are plain scalars or a queue — no reference to `StreamingState` or any main-thread object is held after the thread is started.
 
 **Responsibilities:**
@@ -320,20 +321,39 @@ This ordering guarantees:
 
 The `_ResponseHeaders` item put into `chunk_queue` at the top of the worker is **not** put into `usage_queue`.
 
-In the `finally` block, after `chunk_queue.put(None)` add `state.usage_queue.put(None)`. The `finally` block runs on ALL exit paths — including the `OSError` early-return on the `_ResponseHeaders` pipe-notification (line 463–465 of current code). There is one subtle case on that early-return: `state.error` remains `None` even though the client disconnected. This is acceptable because `_reset_request_state()` (which fires when the client connection closes) sets `state.cancel` and will join the worker thread before `read_from_descriptors()` can process the sentinel. If `read_from_descriptors()` does process the `None` sentinel before `_reset_request_state()` runs, `_finish_stream()` is called with `state.error = None` and `state.status_code = 0` (headers were never delivered), which would record a spurious `"response"` event with `status_code=0`. To prevent this, add `if state.status_code == 0: return` before the `record_stream_event("response", ...)` call in `_finish_stream()`.
+In the `finally` block, add `state.usage_queue.put(None)` **immediately after** `chunk_queue.put(None)` and **before** `os.write(state.pipe_w, b"\x00")`:
+
+```python
+# finally block (exact ordering):
+state.chunk_queue.put(None)
+state.usage_queue.put(None)   # NEW — before os.write
+try:
+    os.write(state.pipe_w, b"\x00")
+except OSError:
+    pass  # pipe may already be closed (client disconnected)
+```
+
+Placing `usage_queue.put(None)` before `os.write()` ensures the `UsageParser` sentinel is enqueued before the main thread is woken. The `finally` block runs on ALL exit paths — including the `OSError` early-return on the `_ResponseHeaders` pipe-notification (line 463–465 of current code). There is one subtle case on that early-return: `state.error` remains `None` even though the client disconnected. This is acceptable because `_reset_request_state()` (which fires when the client connection closes) sets `state.cancel` and will join the worker thread before `read_from_descriptors()` can process the sentinel. If `read_from_descriptors()` does process the `None` sentinel before `_reset_request_state()` runs, `_finish_stream()` is called with `state.error = None` and `state.status_code = 0` (headers were never delivered), which would record a spurious `"response"` event with `status_code=0`. The `if state.status_code != 0:` wrapper in `_finish_stream()` (see §5.5) prevents this.
 
 ### 5.4 `_reset_request_state()` changes
 
-1. Set `state.cancel`. ← existing
-2. Join worker thread (`timeout=2.0s`). ← existing
-3. Join `UsageParser` thread (`state.usage_parser_thread`, if not `None`) with `timeout=2.0s`. ← **new**
-   - `usage_parser_thread` may be `None` if the client disconnected before `read_from_descriptors()` had dequeued the `_ResponseHeaders` item (i.e., headers never arrived). In that case the join is skipped and no `UsageParser` log line will be emitted for the request.
-4. Call `record_stream_event("error", config_name=state.config_name, error_reason="client_disconnect", duration_ms=..., ts=datetime.now())`. ← **new** — insert **before** `clear_request_context()` (step 6) so the log context is still active.
+The current implementation has these steps:
+
+1. Call `set_request_context(state.req_id, "WS")`. ← existing
+2. Log `"Stream canceled (client disconnect), no ← 200 [%s]"`. ← existing
+3. Set `state.cancel`. ← existing
+4. Join worker thread (`timeout=2.0s`). ← existing
 5. Close pipe fds (`state.pipe_r`, `state.pipe_w`). ← existing
 6. Set `self._streaming_state = None`. ← existing
 7. Call `clear_request_context()`. ← existing
 
-Steps 1, 2, 5, 6, 7 are unchanged from the current implementation. Steps 3 and 4 are new.
+New insertions:
+
+- **After step 4**, insert: Join `UsageParser` thread (`state.usage_parser_thread`, if not `None`) with `timeout=2.0s`. ← **new** (becomes new step 5)
+  - `usage_parser_thread` may be `None` if the client disconnected before `read_from_descriptors()` had dequeued the `_ResponseHeaders` item (i.e., headers never arrived). In that case the join is skipped and no `UsageParser` log line will be emitted for the request.
+- **Before `clear_request_context()`** (before current step 7), insert: Call `record_stream_event("error", config_name=state.config_name, error_reason="client_disconnect", duration_ms=..., ts=datetime.now())`. ← **new** — must be before `clear_request_context()` so that the `[req_id][WS]` log context is still active if any logging occurs inside `record_stream_event()`.
+
+Steps 1–7 (renumbered) are otherwise unchanged; only the two **new** insertions are added.
 
 ### 5.5 `_finish_stream()` changes
 
@@ -345,7 +365,21 @@ is **replaced** with actual `record_stream_event()` calls as specified in §6.5.
 
 **Placement:** The `record_stream_event()` calls must be inserted **before** `clear_request_context()` at line 189, so that the `[req_id][WS]` log context is still active if any logging occurs inside `record_stream_event()`. The stub comment currently sits at line 190 (after `clear_request_context()`). The replacement calls should move to **before** line 189.
 
-Additionally, guard against the `status_code=0` spurious response case (see §5.3): add `if state.status_code == 0: return` immediately before the `record_stream_event("response", ...)` call in the `state.error is None` branch.
+Additionally, guard against the `status_code=0` spurious response case (see §5.3). In the `state.error is None` branch, wrap the `record_stream_event("response", ...)` call with a condition — do **NOT** use a bare `return` which would skip `clear_request_context()` and leak the log context:
+
+```python
+# state.error is None branch:
+if state.status_code != 0:
+    ProcessServices.get().usage_stats.record_stream_event(
+        event="response",
+        config_name=state.config_name,
+        status_code=state.status_code,
+        ...
+    )
+clear_request_context()   # always called regardless
+```
+
+`state.status_code == 0` means the `_ResponseHeaders` item was never delivered (client disconnected before the worker's first pipe-notification write completed), so there is no successful response to record. Error paths (`state.error is not None`) are unaffected by this guard.
 
 **State access safety:** `_finish_stream()` begins with `self._streaming_state = None`, clearing the instance reference. All subsequent reads of `state.*` fields (including the new `state.ttfb_ms`, `state.start_time`, `state.config_name`) use the `state` **parameter variable**, which remains a live local reference regardless of the `self._streaming_state = None` assignment. These reads are safe.
 
@@ -575,13 +609,14 @@ from ..utils.usage_stats import UsageStats
 - `self.pricing_cache = PricingCache(target_base_url=self.request_forwarder.target_base_url)` — must appear **after** `self.request_forwarder` is set.
 - `self.usage_stats = UsageStats(stats_file=Path.home() / ".flow-proxy" / "stats.json", flush_interval=int(os.getenv("FLOW_PROXY_STATS_FLUSH_INTERVAL", "300")))` — order relative to other attributes is flexible.
 
-**In `reset()`** — add:
+**In `reset()`** — add (using `hasattr` guards because `_initialize()` may not have run if `reset()` is called between object creation and initialization during tests):
 ```python
-if self.pricing_cache is not None:
-    self.pricing_cache.reset()
-if self.usage_stats is not None:
-    self.usage_stats.reset()
+if hasattr(cls._instance, "pricing_cache") and cls._instance.pricing_cache is not None:
+    cls._instance.pricing_cache.reset()
+if hasattr(cls._instance, "usage_stats") and cls._instance.usage_stats is not None:
+    cls._instance.usage_stats.reset()
 ```
+These lines are added inside the `with cls._lock:` block, after the existing `http_client.close()` call and before `cls._instance = None`.
 
 ### 6.10 Testing (`tests/test_usage_stats.py`)
 
@@ -605,7 +640,8 @@ if self.usage_stats is not None:
 | `test_handle_request_records_started_and_errors` | Mock `usage_stats`; assert `record_stream_event("started")` called after `thread.start()`; assert `record_stream_event("error", error_reason="auth_error")` on auth failure. |
 | `test_finish_stream_records_response` | Mock `usage_stats`; assert `record_stream_event("response", status_code=200)` called in `_finish_stream()` when no error. |
 | `test_finish_stream_records_transport_error` | Mock `usage_stats`; `state.error = httpx.TransportError(...)`; assert `record_stream_event("error", error_reason="transport_error")`. |
-| `test_reset_request_state_records_client_disconnect` | Mock `usage_stats`; call `_reset_request_state()`; assert `record_stream_event("error", error_reason="client_disconnect")`. |
+| `test_reset_request_state_records_client_disconnect` | Mock `usage_stats`; call `_reset_request_state()`; assert `record_stream_event("error", error_reason="client_disconnect")` called **before** `clear_request_context()`. |
+| `test_finish_stream_skips_response_event_when_status_code_zero` | Mock `usage_stats`; set `state.error = None` and `state.status_code = 0` (simulates OSError early-return path); call `_finish_stream(state)`; assert `usage_stats.record_stream_event` **not** called with `event="response"`. |
 | `test_worker_sets_ttfb_ms` | Worker thread sets `state.ttfb_ms` on first byte; assert non-None after stream completes. |
 
 ---
@@ -676,6 +712,7 @@ Failing to update these three sites causes `TypeError` on `StreamingState` const
 - `StreamingState` gains two new required fields (`usage_queue`, `start_time`) inserted before existing defaulted fields (see §3.4 for exact ordering), plus three new optional fields (`request_model=""`, `usage_parser_thread=None`, `ttfb_ms=None`). All `StreamingState` construction sites must be updated to supply `usage_queue` and `start_time`. Run `grep -rn "StreamingState(" flow_proxy_plugin/ tests/` to find all sites — there are currently 4 total (1 production in `handle_request()`, 3 in tests). The optional fields use defaults and require no changes at construction.
 - `LogCleaner` signature is **unchanged** (§6.8 integration removed). Existing callers unaffected.
 - `~/.flow-proxy/` directory is created on first flush; no pre-existing configuration required.
+- **`_finish_stream()` guard**: `record_stream_event("response", ...)` is only called when `state.status_code != 0`. This handles the edge case where the OSError early-return in `_streaming_worker()` (line 463–465) fires before the `_ResponseHeaders` pipe-notification is written — in that case `state.status_code` remains `0` (headers never delivered to the main thread). The guard ensures no spurious `"response"` event is recorded for these phantom completions. Test: `test_finish_stream_skips_response_event_when_status_code_zero` in §7.3.
 
 ---
 
