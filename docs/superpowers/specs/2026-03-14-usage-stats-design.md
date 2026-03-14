@@ -35,7 +35,7 @@
 ### 1.3 Scope
 
 - Applies only to the **B3 async streaming path**: `FlowProxyWebServerPlugin`.
-- Three new modules: `flow_proxy_plugin/utils/usage_parser.py`, `flow_proxy_plugin/utils/pricing_cache.py`, `flow_proxy_plugin/utils/usage_aggregator.py`.
+- Three new modules: `flow_proxy_plugin/utils/usage_parser.py`, `flow_proxy_plugin/utils/pricing_cache.py`, `flow_proxy_plugin/utils/usage_stats.py`.
 - Minor additions to `StreamingState`, `ProcessServices`, `_streaming_worker`, and `LogCleaner`.
 
 ---
@@ -269,18 +269,28 @@ remains unchanged. The `UsageRecord` emitted by `UsageParser` provides the data 
 
 ## 6. Stats Persistence (`~/.flow-proxy/stats.json`)
 
-### 6.1 Purpose and Trigger
+### 6.1 Architecture: In-Memory Counters + Periodic Flush
 
-`stats.json` provides long-term, process-restart-safe aggregated usage statistics. It is updated during every `LogCleaner.cleanup_logs()` run by a new `UsageAggregator` component. Aggregation happens **before** any log file is deleted, so no USAGE lines are lost.
+Stats persistence uses a two-tier approach:
+
+1. **In-process tier** (`UsageStats` singleton in `ProcessServices`): `UsageParser` calls `usage_stats.record()` after building a `UsageRecord`. This is a pure in-memory operation (dict increment + `threading.Lock`), adding negligible overhead per request.
+2. **Disk tier**: A `StatsFlushThread` daemon inside `UsageStats` wakes every `flush_interval` seconds (default 300 s, configurable via `FLOW_PROXY_STATS_FLUSH_INTERVAL` env var) and calls `usage_stats.flush(stats_file)`. Each process flushes its own incremental counters into `~/.flow-proxy/stats.json` with `fcntl.flock` to serialize multi-process writes.
+
+**Why this design handles high concurrency:**
+- The per-request hot path is lock-protected in-memory dict operations only — no I/O, no file contention.
+- Write frequency to disk is decoupled from QPS; a burst of 1000 req/s still results in only one flush per `flush_interval` period.
+- Multi-process safety: each process's flush is a read-increment-write cycle protected by an exclusive POSIX file lock.
+
+**Data loss risk:** at most `flush_interval` seconds of data on hard crash (acceptable for usage statistics).
 
 ### 6.2 `stats.json` Schema
 
-Location: `~/.flow-proxy/stats.json` (user home directory, created on first cleanup run).
+Location: `~/.flow-proxy/stats.json` (created with parent dir on first flush).
 
 ```json
 {
   "version": 1,
-  "last_aggregated_at": "2026-03-14T12:00:00",
+  "last_flushed_at": "2026-03-14T12:00:00",
   "all_time": {
     "total_requests": 1234,
     "total_prompt_tokens": 1000000,
@@ -307,10 +317,10 @@ Location: `~/.flow-proxy/stats.json` (user home directory, created on first clea
     }
   },
   "daily": {
-    "2026-03-14": { "...same structure as all_time bucket..." }
+    "2026-03-14": { "...same bucket structure..." }
   },
   "hourly": {
-    "2026-03-14T12": { "...same structure as all_time bucket..." }
+    "2026-03-14T12": { "...same bucket structure..." }
   }
 }
 ```
@@ -319,55 +329,87 @@ Location: `~/.flow-proxy/stats.json` (user home directory, created on first clea
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `total_requests` | int | Count of USAGE lines processed. |
-| `total_prompt_tokens` | int | Sum; lines with `None` tokens skipped. |
+| `total_requests` | int | Incremented on every `record()` call. |
+| `total_prompt_tokens` | int | Sum; `None` values skipped. |
 | `total_completion_tokens` | int | Sum; same. |
 | `total_tokens` | int | Sum; same. |
-| `total_cost_usd` | float | Sum; lines with `None` cost skipped. |
+| `total_cost_usd` | float | Sum; `None` values skipped. |
 | `by_model` | dict[str, bucket] | Per-model breakdown (same fields). |
 | `by_config` | dict[str, bucket] | Per-config breakdown (same fields). |
 
 **Retention policy:**
 - `all_time`: cumulative, never trimmed.
 - `daily`: kept indefinitely.
-- `hourly`: trimmed to the last 7 days (168 entries) on each cleanup run to bound file size.
+- `hourly`: trimmed to last 7 days (168 entries max) on each flush.
 
-### 6.3 `UsageAggregator` (`flow_proxy_plugin/utils/usage_aggregator.py`)
+### 6.3 `UsageStats` (`flow_proxy_plugin/utils/usage_stats.py`)
 
-A standalone class with one public method:
+A process-level singleton held by `ProcessServices`.
 
 ```python
-class UsageAggregator:
-    def aggregate(self, log_dir: Path, stats_file: Path) -> None:
-        """Scan log files for new USAGE lines and merge into stats_file."""
+class UsageStats:
+    def record(
+        self,
+        model: str,
+        config_name: str,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        total_tokens: int | None,
+        cost_usd: float | None,
+        ts: datetime,               # timestamp from UsageRecord (time.monotonic start → wall clock)
+    ) -> None:
+        """Thread-safe in-memory increment. No I/O."""
+
+    def flush(self, stats_file: Path) -> None:
+        """Merge in-memory increments into stats_file and reset counters."""
+
+    def reset(self) -> None:
+        """Clear in-memory counters and stop flush thread. Tests only."""
 ```
 
-**Algorithm:**
-1. Load `stats.json` (or start with empty structure if absent).
-2. Read `last_aggregated_at` from the loaded stats (default: epoch).
-3. Scan all `*.log*` files in `log_dir`, sorted by modification time ascending.
-4. For each file, read line by line; parse the timestamp from the log format (`%Y-%m-%d %H:%M:%S`). Skip lines with timestamp ≤ `last_aggregated_at`.
-5. For lines matching the USAGE pattern, extract all key=value fields via regex.
-6. Accumulate into in-memory buckets: `all_time`, `daily["YYYY-MM-DD"]`, `hourly["YYYY-MM-DDTHH"]`.
-7. Trim `hourly` keys older than 7 days.
-8. Set `last_aggregated_at` to `datetime.now()` (ISO 8601, no timezone).
-9. Atomic write: serialise to JSON, write to `stats_file.with_suffix(".tmp")`, then `os.replace()` to the target path.
+**`record()` internals:**
+- Acquires `self._lock` (brief critical section: a few dict lookups and integer increments).
+- Updates three buckets: `_pending["all_time"]`, `_pending["daily"][ts.strftime("%Y-%m-%d")]`, `_pending["hourly"][ts.strftime("%Y-%m-%dT%H")]`.
+- Each bucket has the same structure as the JSON schema above.
 
-**USAGE line regex** (applied to `record.message` after stripping the log prefix):
+**`flush()` internals:**
+1. Under `self._lock`, swap `self._pending` with a fresh empty dict (atomic swap — minimises lock hold time; in-flight `record()` calls on other threads see the new empty dict immediately after).
+2. If the swapped snapshot is empty, return early (no I/O).
+3. Open `stats_file` path (creating parent dir if absent); acquire `fcntl.flock(fd, LOCK_EX)` on a dedicated lock file `stats_file.with_suffix(".lock")`.
+4. Read existing `stats.json` (empty structure if absent or corrupt).
+5. Add snapshot increments to the file's existing values (merge bucket by bucket).
+6. Trim `hourly` keys older than 7 days.
+7. Update `last_flushed_at = datetime.now().isoformat(timespec="seconds")`.
+8. Atomic write: serialise to `stats_file.with_suffix(".tmp")`, then `os.replace()`.
+9. Release lock.
+
+**`StatsFlushThread`** is a daemon `threading.Thread` started by `UsageStats.__init__()`. It calls `flush()` every `flush_interval` seconds (read from `FLOW_PROXY_STATS_FLUSH_INTERVAL` env var, default 300, valid range 10–3600). The thread exits on `reset()` or process exit.
+
+### 6.4 Integration with `UsageParser`
+
+After building `UsageRecord`, `UsageParser.run()` calls:
+
+```python
+ProcessServices.get().usage_stats.record(
+    model=record.model,
+    config_name=record.config_name,
+    prompt_tokens=record.prompt_tokens,
+    completion_tokens=record.completion_tokens,
+    total_tokens=record.total_tokens,
+    cost_usd=record.cost_usd,
+    ts=datetime.now(),
+)
 ```
-USAGE\s+model=(\S+)\s+config=(\S+)(?:\s+prompt_tokens=(\d+))?(?:\s+completion_tokens=(\d+))?(?:\s+total_tokens=(\d+))?(?:\s+cost_usd=([\d.]+))?
-```
-Fields absent from the line (None-valued at log time) are simply not present and are skipped during aggregation.
 
-**File locking:** `stats.json` may be written by multiple worker processes concurrently (each worker has a `LogCleaner`). An `fcntl.flock(LOCK_EX)` exclusive lock is held on the `.tmp` file during the write, and `os.replace()` is atomic on POSIX. The lock is acquired after loading and before writing, so the read-modify-write cycle is protected.
+This call happens after the USAGE log line is emitted. If `record()` raises (should never happen), the exception is swallowed by the existing `try/except Exception` wrapper in `run()`.
 
-### 6.4 Integration with `LogCleaner`
+### 6.5 Integration with `LogCleaner`
 
-`LogCleaner` receives a `stats_file: Path | None = None` constructor argument. When set, `cleanup_logs()` calls `UsageAggregator().aggregate(self.log_dir, self.stats_file)` **before** the first `log_file.unlink()` call, ensuring no USAGE lines are discarded before aggregation.
+`LogCleaner` receives a `usage_stats: UsageStats | None = None` constructor argument. When set, `cleanup_logs()` calls `usage_stats.flush(stats_file)` **once before** any `log_file.unlink()` call. This ensures in-memory data accumulated since the last periodic flush is persisted before old logs are removed.
 
-Default `stats_file`: `Path.home() / ".flow-proxy" / "stats.json"`. Created (with parent directory) on first run.
+`init_log_cleaner()` and `LogSetup.initialize_cleaner()` pass `usage_stats=ProcessServices.get().usage_stats` and `stats_file=Path.home() / ".flow-proxy" / "stats.json"` by default.
 
-`LogCleaner` constructor update:
+`LogCleaner` constructor additions:
 
 ```python
 def __init__(
@@ -378,32 +420,37 @@ def __init__(
     cleanup_interval_hours: int = 24,
     max_size_mb: int = 0,
     enabled: bool = True,
-    stats_file: Path | None = None,   # new
+    usage_stats: "UsageStats | None" = None,   # new
+    stats_file: Path | None = None,             # new
 ):
 ```
 
-`init_log_cleaner()` passes `stats_file=Path.home() / ".flow-proxy" / "stats.json"` by default.
+### 6.6 `ProcessServices` additions
 
-### 6.5 Testing (`tests/test_usage_aggregator.py`)
+- Add `usage_stats: UsageStats` attribute, initialised in `_initialize()` with `stats_file=Path.home() / ".flow-proxy" / "stats.json"` and `flush_interval` from env.
+- Add `usage_stats.reset()` in `reset()` for test isolation.
+
+### 6.7 Testing (`tests/test_usage_stats.py`)
 
 | Test | Assertion |
 |------|-----------|
-| `test_aggregate_creates_stats_file` | No `stats.json` initially; after `aggregate()`, file created with correct structure. |
-| `test_aggregate_parses_usage_lines` | Log file with 3 USAGE lines; assert `all_time.total_requests == 3`, correct token sums. |
-| `test_aggregate_skips_old_lines` | `last_aggregated_at` set to a past time; only newer lines counted. |
-| `test_aggregate_hourly_buckets` | Lines from two different hours; assert two `hourly` keys with correct counts. |
-| `test_aggregate_daily_buckets` | Lines from two different days; assert two `daily` keys. |
-| `test_hourly_trimmed_to_7_days` | Insert 200 hourly entries; after aggregate, only 168 (7 days) remain. |
-| `test_aggregate_none_fields_skipped` | USAGE line missing `cost_usd`; `total_cost_usd` not inflated. |
-| `test_aggregate_by_model_and_config` | Lines with two models and two configs; assert correct breakdown in `by_model` and `by_config`. |
-| `test_atomic_write` | Simulate crash mid-write (mock `os.replace` to fail); assert original `stats.json` unchanged. |
-| `test_log_cleaner_aggregates_before_delete` | Mock `UsageAggregator.aggregate`; assert called before `unlink()`. |
+| `test_record_updates_all_buckets` | Single `record()` call; assert `_pending` has `all_time`, `daily`, `hourly` entries with correct values. |
+| `test_record_thread_safe` | 100 threads each call `record()` 10 times concurrently; assert `total_requests == 1000`. |
+| `test_flush_creates_stats_file` | No `stats.json`; `flush()` creates it with correct structure. |
+| `test_flush_merges_increments` | Existing `stats.json` with `total_requests=5`; `flush()` with 3 new requests; assert `total_requests==8`. |
+| `test_flush_resets_pending` | After `flush()`, `_pending` is empty; second `flush()` is a no-op (no file write). |
+| `test_flush_atomic_write` | Mock `os.replace` to raise; assert original `stats.json` unchanged. |
+| `test_flush_multiprocess_safe` | Two threads call `flush()` concurrently on the same file; assert no data corruption or lost increments. |
+| `test_hourly_trimmed_to_7_days` | Record events with 200 distinct hours; after `flush()`, only last 168 hourly keys remain. |
+| `test_none_fields_skipped` | `record()` with `None` tokens; assert token fields not present in pending bucket. |
+| `test_flush_interval_env_var` | `FLOW_PROXY_STATS_FLUSH_INTERVAL=10`; assert `StatsFlushThread` fires within ~15 s. |
+| `test_log_cleaner_flushes_before_delete` | Mock `usage_stats.flush`; assert called before `unlink()` in `cleanup_logs()`. |
 
 ---
 
 ## 7. Testing
 
-### 6.1 New: `tests/test_usage_parser.py`
+### 7.1 New: `tests/test_usage_parser.py`
 
 | Test | Assertion |
 |------|-----------|
@@ -417,7 +464,7 @@ def __init__(
 | `test_parser_exception_logged_and_context_cleared` | Inject queue that raises on `get()`; assert `ERROR` logged with `exc_info`, `clear_request_context()` called. |
 | `test_set_and_clear_request_context` | Assert `set_request_context` called at entry and `clear_request_context` called at exit (both normal and exception). |
 
-### 6.2 New: `tests/test_pricing_cache.py`
+### 7.2 New: `tests/test_pricing_cache.py`
 
 | Test | Assertion |
 |------|-----------|
@@ -429,7 +476,7 @@ def __init__(
 | `test_reset_clears_cache` | `reset()` clears all cached entries; next call re-fetches. |
 | `test_model_info_json_path` | Mock response with nested `data[].model_info.input_cost_per_token`; assert correct values extracted. |
 
-### 6.3 Modified: `tests/test_web_server_plugin.py`
+### 7.3 Modified: `tests/test_web_server_plugin.py`
 
 | Test | Change |
 |------|--------|
@@ -438,10 +485,12 @@ def __init__(
 | `test_worker_sentinel_delivered_to_usage_queue` | After worker completes, assert `usage_queue` contains `None` sentinel (worker `finally` delivers it). |
 | `test_reset_request_state_join_order` | After `_reset_request_state()`, assert worker thread joined before `UsageParser` thread. |
 
-### 6.4 Modified: `tests/test_process_services.py`
+### 7.4 Modified: `tests/test_process_services.py`
 
 - Assert `pricing_cache` is initialised in `ProcessServices.get()`.
 - Assert `pricing_cache.reset()` called in `ProcessServices.reset()`.
+- Assert `usage_stats` is initialised in `ProcessServices.get()`.
+- Assert `usage_stats.reset()` called in `ProcessServices.reset()`.
 
 ---
 
@@ -451,8 +500,9 @@ def __init__(
 - No changes to request or response wire format.
 - `PricingCache` uses `target_base_url` from `RequestForwarder`; no new secrets or endpoints required.
 - `usage_queue` and `start_time` are required `StreamingState` constructor arguments (no default); `request_model` defaults to `""`; `usage_parser_thread` defaults to `None`. `usage_queue` and `start_time` are constructed in `handle_request()`; `usage_parser_thread` is set in `read_from_descriptors()`.
-- `LogCleaner` gains an optional `stats_file` constructor argument (default `~/.flow-proxy/stats.json`); existing callers passing no `stats_file` get the default. Existing behavior of `cleanup_logs()` is unchanged except for the pre-deletion aggregation step.
-- `~/.flow-proxy/` directory is created on first cleanup run; no pre-existing configuration required.
+- `LogCleaner` gains two optional constructor arguments (`usage_stats`, `stats_file`), both defaulting to `None`; existing callers are unaffected. When both are provided, `cleanup_logs()` calls `usage_stats.flush(stats_file)` once before deletions — no log file scanning.
+- New env var `FLOW_PROXY_STATS_FLUSH_INTERVAL` (default 300 s, range 10–3600); all other env vars unchanged.
+- `~/.flow-proxy/` directory is created on first flush; no pre-existing configuration required.
 
 ---
 
