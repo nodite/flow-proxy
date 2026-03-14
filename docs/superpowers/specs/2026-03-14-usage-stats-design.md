@@ -76,13 +76,13 @@
 **Key invariants:**
 - `chunk_queue` and all main-thread logic are **not modified**.
 - `bytes` objects are immutable; putting the same reference into two queues has zero copy overhead.
-- Only `bytes` chunks are put into `usage_queue`. The `_ResponseHeaders` item placed first into `chunk_queue` is **not** put into `usage_queue`.
+- Only `bytes` chunks are put into `usage_queue`. The `_ResponseHeaders` item placed first into `chunk_queue` is **not** put into `usage_queue`. SSE blank-line separator items (`b"\n"`, produced by `_encode_sse_line("")`) ARE included — `b"\n"` is truthy, so the `if chunk:` guard in the worker does not filter them out. `UsageParser` handles them correctly (they don't match the `data: ` prefix and are ignored).
 - `usage_queue` is an unbounded `queue.Queue()`. Because `UsageParser` only reads from it (no blocking HTTP calls during chunk consumption — pricing is queried only after the sentinel is received), backpressure is not a concern during the stream. Memory usage is bounded by stream size, which is acceptable for LLM response sizes.
 - The `UsageParser` thread is a daemon; it exits when the process exits or when it receives the `None` sentinel.
 
 ### 2.2 Model Name Extraction (A+B combined)
 
-1. **Primary**: `handle_request()` parses the request body JSON and reads the top-level `"model"` field. Stored as `request_model` (plain `str`) passed to `UsageParser`.
+1. **Primary**: `handle_request()` parses the request body JSON and reads the top-level `"model"` field. Stored as `request_model` (plain `str`) and passed to `UsageParser.run()` as a positional argument (see §3.2 for the `run()` signature).
 2. **Fallback**: `UsageParser` reads the `"model"` field from the first valid SSE `data:` chunk if `request_model` is empty.
 3. **Final fallback**: model recorded as `"unknown"`, cost recorded as `None`. Log line is still written.
 
@@ -130,7 +130,16 @@ def run(
 ) -> None:
 ```
 
-Intended to be the target of a daemon `threading.Thread`. All arguments are plain scalars or a queue — no reference to `StreamingState` or any main-thread object is held.
+Intended to be the target of a daemon `threading.Thread`. `UsageParser` has no significant constructor arguments — it is instantiated as `parser = UsageParser()` in `read_from_descriptors()`, and the thread is created as:
+```python
+t = threading.Thread(
+    target=parser.run,
+    args=(state.usage_queue, state.req_id, state.config_name,
+          state.request_model, state.start_time, headers_item.is_sse),
+    daemon=True,
+)
+```
+All arguments are plain scalars or a queue — no reference to `StreamingState` or any main-thread object is held after the thread is started.
 
 **Responsibilities:**
 - Call `set_request_context(req_id, "WS")` at entry.
@@ -263,19 +272,18 @@ On pipe/`thread.start()` failure, `_streaming_state` is set to `None` and `clear
 
 ### 5.1 `ProcessServices` changes
 
-- Add `pricing_cache: PricingCache` attribute, initialised in `_initialize()` with `target_base_url=self.request_forwarder.target_base_url`.
-- Add `pricing_cache.reset()` call in `reset()` for test isolation.
+- Add `pricing_cache: PricingCache` attribute, initialised in `_initialize()` with `target_base_url=self.request_forwarder.target_base_url`. See §6.9 for initialization order and `reset()` requirements.
 
 ### 5.2 `handle_request()` changes
 
-1. At the very start of `handle_request()`, **before** the `_get_config_and_token()` call, add:
+1. After `set_request_context(req_id, "WS")` and the initial `self.logger.info(...)` call, but **before** the `try: _, config_name, jwt_token = self._get_config_and_token()` block, add:
    ```python
    config_name = ""
    start_time = time.monotonic()
    ```
    This ensures `config_name` and `start_time` are always in scope for `record_stream_event()` calls on all exit paths (including auth failure, where `_get_config_and_token()` raises before `config_name` is bound by the destructuring assignment). The auth-failure `record_stream_event("error", error_reason="auth_error", ...)` emits `config_name=""` since no config was selected yet.
 
-2. Extract `request_model` from request body JSON (top-level `"model"` field); default to `""` on any error. This should be done between the auth call and `StreamingState` construction — `body` (`bytes | None`) is available after `self._get_request_body()`. When `body` is `None`, not valid UTF-8, or not valid JSON, the `try/except` catches the error and `request_model` defaults to `""`.
+2. Extract `request_model` from the **existing** `body` variable (assigned at line 249 via `self._get_request_body()`, after the filter block). Do not call `_get_request_body()` again. `body` is `bytes | None`; when `None`, non-UTF-8, or non-JSON, a surrounding `try/except` catches the error and `request_model` defaults to `""`.
 
 3. Create `usage_queue = queue.Queue()`.
 
@@ -289,10 +297,30 @@ On pipe/`thread.start()` failure, `_streaming_state` is set to `None` and `clear
 
 ### 5.3 `_streaming_worker()` changes
 
-- **TTFB**: On first byte/line, compute `state.ttfb_ms = (time.monotonic() - state.start_time) * 1000` **before** calling `state.chunk_queue.put(chunk)` or `state.usage_queue.put(chunk)`. This ordering guarantees GIL-visibility to the main thread via the queue happens-before relationship.
-- For each `bytes` chunk: call `state.usage_queue.put(chunk)` **immediately after** `state.chunk_queue.put(chunk)` and **before** the `os.write(state.pipe_w, ...)` notification call. This ordering ensures that an `OSError` on `os.write` (early-return on client disconnect) does not leave a chunk in `chunk_queue` but missing from `usage_queue`.
-- This applies only to `bytes` chunks — the `_ResponseHeaders` item put at the top of the worker is **not** put into `usage_queue`.
-- In `finally`: after `chunk_queue.put(None)`, also call `state.usage_queue.put(None)`. The `finally` block runs on ALL exit paths, including the `OSError` early-return after the `_ResponseHeaders` pipe-notification (line 463–464 of current code), so the sentinel is always delivered to `UsageParser` regardless of how the worker exits.
+The exact per-chunk ordering (applies to BOTH SSE and non-SSE loops) is:
+
+```python
+# First chunk only:
+state.ttfb_ms = (time.monotonic() - state.start_time) * 1000
+self.logger.info("Received first SSE line ..." / "Received first chunk ...")
+first_logged = True
+
+# Every chunk:
+state.chunk_queue.put(chunk)
+state.usage_queue.put(chunk)   # NEW — immediately after chunk_queue.put
+try:
+    os.write(state.pipe_w, b"\x00")
+except OSError:
+    return   # client disconnected; finally still runs
+```
+
+This ordering guarantees:
+- `ttfb_ms` is set before the first `chunk_queue.put(chunk)` → GIL-visibility via queue happens-before.
+- An `OSError` on `os.write` (client disconnect early-return) cannot leave a chunk in `chunk_queue` but absent from `usage_queue`.
+
+The `_ResponseHeaders` item put into `chunk_queue` at the top of the worker is **not** put into `usage_queue`.
+
+In the `finally` block, after `chunk_queue.put(None)` add `state.usage_queue.put(None)`. The `finally` block runs on ALL exit paths — including the `OSError` early-return on the `_ResponseHeaders` pipe-notification (line 463–465 of current code). There is one subtle case on that early-return: `state.error` remains `None` even though the client disconnected. This is acceptable because `_reset_request_state()` (which fires when the client connection closes) sets `state.cancel` and will join the worker thread before `read_from_descriptors()` can process the sentinel. If `read_from_descriptors()` does process the `None` sentinel before `_reset_request_state()` runs, `_finish_stream()` is called with `state.error = None` and `state.status_code = 0` (headers were never delivered), which would record a spurious `"response"` event with `status_code=0`. To prevent this, add `if state.status_code == 0: return` before the `record_stream_event("response", ...)` call in `_finish_stream()`.
 
 ### 5.4 `_reset_request_state()` changes
 
@@ -300,19 +328,24 @@ On pipe/`thread.start()` failure, `_streaming_state` is set to `None` and `clear
 2. Join worker thread (`timeout=2.0s`). ← existing
 3. Join `UsageParser` thread (`state.usage_parser_thread`, if not `None`) with `timeout=2.0s`. ← **new**
    - `usage_parser_thread` may be `None` if the client disconnected before `read_from_descriptors()` had dequeued the `_ResponseHeaders` item (i.e., headers never arrived). In that case the join is skipped and no `UsageParser` log line will be emitted for the request.
-4. Close pipe fds (`state.pipe_r`, `state.pipe_w`). ← existing
-5. Set `self._streaming_state = None`. ← existing
-6. Call `clear_request_context()`. ← existing
+4. Call `record_stream_event("error", config_name=state.config_name, error_reason="client_disconnect", duration_ms=..., ts=datetime.now())`. ← **new** — insert **before** `clear_request_context()` (step 6) so the log context is still active.
+5. Close pipe fds (`state.pipe_r`, `state.pipe_w`). ← existing
+6. Set `self._streaming_state = None`. ← existing
+7. Call `clear_request_context()`. ← existing
 
-Steps 1, 2, 4, 5, 6 are unchanged from the current implementation. Only step 3 is new.
+Steps 1, 2, 5, 6, 7 are unchanged from the current implementation. Steps 3 and 4 are new.
 
 ### 5.5 `_finish_stream()` changes
 
-The existing stub comment:
+The existing stub comment at line 190:
 ```python
 # metrics hook (Phase 2): on_stream_finished(req_id, config_name, status_code, error)
 ```
 is **replaced** with actual `record_stream_event()` calls as specified in §6.5.
+
+**Placement:** The `record_stream_event()` calls must be inserted **before** `clear_request_context()` at line 189, so that the `[req_id][WS]` log context is still active if any logging occurs inside `record_stream_event()`. The stub comment currently sits at line 190 (after `clear_request_context()`). The replacement calls should move to **before** line 189.
+
+Additionally, guard against the `status_code=0` spurious response case (see §5.3): add `if state.status_code == 0: return` immediately before the `record_stream_event("response", ...)` call in the `state.error is None` branch.
 
 **State access safety:** `_finish_stream()` begins with `self._streaming_state = None`, clearing the instance reference. All subsequent reads of `state.*` fields (including the new `state.ttfb_ms`, `state.start_time`, `state.config_name`) use the `state` **parameter variable**, which remains a live local reference regardless of the `self._streaming_state = None` assignment. These reads are safe.
 
@@ -408,6 +441,8 @@ Location: `~/.flow-proxy/stats.json` (created with parent dir on first flush).
 | `by_model` | dict[str, sub-bucket] | `UsageParser` via `record()` | Per-model breakdown. Sub-bucket fields: `total_prompt_tokens`, `total_completion_tokens`, `total_tokens`, `total_cost_usd` only. **No `stream_requests` in `by_model`** — model is not reliably known at `"started"` time (SSE fallback may be needed). |
 | `by_config` | dict[str, sub-bucket] | Both paths | Per-config breakdown. Sub-bucket fields: `stream_requests`, `stream_responses`, `stream_errors`, `total_prompt_tokens`, `total_completion_tokens`, `total_tokens`, `total_cost_usd`. |
 
+All three time granularities (`all_time`, each `daily` entry, each `hourly` entry) use the identical bucket structure, including `by_model` and `by_config` sub-buckets.
+
 **Retention policy:**
 - `all_time`: cumulative, never trimmed.
 - `daily`: kept indefinitely.
@@ -458,6 +493,7 @@ class UsageStats:
 
 **`record_stream_event()` internals:**
 - Same lock and three-bucket update.
+- Auto-vivication: if `by_config[config_name]` does not exist in `_pending`, create it with all fields at zero before incrementing. This applies to all three event types.
 - `"started"`: increments top-level `stream_requests` and `by_config[config_name].stream_requests`. **Does not touch `by_model`** — the model name is not reliably known until after the first SSE chunk, which may come after the `"started"` event.
 - `"response"`: increments `stream_responses`, `by_config[config_name].stream_responses`, `responses_by_status_class[status_class]`, adds to `ttfb_ms_sum/count` and `duration_ms_sum/count`.
 - `"error"`: increments `stream_errors`, `by_config[config_name].stream_errors`, `errors_by_reason[error_reason]`, adds to `duration_ms_sum/count` if `duration_ms` is not None.
@@ -529,9 +565,23 @@ The `StatsFlushThread` (§6.3) already provides regular persistence. At-most `fl
 
 ### 6.9 `ProcessServices` additions
 
-- Add `pricing_cache: PricingCache` attribute — initialised in `_initialize()` **after** `self.request_forwarder` (since it requires `self.request_forwarder.target_base_url`).
-- Add `usage_stats: UsageStats` attribute — initialised in `_initialize()` with `stats_file=Path.home() / ".flow-proxy" / "stats.json"` and `flush_interval` read from `FLOW_PROXY_STATS_FLUSH_INTERVAL` env var.
-- Add `pricing_cache.reset()` and `usage_stats.reset()` in `reset()` for test isolation.
+**New imports** to add at the top of `process_services.py`:
+```python
+from ..utils.pricing_cache import PricingCache
+from ..utils.usage_stats import UsageStats
+```
+
+**New attributes** in `_initialize()`:
+- `self.pricing_cache = PricingCache(target_base_url=self.request_forwarder.target_base_url)` — must appear **after** `self.request_forwarder` is set.
+- `self.usage_stats = UsageStats(stats_file=Path.home() / ".flow-proxy" / "stats.json", flush_interval=int(os.getenv("FLOW_PROXY_STATS_FLUSH_INTERVAL", "300")))` — order relative to other attributes is flexible.
+
+**In `reset()`** — add:
+```python
+if self.pricing_cache is not None:
+    self.pricing_cache.reset()
+if self.usage_stats is not None:
+    self.usage_stats.reset()
+```
 
 ### 6.10 Testing (`tests/test_usage_stats.py`)
 
@@ -592,9 +642,11 @@ The `StatsFlushThread` (§6.3) already provides regular persistence. At-most `fl
 
 **Three existing `StreamingState` construction sites in `tests/test_web_server_plugin.py` break when `usage_queue` and `start_time` become required fields. All three must be updated.** (The production construction site in `handle_request()` is addressed separately in §5.2 and §8.)
 
-1. `TestDataStructures.test_streaming_state_defaults` (lines 29–37): Completely rewrite construction call to add `usage_queue=queue.Queue()` and `start_time=time.monotonic()` after `config_name`.
-2. `TestStreamingWorker._make_state()` (lines 383–390): Add `usage_queue=queue.Queue()` and `start_time=time.monotonic()` after `config_name`.
-3. `TestEventLoopHooks._make_state_with_pipe()` (lines 530–537): Add `usage_queue=queue.Queue()` and `start_time=time.monotonic()` after `config_name`.
+1. `TestDataStructures.test_streaming_state_defaults`: Completely rewrite construction call to add `usage_queue=queue.Queue()` and `start_time=time.monotonic()` after `config_name`.
+2. `TestStreamingWorker._make_state()`: Add `usage_queue=queue.Queue()` and `start_time=time.monotonic()` after `config_name`.
+3. `TestEventLoopHooks._make_state_with_pipe()`: Add `usage_queue=queue.Queue()` and `start_time=time.monotonic()` after `config_name`.
+
+(Run `grep -n "StreamingState(" tests/test_web_server_plugin.py` to confirm all construction sites; there should be exactly these three in tests plus one in `handle_request()`.)
 
 Failing to update these three sites causes `TypeError` on `StreamingState` construction, breaking all tests in `TestStreamingWorker` and `TestEventLoopHooks`.
 
@@ -621,7 +673,7 @@ Failing to update these three sites causes `TypeError` on `StreamingState` const
 - No changes to existing environment variables or request/response wire format.
 - **One new env var**: `FLOW_PROXY_STATS_FLUSH_INTERVAL` (default `300`, range `10`–`3600`, seconds). All other env vars unchanged.
 - `PricingCache` uses `target_base_url` from `RequestForwarder`; no new secrets or endpoints required.
-- `StreamingState` gains two new required fields (`usage_queue`, `start_time`) inserted before existing defaulted fields (see §3.4 for exact ordering), plus three new optional fields (`request_model=""`, `usage_parser_thread=None`, `ttfb_ms=None`). All `StreamingState` construction sites (in `handle_request()`) must be updated to supply `usage_queue` and `start_time`. The `ttfb_ms`, `usage_parser_thread`, and `request_model` fields use defaults and require no changes at construction.
+- `StreamingState` gains two new required fields (`usage_queue`, `start_time`) inserted before existing defaulted fields (see §3.4 for exact ordering), plus three new optional fields (`request_model=""`, `usage_parser_thread=None`, `ttfb_ms=None`). All `StreamingState` construction sites must be updated to supply `usage_queue` and `start_time`. Run `grep -rn "StreamingState(" flow_proxy_plugin/ tests/` to find all sites — there are currently 4 total (1 production in `handle_request()`, 3 in tests). The optional fields use defaults and require no changes at construction.
 - `LogCleaner` signature is **unchanged** (§6.8 integration removed). Existing callers unaffected.
 - `~/.flow-proxy/` directory is created on first flush; no pre-existing configuration required.
 
