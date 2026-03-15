@@ -68,6 +68,25 @@ The `hasattr` guards are required because `_initialize()` may not have run if `r
 
 ## 3. `web_server_plugin.py` Changes
 
+### 3.0 Exception Safety of `record_stream_event()` Calls
+
+All `record_stream_event()` calls added in §3.3–§3.5 are pure in-memory dict operations under a lock — they do not do any I/O and should not raise in normal operation. However, if `record_stream_event()` raises unexpectedly:
+
+- In `_finish_stream()`: `clear_request_context()` (line 222) would be skipped, leaving the thread-local request context stale for the next request on that thread.
+- In `_reset_request_state()`: same stale-context risk.
+- In `handle_request()` after `state.thread.start()`: the worker thread is already running; an exception would propagate out of `handle_request()`, abandoning cleanup.
+
+**Requirement**: wrap each `record_stream_event()` call in a `try/except Exception` with `logger.warning("Usage stats error: %s", e)` so that any failure is logged and execution continues normally. Example pattern:
+
+```python
+try:
+    ProcessServices.get().usage_stats.record_stream_event(...)
+except Exception as e:
+    self.logger.warning("Usage stats error: %s", e)
+```
+
+Apply this pattern to all call sites listed in §3.3, §3.4, and §3.5.
+
 ### 3.1 New Imports
 
 Add to the imports in `web_server_plugin.py` (note: `import time` already exists at the top of the file — do not add it again):
@@ -165,41 +184,57 @@ ProcessServices.get().usage_stats.record_stream_event(
 
 Insert the `record_stream_event()` calls **before** `clear_request_context()` at line 222 (not in place of the stub at line 223, which sits after `clear_request_context()`).
 
-The current `_finish_stream()` tail has this structure (simplified):
+**Existing variable names to reuse** (from the actual `_finish_stream()` source):
+
+| Existing variable | Set at | Use in `record_stream_event` |
+|---|---|---|
+| `end` | `"transport_error"` or `"worker_error"` (lines 198–201) | pass as `error_reason=end` |
+| `duration` | `time.time() - state.start_time` (lines 204, 213) — **changed to `time.monotonic()` in Part 1 §4.1** | pass as `duration_ms=duration * 1000` |
+
+Do NOT introduce a new `error_reason` variable — the existing `end` variable already serves this purpose.
+
+The current `_finish_stream()` tail (condensed, with Part 1 changes already applied to `time.monotonic()`):
 
 ```python
 if state.error:
-    # ... log error ...
+    # ... error-response sending (unchanged) ...
     if isinstance(state.error, httpx.TransportError):
-        ...
+        end = "transport_error"
+    else:
+        end = "worker_error"
+    status = ...
+    ttfb_str = ...
+    duration = time.monotonic() - state.start_time   # Part 1: changed from time.time()
+    self.logger.warning("← %s ... end=%s", ..., end)
+    # INSERT record_stream_event HERE (after the log, before clear_request_context)
 else:
-    # ... log success ...
-clear_request_context()   # line 222 — single call shared by both branches
-# metrics hook (Phase 2): ...  # line 223 — remove this stub
+    status = ...
+    ttfb_str = ...
+    duration = time.monotonic() - state.start_time   # Part 1: changed from time.time()
+    log_func(...)
+    # INSERT record_stream_event HERE (after the log, before clear_request_context)
+clear_request_context()   # line 222 — single call, always runs
+# metrics hook stub at line 223 — REMOVE this line
 ```
 
-**The new code inserts `record_stream_event()` inside each branch, before the shared `clear_request_context()` at line 222. There must be exactly one `clear_request_context()` call — do not duplicate it.**
+**The new code inserts `record_stream_event()` inside each branch after the existing log call, before the shared `clear_request_context()`. There must be exactly one `clear_request_context()` call — do not duplicate it.**
 
-Updated tail (replace the `if state.error / else` block and the single `clear_request_context()` that follows):
+Updated tail (showing only the insertions — all existing lines are unchanged except `time.time()` → `time.monotonic()` per Part 1):
 
 ```python
 if state.error:
-    if isinstance(state.error, httpx.TransportError):
-        error_reason = "transport_error"
-    else:
-        error_reason = "worker_error"
-    # ... existing error log lines (unchanged) ...
+    # ... existing lines unchanged (but duration already uses time.monotonic() per Part 1) ...
     ProcessServices.get().usage_stats.record_stream_event(
         config_name=state.config_name,
         event="error",
         status_code=None,
-        error_reason=error_reason,
+        error_reason=end,        # reuse existing 'end' variable
         ttfb_ms=None,
-        duration_ms=(time.monotonic() - state.start_time) * 1000,
+        duration_ms=duration * 1000,   # reuse existing 'duration' variable
         ts=datetime.now(),
     )
 else:
-    # ... existing success log lines (unchanged) ...
+    # ... existing lines unchanged ...
     if state.status_code != 0:
         ProcessServices.get().usage_stats.record_stream_event(
             config_name=state.config_name,
@@ -207,7 +242,7 @@ else:
             status_code=state.status_code,
             error_reason=None,
             ttfb_ms=state.ttfb * 1000 if state.ttfb is not None else None,
-            duration_ms=(time.monotonic() - state.start_time) * 1000,
+            duration_ms=duration * 1000,   # reuse existing 'duration' variable
             ts=datetime.now(),
         )
 clear_request_context()   # exactly one call — always runs regardless of branch
@@ -330,12 +365,15 @@ TestEventLoopHooks — MUST be patched (enqueue _ResponseHeaders):
   - test_read_from_descriptors_tracks_bytes_sent
   - test_read_from_descriptors_returns_true_on_sentinel
   - test_get_descriptors_empty_after_stream_finishes
+  - test_is_sse_propagated_to_state_when_response_headers_processed
 
 TestEventLoopHooks — safe, no patch needed (do NOT enqueue _ResponseHeaders):
   - test_read_from_descriptors_noop_when_pipe_not_in_readables  (only None sentinel)
   - test_worker_error_before_headers_sends_503  (only None sentinel)
   - test_worker_error_after_headers_does_not_send_error_response  (only None sentinel — no _ResponseHeaders enqueued)
 ```
+
+The instruction to `grep -n "_ResponseHeaders" tests/test_web_server_plugin.py` before implementing is the authoritative check — run it to catch any additional tests not listed here.
 
 Run `grep -n "_ResponseHeaders" tests/test_web_server_plugin.py` to find all test methods that enqueue a `_ResponseHeaders` item into `chunk_queue`. Each such test needs the following patch added around the `read_from_descriptors()` call:
 

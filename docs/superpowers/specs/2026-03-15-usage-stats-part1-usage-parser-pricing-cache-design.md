@@ -293,16 +293,27 @@ class StreamingState:
 1. req_id / start_time / stream parsing
 2. config_name = ""  ← Part 3 addition
 3. try: _, config_name, jwt_token = _get_config_and_token()  ← auth (may fail)
-4. body = self._get_request_body(request, filter_rule)  ← AFTER auth
-5. request_model extracted from body  ← steps below (AFTER body exists)
-6. usage_queue = queue.Queue()
-7. StreamingState(..., usage_queue=..., request_model=...)
-8. state.thread.start()
+4. filter_rule lookup + target_url + headers build
+5. body = self._get_request_body(request, filter_rule)  ← line 290 in source
+6. [debug log]
+7. [FWD log]
+8. pipe_r, pipe_w = os.pipe()  ← line 298; resource allocation starts here
+9. try:
+       state = StreamingState(...)  ← line 300; existing constructor call to modify
+       ...
+       state.thread.start()        ← line 318
 ```
 
-Steps 5–8 all take place after auth succeeds. `body` is only available at step 4 and later.
+**Insertion points for Part 1 changes:**
 
-**Changes for Part 1** (steps 5–7, inserting after the existing `body = self._get_request_body(...)` line):
+- **Steps 6a–6b** (new, between lines 290 and 298, BEFORE `os.pipe()`):
+  - Extract `request_model` from `body` (pure Python, no resource allocation — safe here)
+  - Create `usage_queue = queue.Queue()` (also before `os.pipe()` — no cleanup needed on failure)
+- **Step 9** (modify existing): add `usage_queue=usage_queue` and `request_model=request_model` to the existing `StreamingState(...)` constructor call at line 300 (already inside the `try:` block).
+
+`body` is only available from line 290 onward. `request_model` extraction and `usage_queue` creation must therefore be AFTER line 290.
+
+**Changes for Part 1** (steps 6a–6b, inserting after line 290 `body = self._get_request_body(...)`):
 
 1. **Extract `request_model`** from the existing `body` variable. Do not call `_get_request_body()` again. `body` is `bytes | None`; use a `try/except` around the JSON parse:
    ```python
@@ -324,21 +335,46 @@ Steps 5–8 all take place after auth succeeds. `body` is only available at step
 
 ### 5.2 `_streaming_worker()` changes
 
-The exact per-chunk ordering (applies to BOTH SSE and non-SSE loops) — add `usage_queue.put` immediately after each `chunk_queue.put`:
+The two streaming loops have **different guard structures** — the `usage_queue.put(chunk)` placement must respect each loop's existing guard:
+
+**SSE path** (`if is_sse:` branch, lines 526–545): each chunk is guarded by `if chunk:` before being put into `chunk_queue`. Place `usage_queue.put(chunk)` immediately after `chunk_queue.put(chunk)`, still inside the `if chunk:` block:
 
 ```python
-# First chunk only (ttfb block — clock changed to monotonic):
-if state.ttfb is None:
-    state.ttfb = time.monotonic() - state.start_time
-    ...
+if is_sse:
+    for line in response.iter_lines():
+        if state.cancel.is_set():
+            break
+        chunk = self._encode_sse_line(line)
+        if chunk:                                # existing guard — do NOT move outside
+            if state.ttfb is None:
+                state.ttfb = time.monotonic() - state.start_time   # clock change (§4.1)
+                ...
+            state.chunk_queue.put(chunk)
+            state.usage_queue.put(chunk)         # NEW — inside the if chunk: block
+            try:
+                os.write(state.pipe_w, b"\x00")
+            except OSError:
+                return
+```
 
-# Every chunk (both paths):
-state.chunk_queue.put(chunk)
-state.usage_queue.put(chunk)   # NEW — immediately after chunk_queue.put
-try:
-    os.write(state.pipe_w, b"\x00")
-except OSError:
-    return
+**Non-SSE path** (`else:` branch, lines 546–565): each chunk is guarded by `if not chunk: continue` before being put into `chunk_queue`. Place `usage_queue.put(chunk)` immediately after `chunk_queue.put(chunk)` (the `continue` already prevents empty chunks from reaching either put):
+
+```python
+else:
+    for chunk in response.iter_bytes():
+        if state.cancel.is_set():
+            break
+        if not chunk:
+            continue                             # empty chunk skipped — neither queue gets it
+        if state.ttfb is None:
+            state.ttfb = time.monotonic() - state.start_time   # clock change (§4.1)
+            ...
+        state.chunk_queue.put(chunk)
+        state.usage_queue.put(chunk)             # NEW — after the empty-chunk guard
+        try:
+            os.write(state.pipe_w, b"\x00")
+        except OSError:
+            return
 ```
 
 In the `finally` block, add `state.usage_queue.put(None)` **immediately after** `chunk_queue.put(None)` and **before** `os.write(state.pipe_w, b"\x00")`:
@@ -403,7 +439,7 @@ with patch("flow_proxy_plugin.plugins.web_server_plugin.UsageParser") as mock_pa
     mock_parser_cls.return_value.run = MagicMock()   # no-op run()
     asyncio.run(plugin.read_from_descriptors([pipe_r]))
 ```
-See Part 3 §4.3 for the complete list of tests that require this patch.
+See Part 3 §4.2.5 for the complete list of tests that require this patch.
 
 ### 5.4 `_reset_request_state()` changes (Part 1 portion)
 
