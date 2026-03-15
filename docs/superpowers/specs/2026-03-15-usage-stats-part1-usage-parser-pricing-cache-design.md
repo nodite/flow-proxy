@@ -105,6 +105,24 @@ class UsageRecord:
 
 ### 3.2 `UsageParser` (`flow_proxy_plugin/utils/usage_parser.py`)
 
+**Required imports for `usage_parser.py`** (new module — implementer must supply all of these):
+
+```python
+from __future__ import annotations
+
+import json
+import logging
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING
+
+from .log_context import clear_request_context, set_request_context
+from .process_services import ProcessServices
+```
+
 A standalone class. No significant constructor arguments — instantiated as `UsageParser()` in `read_from_descriptors()`.
 
 ```python
@@ -171,6 +189,19 @@ The `hasattr` guard is removed in Part 3 once `usage_stats` is unconditionally p
 **Import note:** `usage_parser.py` calls `ProcessServices.get()` inside `run()` at runtime. No circular import: `process_services.py` → (will import) `usage_stats.py`; `usage_parser.py` → `process_services.py`. `process_services.py` must **not** import `usage_parser.py`.
 
 ### 3.3 `PricingCache` (`flow_proxy_plugin/utils/pricing_cache.py`)
+
+**Required imports for `pricing_cache.py`** (new module):
+
+```python
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from typing import Any
+
+import httpx
+```
 
 A process-level singleton held by `ProcessServices` (added in Part 3). Instantiated as `PricingCache(target_base_url=...)`.
 
@@ -306,14 +337,14 @@ class StreamingState:
 
 **Insertion points for Part 1 changes:**
 
-- **Steps 6a–6b** (new, between lines 290 and 298, BEFORE `os.pipe()`):
+- **Steps 6a–6b** (new, inserting **immediately after line 290** `body = self._get_request_body(request, filter_rule)`, before the debug log block at lines 292–293):
   - Extract `request_model` from `body` (pure Python, no resource allocation — safe here)
   - Create `usage_queue = queue.Queue()` (also before `os.pipe()` — no cleanup needed on failure)
 - **Step 9** (modify existing): add `usage_queue=usage_queue` and `request_model=request_model` to the existing `StreamingState(...)` constructor call at line 300 (already inside the `try:` block).
 
-`body` is only available from line 290 onward. `request_model` extraction and `usage_queue` creation must therefore be AFTER line 290.
+`body` is only available from line 290 onward. `request_model` extraction and `usage_queue` creation must therefore be AFTER line 290. Place them immediately after line 290 (before the debug log at 292), not after the FWD log block.
 
-**Changes for Part 1** (steps 6a–6b, inserting after line 290 `body = self._get_request_body(...)`):
+**Changes for Part 1** (steps 6a–6b, inserting immediately after line 290 `body = self._get_request_body(...)`):
 
 1. **Extract `request_model`** from the existing `body` variable. Do not call `_get_request_body()` again. `body` is `bytes | None`; use a `try/except` around the JSON parse:
    ```python

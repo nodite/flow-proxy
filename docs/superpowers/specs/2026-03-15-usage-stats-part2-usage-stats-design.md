@@ -137,10 +137,23 @@ UsageStats(
 
 ### 4.1 Public Interface
 
-```python
-from datetime import datetime
-from pathlib import Path
+**Required imports for `usage_stats.py`** (new module — implementer must supply all of these):
 
+```python
+from __future__ import annotations
+
+import fcntl
+import json
+import logging
+import os
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+```
+
+```python
 class UsageStats:
     def __init__(self, stats_file: Path, flush_interval: int) -> None:
         """Initialize in-memory state and start StatsFlushThread."""
@@ -191,7 +204,7 @@ class UsageStats:
 - Auto-vivication for `by_config[config_name]` (only when `config_name` is non-empty): if the sub-bucket does not exist, create it with all fields at zero before incrementing.
 - `"started"`: increments top-level `stream_requests`. If `config_name` is non-empty, also increments `by_config[config_name].stream_requests`. Does not touch `by_model`.
 - `"response"`: increments top-level `stream_responses`, `responses_by_status_class[status_class]`, adds to `ttfb_ms_sum`/`ttfb_ms_count` (only if `ttfb_ms` is not `None`), adds to `duration_ms_sum`/`duration_ms_count` (only if `duration_ms` is not `None`). If `config_name` is non-empty, also increments `by_config[config_name].stream_responses`.
-- `"error"`: increments top-level `stream_errors`, `errors_by_reason[error_reason]`, adds to `duration_ms_sum`/`duration_ms_count` (only if `duration_ms` is not `None`). If `config_name` is non-empty, also increments `by_config[config_name].stream_errors`.
+- `"error"`: increments top-level `stream_errors`, adds to `duration_ms_sum`/`duration_ms_count` (only if `duration_ms` is not `None`). If `config_name` is non-empty, also increments `by_config[config_name].stream_errors`. For `errors_by_reason`: only increment `errors_by_reason[error_reason]` when `error_reason` is not `None` — skip silently if `None`.
 
 ### 4.4 `flush()` Internals
 

@@ -53,13 +53,35 @@ self.usage_stats = UsageStats(
 
 ### 2.3 Updates in `reset()`
 
-Add inside the `with cls._lock:` block, after the existing `http_client.close()` call and before `cls._instance = None`:
+The actual `reset()` method wraps `http_client.close()` in a `try/except Exception: pass` block:
 
 ```python
-if hasattr(cls._instance, "pricing_cache") and cls._instance.pricing_cache is not None:
-    cls._instance.pricing_cache.reset()
-if hasattr(cls._instance, "usage_stats") and cls._instance.usage_stats is not None:
-    cls._instance.usage_stats.reset()
+with cls._lock:
+    if cls._instance is not None:
+        try:
+            if cls._instance.http_client is not None:
+                cls._instance.http_client.close()
+        except Exception:
+            pass
+    cls._instance = None
+```
+
+Add the new cleanup calls **after the entire `try/except` block** (not inside it), still inside `if cls._instance is not None:`, before `cls._instance = None`:
+
+```python
+with cls._lock:
+    if cls._instance is not None:
+        try:
+            if cls._instance.http_client is not None:
+                cls._instance.http_client.close()
+        except Exception:
+            pass
+        # ADD HERE — after the try/except block, before cls._instance = None:
+        if hasattr(cls._instance, "pricing_cache") and cls._instance.pricing_cache is not None:
+            cls._instance.pricing_cache.reset()
+        if hasattr(cls._instance, "usage_stats") and cls._instance.usage_stats is not None:
+            cls._instance.usage_stats.reset()
+    cls._instance = None
 ```
 
 The `hasattr` guards are required because `_initialize()` may not have run if `reset()` is called between object construction and initialization during tests.
@@ -136,43 +158,52 @@ Add `config_name = ""` immediately before the `try:` block (between the `self.lo
 **2. Auth failure path** — after `self._send_error(503, "Auth error")` and before `clear_request_context()`:
 
 ```python
-ProcessServices.get().usage_stats.record_stream_event(
-    config_name=config_name,  # "" — no config was selected
-    event="error",
-    status_code=None,
-    error_reason="auth_error",
-    ttfb_ms=None,
-    duration_ms=(time.monotonic() - start_time) * 1000,
-    ts=datetime.now(),
-)
+try:
+    ProcessServices.get().usage_stats.record_stream_event(
+        config_name=config_name,  # "" — no config was selected
+        event="error",
+        status_code=None,
+        error_reason="auth_error",
+        ttfb_ms=None,
+        duration_ms=(time.monotonic() - start_time) * 1000,
+        ts=datetime.now(),
+    )
+except Exception as e:
+    self.logger.warning("Usage stats error: %s", e)
 ```
 
 **3. Setup failure path** — after `self._send_error(500, "Failed to start streaming")` and before `clear_request_context()`:
 
 ```python
-ProcessServices.get().usage_stats.record_stream_event(
-    config_name=config_name,  # bound — auth succeeded
-    event="error",
-    status_code=None,
-    error_reason="setup_failed",
-    ttfb_ms=None,
-    duration_ms=(time.monotonic() - start_time) * 1000,
-    ts=datetime.now(),
-)
+try:
+    ProcessServices.get().usage_stats.record_stream_event(
+        config_name=config_name,  # bound — auth succeeded
+        event="error",
+        status_code=None,
+        error_reason="setup_failed",
+        ttfb_ms=None,
+        duration_ms=(time.monotonic() - start_time) * 1000,
+        ts=datetime.now(),
+    )
+except Exception as e:
+    self.logger.warning("Usage stats error: %s", e)
 ```
 
 **4. After `state.thread.start()`** — record the "started" event:
 
 ```python
-ProcessServices.get().usage_stats.record_stream_event(
-    config_name=config_name,
-    event="started",
-    status_code=None,
-    error_reason=None,
-    ttfb_ms=None,
-    duration_ms=None,
-    ts=datetime.now(),
-)
+try:
+    ProcessServices.get().usage_stats.record_stream_event(
+        config_name=config_name,
+        event="started",
+        status_code=None,
+        error_reason=None,
+        ttfb_ms=None,
+        duration_ms=None,
+        ts=datetime.now(),
+    )
+except Exception as e:
+    self.logger.warning("Usage stats error: %s", e)
 ```
 
 ### 3.4 `_finish_stream()` Changes
@@ -224,27 +255,33 @@ Updated tail (showing only the insertions — all existing lines are unchanged e
 ```python
 if state.error:
     # ... existing lines unchanged (but duration already uses time.monotonic() per Part 1) ...
-    ProcessServices.get().usage_stats.record_stream_event(
-        config_name=state.config_name,
-        event="error",
-        status_code=None,
-        error_reason=end,        # reuse existing 'end' variable
-        ttfb_ms=None,
-        duration_ms=duration * 1000,   # reuse existing 'duration' variable
-        ts=datetime.now(),
-    )
-else:
-    # ... existing lines unchanged ...
-    if state.status_code != 0:
+    try:
         ProcessServices.get().usage_stats.record_stream_event(
             config_name=state.config_name,
-            event="response",
-            status_code=state.status_code,
-            error_reason=None,
-            ttfb_ms=state.ttfb * 1000 if state.ttfb is not None else None,
+            event="error",
+            status_code=None,
+            error_reason=end,        # reuse existing 'end' variable
+            ttfb_ms=None,
             duration_ms=duration * 1000,   # reuse existing 'duration' variable
             ts=datetime.now(),
         )
+    except Exception as e:
+        self.logger.warning("Usage stats error: %s", e)
+else:
+    # ... existing lines unchanged ...
+    if state.status_code != 0:
+        try:
+            ProcessServices.get().usage_stats.record_stream_event(
+                config_name=state.config_name,
+                event="response",
+                status_code=state.status_code,
+                error_reason=None,
+                ttfb_ms=state.ttfb * 1000 if state.ttfb is not None else None,
+                duration_ms=duration * 1000,   # reuse existing 'duration' variable
+                ts=datetime.now(),
+            )
+        except Exception as e:
+            self.logger.warning("Usage stats error: %s", e)
 clear_request_context()   # exactly one call — always runs regardless of branch
 # remove the "metrics hook (Phase 2)" stub comment that was here
 ```
@@ -257,18 +294,22 @@ clear_request_context()   # exactly one call — always runs regardless of branc
 
 ### 3.5 `_reset_request_state()` Changes
 
-Add **before** `clear_request_context()`:
+`_reset_request_state()` already computes `duration = time.time() - state.start_time` at line 245 (changed to `time.monotonic()` by Part 1 §4.1). Add the `record_stream_event()` call **after the existing log line** and **before** `clear_request_context()`, reusing the existing `duration` variable:
 
 ```python
-ProcessServices.get().usage_stats.record_stream_event(
-    config_name=state.config_name,
-    event="error",
-    status_code=None,
-    error_reason="client_disconnect",
-    ttfb_ms=None,
-    duration_ms=(time.monotonic() - state.start_time) * 1000,
-    ts=datetime.now(),
-)
+# ... existing log line at line ~246-250 (unchanged) ...
+try:
+    ProcessServices.get().usage_stats.record_stream_event(
+        config_name=state.config_name,
+        event="error",
+        status_code=None,
+        error_reason="client_disconnect",
+        ttfb_ms=None,
+        duration_ms=duration * 1000,   # reuse existing 'duration' variable (line 245)
+        ts=datetime.now(),
+    )
+except Exception as e:
+    self.logger.warning("Usage stats error: %s", e)
 clear_request_context()
 ```
 
@@ -360,17 +401,17 @@ The following existing tests must be updated to patch `UsageParser`:
 
 ```
 TestEventLoopHooks — MUST be patched (enqueue _ResponseHeaders):
-  - test_read_from_descriptors_queues_each_chunk
-  - test_read_from_descriptors_sends_headers_on_first_item
-  - test_read_from_descriptors_tracks_bytes_sent
-  - test_read_from_descriptors_returns_true_on_sentinel
-  - test_get_descriptors_empty_after_stream_finishes
-  - test_is_sse_propagated_to_state_when_response_headers_processed
+  - test_read_from_descriptors_queues_each_chunk         (line ~737)
+  - test_read_from_descriptors_sends_headers_on_first_item  (line ~765)
+  - test_read_from_descriptors_tracks_bytes_sent         (line ~794)
+  - test_is_sse_propagated_to_state_when_response_headers_processed  (line ~937)
 
 TestEventLoopHooks — safe, no patch needed (do NOT enqueue _ResponseHeaders):
+  - test_read_from_descriptors_returns_true_on_sentinel  (only None sentinel — line ~808)
+  - test_get_descriptors_empty_after_stream_finishes     (only None sentinel — line ~826)
   - test_read_from_descriptors_noop_when_pipe_not_in_readables  (only None sentinel)
-  - test_worker_error_before_headers_sends_503  (only None sentinel)
-  - test_worker_error_after_headers_does_not_send_error_response  (only None sentinel — no _ResponseHeaders enqueued)
+  - test_worker_error_before_headers_sends_503           (only None sentinel)
+  - test_worker_error_after_headers_does_not_send_error_response  (only None sentinel)
 ```
 
 The instruction to `grep -n "_ResponseHeaders" tests/test_web_server_plugin.py` before implementing is the authoritative check — run it to catch any additional tests not listed here.
