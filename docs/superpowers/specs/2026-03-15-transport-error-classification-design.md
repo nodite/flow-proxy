@@ -43,7 +43,7 @@ WARNING [f733c1][WS] ← 200 [flow-proxy-apac] stream=True ttfb=3.9s duration=18
 
 ### 4.1 `StreamingState` — New Field
 
-Add `end_reason` to `StreamingState` with a default of `""` (empty string):
+Add `end_reason` to `StreamingState` with a default of `""` (empty string). Place it after the existing defaulted fields (`headers_sent`, `is_sse`, `status_code`, `error`, `ttfb`, `bytes_sent`) to satisfy the dataclass rule that defaulted fields follow non-defaulted fields:
 
 ```python
 end_reason: str = ""
@@ -74,6 +74,8 @@ except httpx.TransportError as e:
 ```
 
 **Ordering matters:** `RemoteProtocolError` and `ConnectError` are subclasses of `TransportError`; they must be caught before the base class.
+
+**Timeout exceptions:** `httpx.TimeoutException` and its subclasses (`ConnectTimeout`, `ReadTimeout`, `WriteTimeout`, `PoolTimeout`) are also subclasses of `TransportError` and will be caught by the generic `except httpx.TransportError` branch, producing `end=transport_error`. This is a known and intentional gap. For example, a `ReadTimeout` from the proxy's own 600s read deadline expiring is operationally different from a `RemoteProtocolError`, but both produce `end=transport_error`. Adding a fourth classification layer for timeouts is a future concern and is out of scope for this spec.
 
 ### 4.3 `_finish_stream()` — Use `end_reason`
 
@@ -115,6 +117,8 @@ This design updates the streaming worker error-handling contract originally spec
 
 Additionally, the robustness spec §4.1 log event table row describing the worker TransportError message as `"Transport error — marking httpx client dirty: {e}"` is stale. The new worker log messages are as specified in §4.2 of this document (`"Remote closed stream: {e}"`, `"Connect error: {e}"`, `"Transport error: {e}"`).
 
+The usage-stats part3 spec ([2026-03-15-usage-stats-part3-integration-design.md](2026-03-15-usage-stats-part3-integration-design.md) §3.4) contains a `_finish_stream()` code snippet that assumes `end = "transport_error"` is always the value for the `TransportError` branch, and a test (`test_finish_stream_records_transport_error`) written against that assumption. Both are stale after this change: the correct value passed as `error_reason` to `record_stream_event()` will be `state.end_reason` — one of `"remote_closed"`, `"connect_error"`, or `"transport_error"` — not always `"transport_error"`. The part3 spec's §3.4 snippet and test table entry must be updated accordingly when implementing that spec after this one.
+
 All other clauses of §3.3 (failover scope, error paths, client-disconnect handling) remain in effect.
 
 ---
@@ -123,7 +127,7 @@ All other clauses of §3.3 (failover scope, error paths, client-disconnect handl
 
 ### 6.1 Modified Tests
 
-Existing tests that assert `mark_http_client_dirty()` is called on `TransportError` must be updated to assert it is **not** called.
+The test `test_worker_transport_error_sets_state_error_and_sentinel` currently asserts that `mark_http_client_dirty()` is called on `TransportError`. It must be updated to assert it is **not** called.
 
 ### 6.2 New Tests (`test_web_server_plugin.py`)
 
