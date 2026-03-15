@@ -114,10 +114,9 @@ class FlowProxyPlugin(HttpProxyBasePlugin, BaseFlowProxyPlugin):
             )
 
             # Log success
-            target_url = self._decode_bytes(request.path) if request.path else "unknown"
-            self.logger.info(
-                "Request processed with config '%s' → %s", config_name, target_url
-            )
+            method = self._decode_bytes(request.method) if request.method else "GET"
+            path = self._decode_bytes(request.path) if request.path else "unknown"
+            self.logger.info("→ %s %s [%s]", method, path, config_name)
 
             return modified_request
 

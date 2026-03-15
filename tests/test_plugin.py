@@ -2,7 +2,7 @@
 
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from proxy.http.parser import HttpParser
@@ -177,6 +177,35 @@ class TestFlowProxyPluginRequestProcessing:
             assert result is not None
             assert mock_gen.called
             assert mock_modify.called
+
+    def test_proxy_plugin_log_format(self, plugin: FlowProxyPlugin) -> None:
+        """before_upstream_connection emits '→ POST /path [config]' format."""
+        request = Mock(spec=HttpParser)
+        request.method = b"POST"
+        request.path = b"/v1/messages"
+        request.headers = {}
+
+        plugin.logger = MagicMock()
+        with (
+            patch.object(plugin.request_forwarder, "validate_request", return_value=True),
+            patch.object(plugin.jwt_generator, "generate_token", return_value="tok"),
+            patch.object(
+                plugin.request_forwarder, "modify_request_headers", return_value=request
+            ),
+        ):
+            plugin.before_upstream_connection(request)
+
+        info_calls = list(plugin.logger.info.call_args_list)
+        messages = [str(c.args[0]) for c in info_calls]
+        assert any(m.startswith("→") for m in messages)
+        arrow_args = [c.args for c in info_calls if str(c.args[0]).startswith("→")]
+        assert len(arrow_args) == 1
+        fmt, method, path, config_name = arrow_args[0]
+        assert method == "POST"
+        assert path == "/v1/messages"
+        assert "test-config" in config_name
+        old = [m for m in messages if "Request processed with config" in m]
+        assert old == []
 
     def test_before_upstream_connection_invalid_request(
         self, plugin: FlowProxyPlugin
