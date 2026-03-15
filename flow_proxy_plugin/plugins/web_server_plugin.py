@@ -409,7 +409,9 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             return None
         try:
             parsed = json.loads(body)
-            return parsed.get("stream")
+            if isinstance(parsed, dict):
+                return parsed.get("stream")
+            return None
         except (json.JSONDecodeError, UnicodeDecodeError):
             return None
 

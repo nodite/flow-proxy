@@ -401,6 +401,56 @@ class TestHelperMethods:
         assert calls[-1] == b"\r\n"
 
 
+class TestParseStreamField:
+    """Direct unit tests for FlowProxyWebServerPlugin._parse_stream_field()."""
+
+    def test_stream_true_from_json_body(self) -> None:
+        request = MagicMock(spec=HttpParser)
+        request.body = b'{"stream": true}'
+        request.buffer = None
+        assert FlowProxyWebServerPlugin._parse_stream_field(request) is True
+
+    def test_stream_false_from_json_body(self) -> None:
+        request = MagicMock(spec=HttpParser)
+        request.body = b'{"stream": false}'
+        request.buffer = None
+        assert FlowProxyWebServerPlugin._parse_stream_field(request) is False
+
+    def test_no_stream_field_returns_none(self) -> None:
+        request = MagicMock(spec=HttpParser)
+        request.body = b'{"model": "claude-3-5-sonnet"}'
+        request.buffer = None
+        assert FlowProxyWebServerPlugin._parse_stream_field(request) is None
+
+    def test_absent_body_returns_none(self) -> None:
+        request = MagicMock(spec=HttpParser)
+        request.body = None
+        request.buffer = None
+        assert FlowProxyWebServerPlugin._parse_stream_field(request) is None
+
+    def test_non_json_body_returns_none(self) -> None:
+        request = MagicMock(spec=HttpParser)
+        request.body = b"not json at all"
+        request.buffer = None
+        assert FlowProxyWebServerPlugin._parse_stream_field(request) is None
+
+    def test_non_dict_json_body_returns_none(self) -> None:
+        """Valid JSON but not an object (list, int, null) must return None, not raise."""
+        request = MagicMock(spec=HttpParser)
+        request.buffer = None
+        for non_dict_body in (b"[1,2,3]", b"42", b'"hello"', b"null"):
+            request.body = non_dict_body
+            assert FlowProxyWebServerPlugin._parse_stream_field(request) is None, (
+                f"Expected None for body={non_dict_body!r}"
+            )
+
+    def test_buffer_fallback_when_body_absent(self) -> None:
+        request = MagicMock(spec=HttpParser)
+        request.body = None
+        request.buffer = bytearray(b'{"stream": true}')
+        assert FlowProxyWebServerPlugin._parse_stream_field(request) is True
+
+
 class TestStreamingWorker:
     """Tests for _streaming_worker() background thread method."""
 
@@ -1094,6 +1144,39 @@ class TestEventLoopHooks:
         with pytest.raises(OSError):
             os.close(pipe_w)
 
+    def test_finish_stream_worker_error_emits_warning(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_finish_stream emits WARNING with end=worker_error for non-TransportError exceptions."""
+        import os
+        import time
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.start_time = time.time() - 5.0
+        state.stream = True
+        state.ttfb = 1.2
+        state.bytes_sent = 64
+        state.status_code = 200
+        state.headers_sent = True
+        state.is_sse = False
+        state.error = RuntimeError("unexpected db error")
+        plugin._streaming_state = state
+        plugin.client = MagicMock()
+        plugin.logger = MagicMock()
+
+        plugin._finish_stream(state)
+
+        warning_calls = plugin.logger.warning.call_args_list
+        completion = [c for c in warning_calls if c.args and str(c.args[0]).startswith("← ")]
+        assert len(completion) == 1
+        msg = completion[0].args[0] % completion[0].args[1:]
+        assert "end=worker_error" in msg
+        assert "ttfb=1.2s" in msg
+        with pytest.raises(OSError):
+            os.close(pipe_r)
+        with pytest.raises(OSError):
+            os.close(pipe_w)
+
 
 class TestHandleRequestAsync:
     """Tests for the refactored handle_request() that starts a worker and returns."""
@@ -1278,8 +1361,8 @@ class TestHandleRequestAsync:
         info_calls = plugin.logger.info.call_args_list
         entry_calls = [c for c in info_calls if c.args and str(c.args[0]).startswith("→ ") and "stream" in str(c)]
         assert len(entry_calls) >= 1
-        entry_str = str(entry_calls[0])
-        assert "stream=True" in entry_str or "True" in str(entry_calls[0].args)
+        entry_msg = entry_calls[0].args[0] % entry_calls[0].args[1:]
+        assert "stream=True" in entry_msg
         # Clean up worker thread
         if plugin._streaming_state:
             plugin._reset_request_state()
