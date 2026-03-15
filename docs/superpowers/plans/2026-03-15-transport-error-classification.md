@@ -233,6 +233,7 @@
       self, plugin: FlowProxyWebServerPlugin
   ) -> None:
       """_finish_stream logs end=remote_closed when state.end_reason='remote_closed'."""
+      import os
       import time
 
       state, pipe_r, pipe_w = self._make_state_with_pipe()
@@ -266,6 +267,7 @@
       self, plugin: FlowProxyWebServerPlugin
   ) -> None:
       """_finish_stream logs end=connect_error when state.end_reason='connect_error'."""
+      import os
       import time
 
       state, pipe_r, pipe_w = self._make_state_with_pipe()
@@ -298,6 +300,7 @@
       self, plugin: FlowProxyWebServerPlugin
   ) -> None:
       """_finish_stream logs end=transport_error when state.end_reason='transport_error' (generic fallback)."""
+      import os
       import time
 
       state, pipe_r, pipe_w = self._make_state_with_pipe()
@@ -327,7 +330,7 @@
           os.close(pipe_w)
   ```
 
-  > Note: `os` and `pytest` are already imported at module level in the test file; no local import needed.
+  > Note: `pytest` is imported at module level in the test file. `os` is NOT — it is imported locally inside each test method body, following the established pattern in this file. The test bodies above include the required `import os` locally.
 
 - [ ] **Step 2: Also update `test_finish_stream_transport_error_emits_warning`**
 
