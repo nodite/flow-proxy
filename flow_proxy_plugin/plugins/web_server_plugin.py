@@ -193,14 +193,32 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 self._send_error(503, "Upstream error")
             elif state.is_sse:
                 self._send_sse_error_event()
-            # non-SSE + headers sent: silent close (unchanged)
-            log_func = self.logger.warning if state.headers_sent else self.logger.error
-            log_func("Stream ended with error: %s", state.error)
+            # non-SSE + headers sent: silent close
+
+            if isinstance(state.error, httpx.TransportError):
+                end = "transport_error"
+            else:
+                end = "worker_error"
+            status = str(state.status_code) if state.status_code else "---"
+            ttfb_str = f"{state.ttfb:.1f}s" if state.ttfb is not None else "-"
+            duration = time.time() - state.start_time
+            self.logger.warning(
+                "← %s [%s] stream=%s ttfb=%s duration=%.1fs bytes=%d end=%s",
+                status, state.config_name, state.stream,
+                ttfb_str, duration, state.bytes_sent, end,
+            )
         else:
+            status = str(state.status_code) if state.status_code else "---"
+            ttfb_str = f"{state.ttfb:.1f}s" if state.ttfb is not None else "-"
+            duration = time.time() - state.start_time
             log_func = (
                 self.logger.info if state.status_code < 400 else self.logger.warning
             )
-            log_func("← %d [%s]", state.status_code, state.config_name)
+            log_func(
+                "← %s [%s] stream=%s ttfb=%s duration=%.1fs bytes=%d end=ok",
+                status, state.config_name, state.stream,
+                ttfb_str, duration, state.bytes_sent,
+            )
         clear_request_context()
         # metrics hook (Phase 2): on_stream_finished(req_id, config_name, status_code, error)
 

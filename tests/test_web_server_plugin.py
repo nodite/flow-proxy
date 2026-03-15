@@ -976,6 +976,84 @@ class TestEventLoopHooks:
         assert b"503" in queued
 
 
+    def test_finish_stream_ok_emits_structured_completion_line(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_finish_stream emits '← 200 [cfg] stream=True ttfb=1.2s ... end=ok' at INFO.
+
+        _finish_stream closes both fds, so re-closing raises OSError.
+        """
+        import os
+        import time
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.start_time = time.time() - 5.0
+        state.stream = True
+        state.ttfb = 1.2
+        state.bytes_sent = 1024
+        state.status_code = 200
+        state.headers_sent = True
+        plugin._streaming_state = state
+        plugin.client = MagicMock()
+        plugin.logger = MagicMock()
+
+        plugin._finish_stream(state)
+
+        info_calls = plugin.logger.info.call_args_list
+        completion = [c for c in info_calls if c.args and str(c.args[0]).startswith("← ")]
+        assert len(completion) == 1
+        msg = completion[0].args[0] % completion[0].args[1:]
+        assert "← 200 [cfg]" in msg
+        assert "stream=True" in msg
+        assert "ttfb=1.2s" in msg
+        assert "bytes=1024" in msg
+        assert "end=ok" in msg
+        # _finish_stream closes both fds; re-closing must raise OSError
+        with pytest.raises(OSError):
+            os.close(pipe_r)
+        with pytest.raises(OSError):
+            os.close(pipe_w)
+
+    def test_finish_stream_transport_error_emits_warning(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_finish_stream emits WARNING with end=transport_error when state.error is TransportError.
+
+        state.headers_sent=False causes _send_error(503) to be called (client.queue mock absorbs it).
+        """
+        import os
+        import time
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.start_time = time.time() - 10.0
+        state.stream = False
+        state.ttfb = None
+        state.bytes_sent = 0
+        state.status_code = 0
+        state.headers_sent = False
+        state.error = httpx.RemoteProtocolError("peer closed")
+        plugin._streaming_state = state
+        plugin.client = MagicMock()
+        plugin.logger = MagicMock()
+
+        plugin._finish_stream(state)
+
+        warning_calls = plugin.logger.warning.call_args_list
+        completion = [c for c in warning_calls if c.args and str(c.args[0]).startswith("← ")]
+        assert len(completion) == 1
+        msg = completion[0].args[0] % completion[0].args[1:]
+        assert "end=transport_error" in msg
+        assert "ttfb=-" in msg
+        # Old "Stream ended with error" line must NOT appear
+        old = [c for c in warning_calls if c.args and "Stream ended with error" in str(c.args[0])]
+        assert old == []
+        # _finish_stream closes both fds; re-closing must raise OSError
+        with pytest.raises(OSError):
+            os.close(pipe_r)
+        with pytest.raises(OSError):
+            os.close(pipe_w)
+
+
 class TestHandleRequestAsync:
     """Tests for the refactored handle_request() that starts a worker and returns."""
 
