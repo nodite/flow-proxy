@@ -135,7 +135,7 @@ class StreamingState:
 
 | Item | Action |
 |------|--------|
-| `_log_stream_mode()` method | Deleted; logic inlined into `handle_request()` |
+| `_log_stream_mode()` method | Deleted; logic moved to a private `_parse_stream_field()` static method called from `handle_request()` |
 | `Received first SSE line from backend: N chars` | Deleted; TTFB captured in `state.ttfb` instead |
 | `Received first chunk from backend: N bytes` | Deleted; same as above |
 | `[JWT] Generated JWT token for <clientId>` (in `JWTGenerator`) | Level changed INFO → DEBUG |
@@ -150,7 +150,7 @@ Note: the current code emits "Stream ended with error" at `WARNING` when `state.
 
 **`handle_request()`**
 - Record `start_time = time.time()`
-- Parse `stream` from request body (inline, replaces `_log_stream_mode`; all indeterminate cases → `None`)
+- Parse `stream` from request body via `_parse_stream_field(request)` (replaces `_log_stream_mode`; all indeterminate cases → `None`)
 - Emit `→ METHOD path stream=X` at INFO
 - Pass `start_time` and `stream` into `StreamingState` constructor
 
