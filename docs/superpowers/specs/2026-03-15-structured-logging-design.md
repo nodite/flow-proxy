@@ -44,11 +44,11 @@ No format change. The existing `LoadBalancer` log line is unchanged (see Non-Goa
 
 ### JWT Line
 
-**Level changed to DEBUG.** The clientId is sensitive and adds noise at INFO in production. No change to content — only the log level changes. The line is emitted from `JWTGenerator` (non-Goals section: no changes to `JWTGenerator` file, but the call site in `base_plugin._get_config_and_token()` does not control this level — see Code Changes).
+**Level changed to DEBUG.** The clientId is sensitive and adds noise at INFO in production. No change to content — only the log level changes. The line is emitted from `JWTGenerator` (see Code Changes).
 
 ### Forward Line (`FWD`)
 
-Format change: prefix `Sending request to backend:` replaced with `→` for visual consistency with the entry line. Kept at INFO.
+Format change: prefix `Sending request to backend:` replaced with `→` for visual consistency with the entry line. The `with component_context("FWD"):` wrapper is retained so the `[FWD]` tag continues to appear. Kept at INFO.
 
 Current:
 ```
@@ -77,7 +77,7 @@ Is replaced by a single line that includes TTFB (time from request send to first
 
 `ttfb` is set inline in `_streaming_worker` at the point the first non-empty chunk or SSE line is received — i.e., inside the `iter_bytes()` / `iter_lines()` loop, before `chunk_queue.put(chunk)`. This is the earliest point at which TTFB is known. The value is also written to `state.ttfb` so `_finish_stream()` can include it in the completion line; this write happens before the sentinel is enqueued, so GIL ensures visibility to the main thread when it reads `state.ttfb` after `queue.get()` returns `None` — the same pattern already used for `state.error`.
 
-**Placement note:** the new backend response line replaces the current pre-loop log call (the one currently emitted when `_ResponseHeaders` is enqueued). It moves into the loop body and fires on the same iteration where `state.ttfb` is first set — before `chunk_queue.put(chunk)` on that first non-empty chunk/line. The `_ResponseHeaders` enqueue itself is retained unchanged; only the adjacent log call is relocated.
+**Placement note:** the new backend response line replaces the current pre-loop log call (the one currently emitted immediately before `_ResponseHeaders` is enqueued, at the point where `response.status_code` is first available). It moves into the loop body and fires on the same iteration where `state.ttfb` is first set — before `chunk_queue.put(chunk)` on that first non-empty chunk/line. The `_ResponseHeaders` enqueue itself is retained unchanged; only the adjacent log call is relocated. The values `response.status_code` and `response.headers.get("transfer-encoding")` remain accessible inside the loop because the `with http_client.stream(...) as response:` block spans the entire loop.
 
 ### Completion Line (`←`)
 
@@ -87,10 +87,12 @@ Emitted by `_finish_stream()` (normal/error path) or `_reset_request_state()` (c
 [87ac66][WS] ← 200 [flow-proxy-cit] stream=True  ttfb=6.3s  duration=186.2s bytes=12480 end=ok
 [a5d612][WS] ← 504 [flow-proxy-apac] stream=False ttfb=181.0s duration=181.0s bytes=132   end=ok
 [707150][WS] ← 200 [flow-proxy-cit] stream=True  ttfb=6.1s  duration=187.4s bytes=8192   end=transport_error
-[xxx][WS]    ← --- [flow-proxy-cit] stream=True  ttfb=6.3s  duration=12.1s  bytes=4096   end=client_disconnected
+[xxx][WS]    ← --- [flow-proxy-cit] stream=True  ttfb=-      duration=12.1s  bytes=0      end=client_disconnected
 ```
 
-Status is `---` when `_reset_request_state()` is called before any backend status code was received (i.e., `state.status_code == 0`). `ttfb` is rendered as `-` when `state.ttfb is None` (backend disconnect or client disconnect before the first byte arrived). Example: `ttfb=-`.
+**Status token:** `state.status_code` is used when non-zero; `"---"` is used when `state.status_code == 0` (backend response not yet received). This applies in both `_finish_stream()` and `_reset_request_state()`. The format placeholder must be `%s` (not `%d`) to handle both the integer and string cases.
+
+**`ttfb` token:** rendered as `"%.1fs" % state.ttfb` when set, or `"-"` when `state.ttfb is None` (first byte never arrived before error or disconnect).
 
 **`end=` values:**
 
@@ -114,17 +116,20 @@ Status is `---` when `_reset_request_state()` is called before any backend statu
 
 ### StreamingState New Fields
 
+`start_time` and `stream` are required fields (no default). They are appended after the existing required field `config_name` and before the existing defaulted fields (`headers_sent`, `is_sse`, `status_code`, `error`). This preserves the `@dataclass` rule that all fields without defaults must precede all fields with defaults.
+
 ```python
 @dataclass
 class StreamingState:
-    # existing fields unchanged ...
-    start_time: float           # set in handle_request() via time.time()
-    stream: bool | None         # parsed from request body; None if indeterminate
+    # existing required fields (pipe_r, pipe_w, chunk_queue, thread, cancel, req_id, config_name) unchanged
+    start_time: float           # appended after config_name; set in handle_request()
+    stream: bool | None         # appended after start_time; parsed from request body; None if indeterminate
+    # existing defaulted fields (headers_sent, is_sse, status_code, error) unchanged
     ttfb: float | None = None   # set by worker on first chunk/line
     bytes_sent: int = 0         # incremented in read_from_descriptors() main thread only
 ```
 
-`bytes_sent` is only written from the main thread (`read_from_descriptors`), so no locking is needed.
+`bytes_sent` is only written from the main thread (`read_from_descriptors`), so no locking is needed. `ttfb` and `bytes_sent` are appended after the existing defaulted fields.
 
 ### Deletions and Level Changes
 
@@ -136,8 +141,10 @@ class StreamingState:
 | `[JWT] Generated JWT token for <clientId>` (in `JWTGenerator`) | Level changed INFO → DEBUG |
 | `Stream ended with error: ...` WARNING **and** ERROR in `_finish_stream()` | Both deleted; end reason folded into `end=` field on completion line |
 | `Stream canceled (client disconnect)...` INFO in `_reset_request_state()` | Deleted; replaced by structured completion line |
+| `Transport error — marking httpx client dirty: %s` ERROR in `_streaming_worker()` | Retained at WARNING; provides specific error message detail that `end=transport_error` alone does not capture |
+| `Worker error: %s` ERROR in `_streaming_worker()` | Retained at WARNING; provides specific error message detail that `end=worker_error` alone does not capture |
 
-Note: the current code emits the "Stream ended with error" line at `WARNING` when `state.headers_sent` is True, and at `ERROR` when `state.headers_sent` is False. Both variants are deleted and replaced by the completion line's `end=` field and log level table above.
+Note: the current code emits "Stream ended with error" at `WARNING` when `state.headers_sent` is True, and at `ERROR` when `state.headers_sent` is False. Both variants are deleted and replaced by the completion line's `end=` field and log level table above. The worker-side error lines (`Transport error` and `Worker error`) are intentionally retained because they capture the specific error message; the completion line captures the category and timing. Both are at WARNING, so each error appears twice in the log: once with the message detail from the worker thread, once as the structured summary from the main thread.
 
 ### Per-method responsibilities
 
@@ -145,11 +152,12 @@ Note: the current code emits the "Stream ended with error" line at `WARNING` whe
 - Record `start_time = time.time()`
 - Parse `stream` from request body (inline, replaces `_log_stream_mode`; all indeterminate cases → `None`)
 - Emit `→ METHOD path stream=X` at INFO
-- Pass `start_time` and `stream` into `StreamingState`
+- Pass `start_time` and `stream` into `StreamingState` constructor
 
 **`_streaming_worker()`**
 - On first non-empty chunk/line (inside `iter_bytes()` / `iter_lines()` loop, before `chunk_queue.put(chunk)`): set `state.ttfb = time.time() - state.start_time` and emit the `backend=STATUS transfer=X ttfb=Xs` line
 - Remove `first_logged` flag and associated log calls
+- Retain `"Transport error — marking httpx client dirty: %s"` and `"Worker error: %s"` lines; change both from ERROR to WARNING
 
 **`read_from_descriptors()`**
 - On `bytes` item: `state.bytes_sent += len(item)` before `self.client.queue()`. Response header bytes (queued from `_send_response_headers_from()`) are intentionally excluded — `bytes_sent` counts payload bytes only.
@@ -157,19 +165,22 @@ Note: the current code emits the "Stream ended with error" line at `WARNING` whe
 **`_finish_stream()`**
 - Compute `duration = time.time() - state.start_time`
 - Determine `end` from `state.error` type
-- Emit single structured `← STATUS [config] stream=X ttfb=Xs duration=Xs bytes=N end=X` line at level per table above
+- Render status as `str(state.status_code) if state.status_code else "---"`
+- Render ttfb as `"%.1fs" % state.ttfb if state.ttfb is not None else "-"`
+- Emit single structured `← %s [%s] stream=%s ttfb=%s duration=%.1fs bytes=%d end=%s` line at level per table above, using `%s` for the status token
 - Delete both the WARNING and ERROR `Stream ended with error: ...` log calls
 
 **`_reset_request_state()`**
 - Only emit completion line when `state is not None` (the existing `if state is None: return` guard at the top of the method already handles the None case)
 - Compute `duration = time.time() - state.start_time`
-- Use `state.status_code or "---"` as the status token
-- Emit `← --- [config] stream=X ttfb=Xs duration=Xs bytes=N end=client_disconnected` at INFO
+- Render status as `str(state.status_code) if state.status_code else "---"`
+- Render ttfb as `"%.1fs" % state.ttfb if state.ttfb is not None else "-"`
+- Emit completion line at INFO using `%s` for the status token
 - Delete the current `Stream canceled (client disconnect)...` line
 
 ### FWD log line format change
 
-In `handle_request()`, replace:
+In `handle_request()`, within the existing `with component_context("FWD"):` block, replace:
 ```python
 self.logger.info("Sending request to backend: %s", target_url)
 ```
@@ -180,7 +191,7 @@ self.logger.info("→ %s", target_url)
 
 ### JWT log level change
 
-In `JWTGenerator.generate_token()`, change:
+In `JWTGenerator`, change:
 ```python
 self.logger.info(f"Generated JWT token for {client_id}")
 ```
@@ -194,14 +205,15 @@ Note: this also fixes the f-string to `%`-style for consistency with the logging
 
 Two targeted changes:
 
-1. **Reformat the existing post-auth summary log line.** The current line fires in the success path after `_get_config_and_token()` returns (after `modify_request_headers` succeeds). It stays in the same position — only the format changes. Current: `"Request processed with config '%s' → %s"`. New: `"→ %s %s [%s]"` (method, path, config_name). Example: `[xxx][PROXY] → POST /v1/messages?beta=true [flow-proxy-cit]`.
+1. **Reformat the existing post-auth summary log line.** The current line fires in the success path after `modify_request_headers` succeeds, at the same position as today. It stays there — only the format changes. `method` is obtained via `self._decode_bytes(request.method) if request.method else "GET"` (mirroring the web server plugin pattern); `path` is obtained via `self._decode_bytes(request.path) if request.path else "unknown"` (the decoded path, not the full `target_url`). Current format: `"Request processed with config '%s' → %s"` (config_name, target_url). New format: `"→ %s %s [%s]"` (method, path, config_name). Example: `[xxx][PROXY] → POST /v1/messages?beta=true [flow-proxy-cit]`.
+
 2. **JWT log level**: already handled by the `JWTGenerator` change above.
 
 `on_upstream_connection_close` log line (`Upstream connection closed`) is kept unchanged — forward proxy mode lacks duration/bytes tracking.
 
 ## Time Format
 
-`ttfb` and `duration` use one decimal place (`%.1f`s). Example: `ttfb=6.3s duration=186.2s`.
+`ttfb` and `duration` use one decimal place (`%.1f`s). Example: `ttfb=6.3s duration=186.2s`. When `ttfb` is unavailable, the literal string `-` is used (no `s` suffix).
 
 ## Non-Goals
 
