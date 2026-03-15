@@ -173,6 +173,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 return True  # signal proxy.py to close connection
 
             else:  # bytes chunk
+                state.bytes_sent += len(item)
                 self.client.queue(memoryview(item))
 
         return False

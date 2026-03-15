@@ -729,6 +729,32 @@ class TestEventLoopHooks:
             os.close(pipe_r)
             os.close(pipe_w)
 
+    def test_read_from_descriptors_tracks_bytes_sent(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """bytes_sent accumulates payload bytes; header bytes are excluded."""
+        import asyncio
+        import os
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        plugin._streaming_state = state
+        plugin.client = MagicMock()
+
+        # Pre-load queue: headers item then two byte chunks
+        state.chunk_queue.put(_ResponseHeaders(200, "OK", {}, False))
+        state.chunk_queue.put(b"hello")
+        state.chunk_queue.put(b"world!")
+
+        os.write(pipe_w, b"\x00")  # trigger read
+        try:
+            asyncio.run(plugin.read_from_descriptors([pipe_r]))
+        finally:
+            plugin._streaming_state = None
+            os.close(pipe_r)
+            os.close(pipe_w)
+
+        assert state.bytes_sent == len(b"hello") + len(b"world!")  # 11
+
     def test_read_from_descriptors_returns_true_on_sentinel(
         self, plugin: FlowProxyWebServerPlugin
     ) -> None:
