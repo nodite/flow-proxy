@@ -6,6 +6,7 @@ import os
 import queue
 import secrets
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -240,7 +241,9 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
         req_id = secrets.token_hex(3)
         set_request_context(req_id, "WS")
-        self.logger.info("→ %s %s", method, path)
+        start_time = time.time()
+        stream = self._parse_stream_field(request)
+        self.logger.info("→ %s %s stream=%s", method, path, stream)
 
         try:
             _, config_name, jwt_token = self._get_config_and_token()
@@ -264,8 +267,6 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         if self.logger.isEnabledFor(logging.DEBUG):
             self._log_request_details(method, path, target_url, headers, body)
 
-        self._log_stream_mode(body)
-
         with component_context("FWD"):
             self.logger.info("Sending request to backend: %s", target_url)
 
@@ -279,8 +280,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 req_id=req_id,
                 config_name=config_name,
                 thread=None,
-                start_time=0.0,
-                stream=None,
+                start_time=start_time,
+                stream=stream,
             )
             state.thread = threading.Thread(
                 target=self._streaming_worker,
@@ -367,17 +368,25 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
         return body
 
-    def _log_stream_mode(self, body: bytes | None) -> None:
-        """Log whether the request uses streaming mode. Helps diagnose 504 patterns."""
+    @staticmethod
+    def _parse_stream_field(request: "HttpParser") -> "bool | None":
+        """Parse the 'stream' field from the JSON request body.
+
+        Returns True/False if the field is present and parseable, None otherwise.
+        All indeterminate cases (absent body, non-JSON, missing field) return None.
+        """
+        body = None
+        if hasattr(request, "body") and request.body:
+            body = request.body
+        elif hasattr(request, "buffer") and request.buffer:
+            body = bytes(request.buffer)
         if not body:
-            self.logger.info("stream=<no body>")
-            return
+            return None
         try:
             parsed = json.loads(body)
-            stream = parsed.get("stream")
-            self.logger.info("stream=%s", stream)
+            return parsed.get("stream")
         except (json.JSONDecodeError, UnicodeDecodeError):
-            self.logger.info("stream=<parse error>")
+            return None
 
     def _log_request_details(  # pylint: disable=too-many-positional-arguments
         self,

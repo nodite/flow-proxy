@@ -1047,3 +1047,60 @@ class TestHandleRequestAsync:
         # Clean up
         if plugin._streaming_state:
             plugin._reset_request_state()
+
+    def test_entry_log_includes_stream_true(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """handle_request emits '→ POST /path stream=True' when body has stream=true."""
+        request = MagicMock(spec=HttpParser)
+        request.method = b"POST"
+        request.path = b"/v1/messages"
+        request.body = b'{"stream": true}'
+        request.buffer = None
+        request.headers = {}
+        mock_svc.request_filter.find_matching_rule.return_value = None
+        plugin.logger = MagicMock()
+
+        with (
+            patch.object(ProcessServices, "get", return_value=mock_svc),
+            patch.object(plugin, "_get_config_and_token", return_value=({"clientId": "cid"}, "test-cfg", "tok")),
+        ):
+            plugin.handle_request(request)
+
+        # First INFO call is the entry line
+        info_calls = plugin.logger.info.call_args_list
+        entry_calls = [c for c in info_calls if c.args and str(c.args[0]).startswith("→ ") and "stream" in str(c)]
+        assert len(entry_calls) >= 1
+        entry_str = str(entry_calls[0])
+        assert "stream=True" in entry_str or "True" in str(entry_calls[0].args)
+        # Clean up worker thread
+        if plugin._streaming_state:
+            plugin._reset_request_state()
+
+    def test_entry_log_stream_none_when_no_body(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """handle_request emits 'stream=None' when body is absent."""
+        request = MagicMock(spec=HttpParser)
+        request.method = b"GET"
+        request.path = b"/v1/models"
+        request.body = None
+        request.buffer = None
+        request.headers = {}
+        mock_svc.request_filter.find_matching_rule.return_value = None
+        plugin.logger = MagicMock()
+
+        with (
+            patch.object(ProcessServices, "get", return_value=mock_svc),
+            patch.object(plugin, "_get_config_and_token", return_value=({"clientId": "cid"}, "test-cfg", "tok")),
+        ):
+            plugin.handle_request(request)
+
+        info_calls = plugin.logger.info.call_args_list
+        entry_calls = [c for c in info_calls if c.args and str(c.args[0]).startswith("→ ") and "stream" in str(c)]
+        assert len(entry_calls) >= 1
+        # stream arg should be None
+        first_entry = entry_calls[0]
+        assert first_entry.args[-1] is None  # last positional arg to logger.info is stream value
+        if plugin._streaming_state:
+            plugin._reset_request_state()
