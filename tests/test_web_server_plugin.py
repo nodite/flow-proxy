@@ -976,6 +976,47 @@ class TestEventLoopHooks:
         assert b"503" in queued
 
 
+    def test_reset_request_state_emits_client_disconnected_line(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_reset_request_state emits '← 200 [cfg] ... end=client_disconnected' at INFO."""
+        import os
+        import threading
+        import time
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.start_time = time.time() - 8.0
+        state.stream = True
+        state.ttfb = 2.0
+        state.bytes_sent = 512
+        state.status_code = 200
+        plugin._streaming_state = state
+        plugin.logger = MagicMock()
+
+        # Assign a dummy thread so join() doesn't fail
+        state.thread = threading.Thread(target=lambda: None)
+        state.thread.start()
+
+        plugin._reset_request_state()
+
+        info_calls = plugin.logger.info.call_args_list
+        completion = [c for c in info_calls if c.args and str(c.args[0]).startswith("← ")]
+        assert len(completion) == 1
+        msg = completion[0].args[0] % completion[0].args[1:]
+        assert "← 200 [cfg]" in msg
+        assert "stream=True" in msg
+        assert "ttfb=2.0s" in msg
+        assert "bytes=512" in msg
+        assert "end=client_disconnected" in msg
+        # Old freeform line must NOT appear
+        old = [c for c in info_calls if c.args and "Stream canceled" in str(c.args[0])]
+        assert old == []
+        # _reset_request_state closes both fds; re-closing must raise OSError
+        with pytest.raises(OSError):
+            os.close(pipe_r)
+        with pytest.raises(OSError):
+            os.close(pipe_w)
+
     def test_finish_stream_ok_emits_structured_completion_line(
         self, plugin: FlowProxyWebServerPlugin
     ) -> None:

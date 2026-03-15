@@ -228,9 +228,6 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         if state is None:
             return
         set_request_context(state.req_id, "WS")
-        self.logger.info(
-            "Stream canceled (client disconnect), no ← 200 [%s]", state.config_name
-        )
         state.cancel.set()
         if state.thread is not None:
             state.thread.join(timeout=2.0)
@@ -242,6 +239,15 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             except OSError:
                 pass
         self._streaming_state = None
+
+        status = str(state.status_code) if state.status_code else "---"
+        ttfb_str = f"{state.ttfb:.1f}s" if state.ttfb is not None else "-"
+        duration = time.time() - state.start_time
+        self.logger.info(
+            "← %s [%s] stream=%s ttfb=%s duration=%.1fs bytes=%d end=client_disconnected",
+            status, state.config_name, state.stream,
+            ttfb_str, duration, state.bytes_sent,
+        )
         clear_request_context()
 
     def routes(self) -> list[tuple[int, str]]:
