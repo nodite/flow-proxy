@@ -66,7 +66,7 @@ class JWTGenerator:
         with self._lock:
             self._cache[client_id] = (token, now + self._ttl)
 
-        self.logger.info(f"Generated JWT token for {client_id}")
+        self.logger.debug("Generated JWT token for %s", client_id)
         return token
 
     def create_jwt_payload(self, config: dict[str, str]) -> dict[str, Any]:

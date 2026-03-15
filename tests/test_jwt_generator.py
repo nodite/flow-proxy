@@ -291,3 +291,20 @@ class TestJWTGenerator:
         token = jwt.encode(incomplete_payload, "secret", algorithm="HS256")
 
         assert not generator.validate_token(token, "secret")
+
+    def test_generate_token_does_not_log_at_info(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """JWT generation does not emit INFO log (clientId should not appear at INFO level).
+
+        JWTGenerator uses jwt.encode directly — no HTTP calls. No patching needed.
+        Add this to the existing TestJWTGenerator class which already calls
+        setup_method to clear cache before each test.
+        """
+        import logging
+        gen = JWTGenerator()
+        config = {"clientId": "test-id", "clientSecret": "secret", "tenant": "tenant"}
+        with caplog.at_level(logging.INFO):
+            gen.generate_token(config)
+        info_msgs = [r for r in caplog.records if r.levelno == logging.INFO and "test-id" in r.message]
+        assert info_msgs == []
