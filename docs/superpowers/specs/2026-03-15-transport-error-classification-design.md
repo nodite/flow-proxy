@@ -35,7 +35,7 @@ WARNING [f733c1][WS] ← 200 [flow-proxy-apac] stream=True ttfb=3.9s duration=18
 
 - Retry logic for streaming requests (explicitly excluded in the streaming robustness spec).
 - Changing `mark_http_client_dirty()` behavior or callers outside the streaming worker.
-- Changing log levels for TransportError (all remain WARNING).
+- Changing log levels for TransportError. All three subtypes (`RemoteProtocolError`, `ConnectError`, generic `TransportError`) retain the existing WARNING level for both the worker log line and the `_finish_stream()` completion line, consistent with the current behavior and independent of whether headers have been sent. (The robustness spec §4.1 log table distinguishes ERROR vs WARNING by `headers_sent` for some events, but the streaming-completion log line has always been WARNING regardless; this spec does not change that.)
 
 ---
 
@@ -43,12 +43,16 @@ WARNING [f733c1][WS] ← 200 [flow-proxy-apac] stream=True ttfb=3.9s duration=18
 
 ### 4.1 `StreamingState` — New Field
 
-Add `end_reason` to `StreamingState` (default `"transport_error"`):
+Add `end_reason` to `StreamingState` with a default of `""` (empty string):
 
 ```python
-end_reason: str = "transport_error"
-# Set by worker on TransportError; read by _finish_stream() for the end= log field.
+end_reason: str = ""
+# Written by worker before putting the None sentinel (same GIL write-before-sentinel
+# / read-after-sentinel invariant as state.error and state.ttfb).
+# Only valid when state.error is an httpx.TransportError; never read otherwise.
 ```
+
+The default is `""` rather than `"transport_error"` to make it clear the field has not been set; reading it without a prior TransportError indicates a logic error. The three-layer except clauses in §4.2 always set it explicitly before putting the sentinel.
 
 ### 4.2 Streaming Worker — Three-Layer Exception Handling
 
@@ -109,6 +113,8 @@ This design updates the streaming worker error-handling contract originally spec
 
 **This clause is superseded.** The updated contract is: on `TransportError` in the streaming worker, do not call `mark_http_client_dirty()`; classify the error by subtype and set `state.end_reason` accordingly.
 
+Additionally, the robustness spec §4.1 log event table row describing the worker TransportError message as `"Transport error — marking httpx client dirty: {e}"` is stale. The new worker log messages are as specified in §4.2 of this document (`"Remote closed stream: {e}"`, `"Connect error: {e}"`, `"Transport error: {e}"`).
+
 All other clauses of §3.3 (failover scope, error paths, client-disconnect handling) remain in effect.
 
 ---
@@ -128,6 +134,7 @@ Existing tests that assert `mark_http_client_dirty()` is called on `TransportErr
 | `test_worker_transport_error_no_dirty` | Generic `TransportError` → `end_reason="transport_error"`, `mark_http_client_dirty()` not called |
 | `test_finish_stream_end_reason_remote_closed` | `_finish_stream()` logs `end=remote_closed` when `state.end_reason="remote_closed"` |
 | `test_finish_stream_end_reason_connect_error` | `_finish_stream()` logs `end=connect_error` when `state.end_reason="connect_error"` |
+| `test_finish_stream_end_reason_transport_error` | `_finish_stream()` logs `end=transport_error` when `state.end_reason="transport_error"` (generic fallback path) |
 
 ### 6.3 Unchanged Tests
 
@@ -141,4 +148,4 @@ Existing tests that assert `mark_http_client_dirty()` is called on `TransportErr
 | File | Change |
 |---|---|
 | `flow_proxy_plugin/plugins/web_server_plugin.py` | `StreamingState`: add `end_reason` field. Worker: replace single `except httpx.TransportError` with three-layer except, remove `mark_http_client_dirty()`. `_finish_stream()`: use `state.end_reason`. |
-| `tests/test_web_server_plugin.py` | Update existing TransportError tests; add 5 new tests per §6.2. |
+| `tests/test_web_server_plugin.py` | Update existing TransportError tests; add 6 new tests per §6.2. |
