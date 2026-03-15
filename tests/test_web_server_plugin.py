@@ -1311,3 +1311,31 @@ class TestHandleRequestAsync:
         assert first_entry.args[-1] is None  # last positional arg to logger.info is stream value
         if plugin._streaming_state:
             plugin._reset_request_state()
+
+    def test_fwd_log_uses_arrow_format(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """handle_request emits '→ https://...' for the FWD line, not 'Sending request to backend:'."""
+        request = MagicMock(spec=HttpParser)
+        request.method = b"POST"
+        request.path = b"/v1/messages"
+        request.body = b'{}'
+        request.buffer = None
+        request.headers = {}
+        mock_svc.request_filter.find_matching_rule.return_value = None
+        plugin.logger = MagicMock()
+
+        with (
+            patch.object(ProcessServices, "get", return_value=mock_svc),
+            patch.object(plugin, "_get_config_and_token", return_value=({"clientId": "cid"}, "test-cfg", "tok")),
+        ):
+            plugin.handle_request(request)
+
+        info_calls = plugin.logger.info.call_args_list
+        fwd_calls = [c for c in info_calls if c.args and "flow.ciandt.com" in str(c)]
+        assert len(fwd_calls) == 1
+        assert fwd_calls[0].args[0] == "→ %s"
+        old_calls = [c for c in info_calls if c.args and "Sending request to backend:" in str(c.args[0])]
+        assert old_calls == []
+        if plugin._streaming_state:
+            plugin._reset_request_state()

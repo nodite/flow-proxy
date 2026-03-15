@@ -293,7 +293,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             self._log_request_details(method, path, target_url, headers, body)
 
         with component_context("FWD"):
-            self.logger.info("Sending request to backend: %s", target_url)
+            self.logger.info("→ %s", target_url)
 
         pipe_r, pipe_w = os.pipe()
         try:
