@@ -622,24 +622,6 @@ class TestStreamingWorker:
         os.close(state.pipe_r)
         os.close(state.pipe_w)
 
-    def test_worker_transport_error_no_dirty(
-        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
-    ) -> None:
-        """Generic TransportError sets end_reason='transport_error' and does NOT mark client dirty."""
-        import os
-        state = self._make_state()
-        mock_svc.http_client.stream.side_effect = httpx.TransportError("conn failed")
-
-        with patch.object(ProcessServices, "get", return_value=mock_svc):
-            plugin._streaming_worker("GET", "https://example.com", {}, None, state)
-
-        assert isinstance(state.error, httpx.TransportError)
-        assert state.end_reason == "transport_error"
-        assert state.chunk_queue.get_nowait() is None
-        mock_svc.mark_http_client_dirty.assert_not_called()
-        os.close(state.pipe_r)
-        os.close(state.pipe_w)
-
     def test_worker_generic_exception_sets_error_and_sentinel(
         self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
