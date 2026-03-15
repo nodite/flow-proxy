@@ -162,7 +162,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
             elif item is None:  # sentinel — stream ended or errored
                 self._finish_stream(state)
-                return True     # signal proxy.py to close connection
+                return True  # signal proxy.py to close connection
 
             else:  # bytes chunk
                 self.client.queue(memoryview(item))
@@ -256,6 +256,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
         if self.logger.isEnabledFor(logging.DEBUG):
             self._log_request_details(method, path, target_url, headers, body)
+
+        self._log_stream_mode(body)
 
         with component_context("FWD"):
             self.logger.info("Sending request to backend: %s", target_url)
@@ -356,6 +358,18 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
         return body
 
+    def _log_stream_mode(self, body: bytes | None) -> None:
+        """Log whether the request uses streaming mode. Helps diagnose 504 patterns."""
+        if not body:
+            self.logger.info("stream=<no body>")
+            return
+        try:
+            parsed = json.loads(body)
+            stream = parsed.get("stream")
+            self.logger.info("stream=%s", stream)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.logger.info("stream=<parse error>")
+
     def _log_request_details(  # pylint: disable=too-many-positional-arguments
         self,
         method: str,
@@ -448,6 +462,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 headers=headers,
                 content=body,
                 timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
+                follow_redirects=True,
             ) as response:
                 is_sse = "text/event-stream" in response.headers.get("content-type", "")
                 self.logger.info(
@@ -479,7 +494,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                         if chunk:
                             if not first_logged:
                                 self.logger.info(
-                                    "Received first SSE line from backend: %d chars", len(line)
+                                    "Received first SSE line from backend: %d chars",
+                                    len(line),
                                 )
                                 first_logged = True
                             state.chunk_queue.put(chunk)
@@ -495,7 +511,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                             continue
                         if not first_logged:
                             self.logger.info(
-                                "Received first chunk from backend: %d bytes", len(chunk)
+                                "Received first chunk from backend: %d bytes",
+                                len(chunk),
                             )
                             first_logged = True
                         state.chunk_queue.put(chunk)
@@ -529,10 +546,12 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
         Called from _finish_stream (main thread only).
         Thread-safety: self.client.queue() is only called from the main thread.
         """
-        payload = json.dumps({
-            "type": "error",
-            "error": {"type": "api_error", "message": "Upstream connection lost"},
-        })
+        payload = json.dumps(
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": "Upstream connection lost"},
+            }
+        )
         event = f"event: error\ndata: {payload}\n\n".encode()
         self.client.queue(memoryview(event))
 

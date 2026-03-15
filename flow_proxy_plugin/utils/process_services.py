@@ -53,7 +53,7 @@ class ProcessServices:  # pylint: disable=too-many-instance-attributes
         self._client_lock = threading.Lock()
         self.http_client: httpx.Client | None = httpx.Client(
             timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
-            follow_redirects=False,
+            follow_redirects=True,
         )
         self.logger.info(
             "ProcessServices initialized with %d configs", len(self.configs)
@@ -69,8 +69,10 @@ class ProcessServices:  # pylint: disable=too-many-instance-attributes
             with self._client_lock:
                 if self.http_client is None:
                     self.http_client = httpx.Client(
-                        timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
-                        follow_redirects=False,
+                        timeout=httpx.Timeout(
+                            connect=30.0, read=600.0, write=30.0, pool=30.0
+                        ),
+                        follow_redirects=True,
                     )
                     self.logger.info("httpx.Client rebuilt after transport error")
         return self.http_client
