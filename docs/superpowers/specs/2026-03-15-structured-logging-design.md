@@ -77,6 +77,8 @@ Is replaced by a single line that includes TTFB (time from request send to first
 
 `ttfb` is set inline in `_streaming_worker` at the point the first non-empty chunk or SSE line is received — i.e., inside the `iter_bytes()` / `iter_lines()` loop, before `chunk_queue.put(chunk)`. This is the earliest point at which TTFB is known. The value is also written to `state.ttfb` so `_finish_stream()` can include it in the completion line; this write happens before the sentinel is enqueued, so GIL ensures visibility to the main thread when it reads `state.ttfb` after `queue.get()` returns `None` — the same pattern already used for `state.error`.
 
+**Placement note:** the new backend response line replaces the current pre-loop log call (the one currently emitted when `_ResponseHeaders` is enqueued). It moves into the loop body and fires on the same iteration where `state.ttfb` is first set — before `chunk_queue.put(chunk)` on that first non-empty chunk/line. The `_ResponseHeaders` enqueue itself is retained unchanged; only the adjacent log call is relocated.
+
 ### Completion Line (`←`)
 
 Emitted by `_finish_stream()` (normal/error path) or `_reset_request_state()` (client disconnect mid-stream). Only emitted when `self._streaming_state is not None` — if the state was never set (early-exit before streaming started), no completion line is emitted.
