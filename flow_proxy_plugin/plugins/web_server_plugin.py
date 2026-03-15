@@ -49,6 +49,9 @@ class StreamingState:  # pylint: disable=too-many-instance-attributes
     Thread-safety: self.client is ONLY touched by the main thread.
     state.error is written by worker before queue.put(None) and read by main
     thread after queue.get() returns None — GIL guarantees visibility in CPython.
+    Same GIL guarantee applies to state.ttfb (written by worker before sentinel,
+    read by main thread after sentinel is dequeued).
+    state.bytes_sent is written only from the main thread (read_from_descriptors).
     """
 
     pipe_r: int  # registered with selector as readable fd
@@ -58,10 +61,14 @@ class StreamingState:  # pylint: disable=too-many-instance-attributes
     cancel: threading.Event  # set by _reset_request_state() on disconnect
     req_id: str  # for log context
     config_name: str  # for final access log line
+    start_time: float  # set in handle_request() via time.time()
+    stream: bool | None  # parsed from request body; None if indeterminate
     headers_sent: bool = False  # guards error-response logic
     is_sse: bool = False  # set by read_from_descriptors when _ResponseHeaders processed
     status_code: int = 0  # stored after _ResponseHeaders item is processed
     error: BaseException | None = None  # set by worker on exception
+    ttfb: float | None = None  # set by worker on first chunk/line
+    bytes_sent: int = 0  # incremented in read_from_descriptors() main thread only
 
 
 class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
@@ -272,6 +279,8 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 req_id=req_id,
                 config_name=config_name,
                 thread=None,
+                start_time=0.0,
+                stream=None,
             )
             state.thread = threading.Thread(
                 target=self._streaming_worker,

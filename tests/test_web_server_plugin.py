@@ -34,10 +34,40 @@ class TestDataStructures:
                 cancel=threading.Event(),
                 req_id="abc123",
                 config_name="test-config",
+                start_time=0.0,
+                stream=None,
             )
             assert state.headers_sent is False
             assert state.status_code == 0
             assert state.error is None
+            assert state.ttfb is None        # new
+            assert state.bytes_sent == 0     # new
+        finally:
+            os.close(pipe_r)
+            os.close(pipe_w)
+
+    def test_streaming_state_new_fields(self) -> None:
+        import os
+        import threading
+        import time
+
+        pipe_r, pipe_w = os.pipe()
+        try:
+            t = time.time()
+            state = StreamingState(
+                pipe_r=pipe_r, pipe_w=pipe_w,
+                chunk_queue=queue.Queue(),
+                thread=None,
+                cancel=threading.Event(),
+                req_id="abc123",
+                config_name="test-config",
+                start_time=t,
+                stream=True,
+            )
+            assert state.start_time == t
+            assert state.stream is True
+            assert state.ttfb is None
+            assert state.bytes_sent == 0
         finally:
             os.close(pipe_r)
             os.close(pipe_w)
@@ -387,6 +417,8 @@ class TestStreamingWorker:
             cancel=threading.Event(),
             req_id="test01",
             config_name="cfg",
+            start_time=0.0,
+            stream=None,
         )
 
     def test_worker_puts_headers_then_chunks_then_sentinel(
@@ -534,6 +566,8 @@ class TestEventLoopHooks:
             cancel=threading.Event(),
             req_id="abc",
             config_name="cfg",
+            start_time=0.0,
+            stream=None,
         )
         return state, pipe_r, pipe_w
 
