@@ -14,5 +14,9 @@
       "WebFetch(domain:docs.litellm.ai)",
       "WebFetch(domain:pypi.org)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "playwright"
+  ],
+  "enableAllProjectMcpServers": true
 }
