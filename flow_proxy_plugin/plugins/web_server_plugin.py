@@ -53,6 +53,8 @@ class StreamingState:  # pylint: disable=too-many-instance-attributes
     Same GIL guarantee applies to state.ttfb (written by worker before sentinel,
     read by main thread after sentinel is dequeued).
     state.bytes_sent is written only from the main thread (read_from_descriptors).
+    state.end_reason is written by worker before queue.put(None) — same GIL guarantee
+    as state.error; only valid when state.error is an httpx.TransportError.
     """
 
     pipe_r: int  # registered with selector as readable fd
@@ -70,6 +72,7 @@ class StreamingState:  # pylint: disable=too-many-instance-attributes
     error: BaseException | None = None  # set by worker on exception
     ttfb: float | None = None  # set by worker on first chunk/line
     bytes_sent: int = 0  # incremented in read_from_descriptors() main thread only
+    end_reason: str = ""  # written by worker before sentinel (same GIL invariant as error/ttfb); only valid when error is httpx.TransportError
 
 
 class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
@@ -196,7 +199,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
             # non-SSE + headers sent: silent close
 
             if isinstance(state.error, httpx.TransportError):
-                end = "transport_error"
+                end = state.end_reason  # "remote_closed" | "connect_error" | "transport_error"
             else:
                 end = "worker_error"
             status = str(state.status_code) if state.status_code else "---"
@@ -481,6 +484,34 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
 
         self.client.queue(memoryview(b"\r\n"))
 
+    def _maybe_record_ttfb(
+        self,
+        state: StreamingState,
+        response: "httpx.Response",
+    ) -> None:
+        """Record TTFB on the first chunk if not already set."""
+        if state.ttfb is None:
+            state.ttfb = time.time() - state.start_time
+            transfer = response.headers.get("transfer-encoding", "none")
+            self.logger.info(
+                "backend=%d transfer=%s ttfb=%.1fs",
+                response.status_code,
+                transfer,
+                state.ttfb,
+            )
+
+    def _record_transport_error(
+        self,
+        state: StreamingState,
+        exc: httpx.TransportError,
+        reason: str,
+        label: str,
+    ) -> None:
+        """Record a transport-layer error into StreamingState and emit a warning."""
+        state.error = exc
+        state.end_reason = reason
+        self.logger.warning("%s: %s", label, exc)
+
     def _streaming_worker(  # pylint: disable=too-many-positional-arguments
         self,
         method: str,
@@ -529,15 +560,7 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                             break
                         chunk = self._encode_sse_line(line)
                         if chunk:
-                            if state.ttfb is None:
-                                state.ttfb = time.time() - state.start_time
-                                transfer = response.headers.get("transfer-encoding", "none")
-                                self.logger.info(
-                                    "backend=%d transfer=%s ttfb=%.1fs",
-                                    response.status_code,
-                                    transfer,
-                                    state.ttfb,
-                                )
+                            self._maybe_record_ttfb(state, response)
                             state.chunk_queue.put(chunk)
                             try:
                                 os.write(state.pipe_w, b"\x00")
@@ -549,25 +572,19 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                             break
                         if not chunk:
                             continue
-                        if state.ttfb is None:
-                            state.ttfb = time.time() - state.start_time
-                            transfer = response.headers.get("transfer-encoding", "none")
-                            self.logger.info(
-                                "backend=%d transfer=%s ttfb=%.1fs",
-                                response.status_code,
-                                transfer,
-                                state.ttfb,
-                            )
+                        self._maybe_record_ttfb(state, response)
                         state.chunk_queue.put(chunk)
                         try:
                             os.write(state.pipe_w, b"\x00")
                         except OSError:
                             return
 
+        except httpx.RemoteProtocolError as e:
+            self._record_transport_error(state, e, "remote_closed", "Remote closed stream")
+        except httpx.ConnectError as e:
+            self._record_transport_error(state, e, "connect_error", "Connect error")
         except httpx.TransportError as e:
-            self.logger.warning("Transport error — marking httpx client dirty: %s", e)
-            ProcessServices.get().mark_http_client_dirty()
-            state.error = e
+            self._record_transport_error(state, e, "transport_error", "Transport error")
         except Exception as e:
             self.logger.warning("Worker error: %s", e, exc_info=True)
             state.error = e

@@ -42,6 +42,7 @@ class TestDataStructures:
             assert state.error is None
             assert state.ttfb is None        # new
             assert state.bytes_sent == 0     # new
+            assert state.end_reason == ""
         finally:
             os.close(pipe_r)
             os.close(pipe_w)
@@ -570,7 +571,7 @@ class TestStreamingWorker:
     def test_worker_transport_error_sets_state_error_and_sentinel(
         self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
     ) -> None:
-        """On httpx.TransportError, worker stores error, marks client dirty, puts sentinel."""
+        """On httpx.TransportError, worker stores error, sets end_reason, puts sentinel; does NOT mark client dirty."""
         import os
         state = self._make_state()
         mock_svc.http_client.stream.side_effect = httpx.TransportError("conn failed")
@@ -579,8 +580,63 @@ class TestStreamingWorker:
             plugin._streaming_worker("GET", "https://example.com", {}, None, state)
 
         assert isinstance(state.error, httpx.TransportError)
+        assert state.end_reason == "transport_error"
         assert state.chunk_queue.get_nowait() is None  # sentinel
-        mock_svc.mark_http_client_dirty.assert_called_once()
+        mock_svc.mark_http_client_dirty.assert_not_called()
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)
+
+    def test_worker_remote_protocol_error_no_dirty(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """RemoteProtocolError sets end_reason='remote_closed' and does NOT mark client dirty."""
+        import os
+        state = self._make_state()
+        mock_svc.http_client.stream.side_effect = httpx.RemoteProtocolError("peer closed")
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("GET", "https://example.com", {}, None, state)
+
+        assert isinstance(state.error, httpx.RemoteProtocolError)
+        assert state.end_reason == "remote_closed"
+        assert state.chunk_queue.get_nowait() is None  # sentinel present
+        mock_svc.mark_http_client_dirty.assert_not_called()
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)
+
+    def test_worker_connect_error_no_dirty(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """ConnectError sets end_reason='connect_error' and does NOT mark client dirty."""
+        import os
+        state = self._make_state()
+        mock_svc.http_client.stream.side_effect = httpx.ConnectError("refused")
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("GET", "https://example.com", {}, None, state)
+
+        assert isinstance(state.error, httpx.ConnectError)
+        assert state.end_reason == "connect_error"
+        assert state.chunk_queue.get_nowait() is None
+        mock_svc.mark_http_client_dirty.assert_not_called()
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)
+
+    def test_worker_transport_error_no_dirty(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """Generic TransportError sets end_reason='transport_error' and does NOT mark client dirty."""
+        import os
+        state = self._make_state()
+        mock_svc.http_client.stream.side_effect = httpx.TransportError("conn failed")
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("GET", "https://example.com", {}, None, state)
+
+        assert isinstance(state.error, httpx.TransportError)
+        assert state.end_reason == "transport_error"
+        assert state.chunk_queue.get_nowait() is None
+        mock_svc.mark_http_client_dirty.assert_not_called()
         os.close(state.pipe_r)
         os.close(state.pipe_w)
 
@@ -1108,7 +1164,7 @@ class TestEventLoopHooks:
     def test_finish_stream_transport_error_emits_warning(
         self, plugin: FlowProxyWebServerPlugin
     ) -> None:
-        """_finish_stream emits WARNING with end=transport_error when state.error is TransportError.
+        """_finish_stream emits WARNING with end=remote_closed when state.end_reason='remote_closed'.
 
         state.headers_sent=False causes _send_error(503) to be called (client.queue mock absorbs it).
         """
@@ -1123,6 +1179,112 @@ class TestEventLoopHooks:
         state.status_code = 0
         state.headers_sent = False
         state.error = httpx.RemoteProtocolError("peer closed")
+        state.end_reason = "remote_closed"
+        plugin._streaming_state = state
+        plugin.client = MagicMock()
+        plugin.logger = MagicMock()
+
+        plugin._finish_stream(state)
+
+        warning_calls = plugin.logger.warning.call_args_list
+        completion = [c for c in warning_calls if c.args and str(c.args[0]).startswith("← ")]
+        assert len(completion) == 1
+        msg = completion[0].args[0] % completion[0].args[1:]
+        assert "end=remote_closed" in msg
+        assert "ttfb=-" in msg
+        # Old "Stream ended with error" line must NOT appear
+        old = [c for c in warning_calls if c.args and "Stream ended with error" in str(c.args[0])]
+        assert old == []
+        # _finish_stream closes both fds; re-closing must raise OSError
+        with pytest.raises(OSError):
+            os.close(pipe_r)
+        with pytest.raises(OSError):
+            os.close(pipe_w)
+
+    def test_finish_stream_end_reason_remote_closed(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_finish_stream logs end=remote_closed when state.end_reason='remote_closed'."""
+        import os
+        import time
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.start_time = time.time() - 10.0
+        state.stream = True
+        state.ttfb = 3.9
+        state.bytes_sent = 2657
+        state.status_code = 200
+        state.headers_sent = True
+        state.is_sse = False
+        state.error = httpx.RemoteProtocolError("peer closed")
+        state.end_reason = "remote_closed"
+        plugin._streaming_state = state
+        plugin.client = MagicMock()
+        plugin.logger = MagicMock()
+
+        plugin._finish_stream(state)
+
+        warning_calls = plugin.logger.warning.call_args_list
+        completion = [c for c in warning_calls if c.args and str(c.args[0]).startswith("← ")]
+        assert len(completion) == 1
+        msg = completion[0].args[0] % completion[0].args[1:]
+        assert "end=remote_closed" in msg
+        # _finish_stream closes both fds; re-closing must raise OSError
+        with pytest.raises(OSError):
+            os.close(pipe_r)
+        with pytest.raises(OSError):
+            os.close(pipe_w)
+
+    def test_finish_stream_end_reason_connect_error(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_finish_stream logs end=connect_error when state.end_reason='connect_error'."""
+        import os
+        import time
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.start_time = time.time() - 1.0
+        state.stream = True
+        state.ttfb = None
+        state.bytes_sent = 0
+        state.status_code = 0
+        state.headers_sent = False
+        state.is_sse = False
+        state.error = httpx.ConnectError("refused")
+        state.end_reason = "connect_error"
+        plugin._streaming_state = state
+        plugin.client = MagicMock()
+        plugin.logger = MagicMock()
+
+        plugin._finish_stream(state)
+
+        warning_calls = plugin.logger.warning.call_args_list
+        completion = [c for c in warning_calls if c.args and str(c.args[0]).startswith("← ")]
+        assert len(completion) == 1
+        msg = completion[0].args[0] % completion[0].args[1:]
+        assert "end=connect_error" in msg
+        with pytest.raises(OSError):
+            os.close(pipe_r)
+        with pytest.raises(OSError):
+            os.close(pipe_w)
+
+    def test_finish_stream_end_reason_transport_error(
+        self, plugin: FlowProxyWebServerPlugin
+    ) -> None:
+        """_finish_stream logs end=transport_error when state.end_reason='transport_error' (generic fallback)."""
+        import os
+        import time
+
+        state, pipe_r, pipe_w = self._make_state_with_pipe()
+        state.start_time = time.time() - 5.0
+        state.stream = True
+        state.ttfb = 1.2
+        state.bytes_sent = 1024
+        state.status_code = 200
+        state.headers_sent = True
+        state.is_sse = False
+        state.error = httpx.TransportError("unknown")
+        state.end_reason = "transport_error"
         plugin._streaming_state = state
         plugin.client = MagicMock()
         plugin.logger = MagicMock()
@@ -1134,11 +1296,6 @@ class TestEventLoopHooks:
         assert len(completion) == 1
         msg = completion[0].args[0] % completion[0].args[1:]
         assert "end=transport_error" in msg
-        assert "ttfb=-" in msg
-        # Old "Stream ended with error" line must NOT appear
-        old = [c for c in warning_calls if c.args and "Stream ended with error" in str(c.args[0])]
-        assert old == []
-        # _finish_stream closes both fds; re-closing must raise OSError
         with pytest.raises(OSError):
             os.close(pipe_r)
         with pytest.raises(OSError):
