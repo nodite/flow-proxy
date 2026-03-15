@@ -187,23 +187,24 @@ class UsageStats:
 ### 4.3 `record_stream_event()` Internals
 
 - Same lock and three-bucket update.
-- Auto-vivication for `by_config[config_name]`.
-- `"started"`: increments top-level `stream_requests` and `by_config[config_name].stream_requests`. Does not touch `by_model`.
-- `"response"`: increments `stream_responses`, `by_config[config_name].stream_responses`, `responses_by_status_class[status_class]`, adds to `ttfb_ms_sum`/`ttfb_ms_count` (only if `ttfb_ms` is not `None`), adds to `duration_ms_sum`/`duration_ms_count` (only if `duration_ms` is not `None`).
-- `"error"`: increments `stream_errors`, `by_config[config_name].stream_errors`, `errors_by_reason[error_reason]`, adds to `duration_ms_sum`/`duration_ms_count` (only if `duration_ms` is not `None`).
+- **`config_name=""` handling**: when `config_name` is empty (auth failure path — no config was selected), update only the top-level bucket counters (`stream_requests`, `stream_errors`, etc.). Skip `by_config` entirely. An empty-string key in `by_config` is meaningless and would pollute stats. Concretely: all `by_config[config_name].*` updates are wrapped with `if config_name:`.
+- Auto-vivication for `by_config[config_name]` (only when `config_name` is non-empty): if the sub-bucket does not exist, create it with all fields at zero before incrementing.
+- `"started"`: increments top-level `stream_requests`. If `config_name` is non-empty, also increments `by_config[config_name].stream_requests`. Does not touch `by_model`.
+- `"response"`: increments top-level `stream_responses`, `responses_by_status_class[status_class]`, adds to `ttfb_ms_sum`/`ttfb_ms_count` (only if `ttfb_ms` is not `None`), adds to `duration_ms_sum`/`duration_ms_count` (only if `duration_ms` is not `None`). If `config_name` is non-empty, also increments `by_config[config_name].stream_responses`.
+- `"error"`: increments top-level `stream_errors`, `errors_by_reason[error_reason]`, adds to `duration_ms_sum`/`duration_ms_count` (only if `duration_ms` is not `None`). If `config_name` is non-empty, also increments `by_config[config_name].stream_errors`.
 
 ### 4.4 `flush()` Internals
 
 1. Under `self._lock`, **atomic swap**: replace `self._pending` with a fresh empty dict. In-flight `record()` calls on other threads see the new empty dict immediately after the swap.
 2. If the swapped snapshot is empty, return early (no I/O).
-3. Create parent directory if absent.
-4. Acquire `fcntl.flock(fd, LOCK_EX)` on a dedicated lock file at `stats_file.with_suffix(".lock")` (open or create with `open(..., "a")`).
+3. Create parent directory if absent (`stats_file.parent.mkdir(parents=True, exist_ok=True)`).
+4. Open the dedicated lock file at `stats_file.with_suffix(".lock")` with `open(..., "a")` and hold it open for the entire flush operation. Acquire `fcntl.flock(fd, fcntl.LOCK_EX)`. The fd must remain open until step 9 — closing it before then releases the lock prematurely.
 5. Read existing `stats.json`. If absent or corrupt (invalid JSON), start from an empty structure: `{"version": 1, "all_time": {}, "daily": {}, "hourly": {}}`.
 6. Merge snapshot increments into the file's existing values bucket by bucket. For each numeric field: `existing_value + snapshot_value`. For nested dicts (`by_model`, `by_config`, `responses_by_status_class`, `errors_by_reason`): recurse.
 7. Trim `hourly` keys: remove any key where the parsed hour is older than `datetime.now() - timedelta(days=7)`.
 8. Update `last_flushed_at = datetime.now().isoformat(timespec="seconds")`.
-9. Atomic write: serialize to `stats_file.with_suffix(".tmp")`, then `os.replace(tmp, stats_file)`.
-10. Release lock (close the lock file fd).
+9. **Atomic write (still under the lock)**: serialize merged data to `stats_file.with_suffix(".tmp")`, then `os.replace(tmp_path, stats_file)`. Both the write and the `os.replace()` must complete **before** releasing the lock, so that a second process acquiring the lock after step 9 always sees a fully written file. Multiple processes using the same `.tmp` path is safe because the exclusive lock serializes all flushers.
+10. Release lock by closing the lock file fd.
 
 ### 4.5 `StatsFlushThread`
 
@@ -277,7 +278,7 @@ All tests use a temporary directory for `stats_file` (via `tmp_path` pytest fixt
 | `test_flush_multiprocess_safe` | Two threads call `flush()` concurrently on the same file; assert no data corruption or lost increments (total = sum of all calls). |
 | `test_hourly_trimmed_to_7_days` | Create `UsageStats` instance and call `record_stream_event` with 200 distinct hours injected into `_pending`; after `flush()`, only last 168 hourly keys remain. |
 | `test_flush_interval_clamped` | `flush_interval=5` (below minimum); assert clamped to 10. `flush_interval=9999`; assert clamped to 3600. |
-| `test_flush_thread_fires_on_interval` | `StatsFlushThread` with `flush_interval=1`; call `record_stream_event("started")`; assert `stats.json` written within ~2 s. |
+| `test_flush_thread_fires_on_interval` | **`@pytest.mark.slow`** — `StatsFlushThread` with `flush_interval=1`; call `record_stream_event("started")`; sleep 2 s; assert `stats.json` written. Mark `@pytest.mark.slow` so it can be excluded from fast CI runs. Do not use this test to verify flush logic correctness — use `test_flush_creates_stats_file` and `test_flush_merges_increments` (which call `flush()` directly) for that. |
 | `test_record_stream_event_started` | `record_stream_event(event="started", config_name="c1", ts=...)`; assert `all_time.stream_requests==1`, `by_config["c1"].stream_requests==1`, no `stream_errors`. |
 | `test_record_stream_event_response` | `record_stream_event(event="response", status_code=200, ttfb_ms=123.0, duration_ms=4000.0)`; assert `stream_responses==1`, `responses_by_status_class["2xx"]==1`, `ttfb_ms_sum==123.0`, `ttfb_ms_count==1`, `duration_ms_sum==4000.0`. |
 | `test_record_stream_event_response_no_ttfb` | `ttfb_ms=None`; assert `ttfb_ms_count==0`, `ttfb_ms_sum==0.0`. |
@@ -286,6 +287,7 @@ All tests use a temporary directory for `stats_file` (via `tmp_path` pytest fixt
 | `test_record_stream_event_5xx_status_class` | `status_code=503`; assert `responses_by_status_class["5xx"]==1`. |
 | `test_by_model_no_stream_requests` | `record(model="m", ...)` then `flush()`; assert `by_model["m"]` in `stats.json` has no `stream_requests` key. |
 | `test_by_config_all_fields` | Mix of `record_stream_event` and `record` for same `config_name`; assert `by_config` has `stream_requests`, `stream_responses`, `stream_errors`, and token fields all correctly summed. |
+| `test_record_stream_event_empty_config_name_skips_by_config` | `record_stream_event(event="error", config_name="", error_reason="auth_error", ...)`; assert `stream_errors==1` in `all_time` top-level, but `all_time.by_config` does not contain the `""` key. |
 
 ---
 

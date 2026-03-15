@@ -24,12 +24,12 @@ This spec covers all **wiring and test updates** needed to make the usage stats 
 
 ### 2.1 New Imports
 
-Add at the top of `process_services.py`:
+Add at the top of `process_services.py` (note: `process_services.py` lives inside `flow_proxy_plugin/utils/`, so same-package imports use `.`):
 
 ```python
 from pathlib import Path
-from ..utils.pricing_cache import PricingCache
-from ..utils.usage_stats import UsageStats
+from .pricing_cache import PricingCache
+from .usage_stats import UsageStats
 ```
 
 ### 2.2 New Attributes in `_initialize()`
@@ -70,7 +70,7 @@ The `hasattr` guards are required because `_initialize()` may not have run if `r
 
 ### 3.1 New Imports
 
-Add to the imports in `web_server_plugin.py`:
+Add to the imports in `web_server_plugin.py` (note: `import time` already exists at the top of the file — do not add it again):
 
 ```python
 from datetime import datetime
@@ -85,19 +85,34 @@ In `flow_proxy_plugin/utils/usage_parser.py` → `UsageParser.run()` (implemente
 
 ### 3.3 `handle_request()` Changes
 
-Three additions to `handle_request()`:
+Four additions to `handle_request()`:
 
-**1. Initialize `config_name` and `start_time` before auth block:**
+**1. Pre-initialize `config_name` before the auth `try` block:**
 
-The existing code assigns `config_name` via destructuring in the auth `try` block. Add a pre-initialization before the `try` block so `config_name` is always in scope for error paths (where `_get_config_and_token()` raises before binding `config_name`):
+The existing code structure (after Part 1 changes) around the auth block is:
 
 ```python
-# Before the try: _, config_name, jwt_token = self._get_config_and_token() block:
-config_name = ""
-# start_time already exists at this point (set earlier in handle_request)
+req_id = secrets.token_hex(3)
+set_request_context(req_id, "WS")
+start_time = time.monotonic()       # changed from time.time() in Part 1
+stream = self._parse_stream_field(request)
+self.logger.info("→ %s %s stream=%s", method, path, stream)
+
+# INSERT HERE: config_name = ""
+
+try:
+    _, config_name, jwt_token = self._get_config_and_token()
+except Exception as e:
+    self.logger.error("Auth failed: %s", e)
+    self._send_error(503, "Auth error")
+    # ADD record_stream_event call here (see item 2 below)
+    clear_request_context()
+    return
 ```
 
-Note: `start_time` is already initialized at the top of `handle_request()` as `time.monotonic()` (changed from `time.time()` in Part 1). No second assignment needed.
+Add `config_name = ""` immediately before the `try:` block (between the `self.logger.info(...)` line and the `try:` line). This ensures `config_name` is always bound when the auth failure error path calls `record_stream_event(config_name=config_name, ...)`.
+
+`start_time` is already initialized at this point via `time.monotonic()` (Part 1). No second assignment needed.
 
 **2. Auth failure path** — after `self._send_error(503, "Auth error")` and before `clear_request_context()`:
 
@@ -148,48 +163,62 @@ ProcessServices.get().usage_stats.record_stream_event(
 # metrics hook (Phase 2): on_stream_finished(req_id, config_name, status_code, error)
 ```
 
-Insert the `record_stream_event()` calls **before** `clear_request_context()` at line 222 (not in place of the stub at line 223, which sits after `clear_request_context()`). The complete updated `_finish_stream()` tail (after the log lines, inserting before the existing `clear_request_context()` at line 222):
+Insert the `record_stream_event()` calls **before** `clear_request_context()` at line 222 (not in place of the stub at line 223, which sits after `clear_request_context()`).
+
+The current `_finish_stream()` tail has this structure (simplified):
 
 ```python
-# In the state.error branch (transport_error):
-if isinstance(state.error, httpx.TransportError):
-    error_reason = "transport_error"
+if state.error:
+    # ... log error ...
+    if isinstance(state.error, httpx.TransportError):
+        ...
 else:
-    error_reason = "worker_error"
-# ... existing log ...
-ProcessServices.get().usage_stats.record_stream_event(
-    config_name=state.config_name,
-    event="error",
-    status_code=None,
-    error_reason=error_reason,
-    ttfb_ms=None,
-    duration_ms=(time.monotonic() - state.start_time) * 1000,
-    ts=datetime.now(),
-)
-clear_request_context()
+    # ... log success ...
+clear_request_context()   # line 222 — single call shared by both branches
+# metrics hook (Phase 2): ...  # line 223 — remove this stub
 ```
 
+**The new code inserts `record_stream_event()` inside each branch, before the shared `clear_request_context()` at line 222. There must be exactly one `clear_request_context()` call — do not duplicate it.**
+
+Updated tail (replace the `if state.error / else` block and the single `clear_request_context()` that follows):
+
 ```python
-# In the no-error branch (state.error is None):
-# ... existing log ...
-if state.status_code != 0:
+if state.error:
+    if isinstance(state.error, httpx.TransportError):
+        error_reason = "transport_error"
+    else:
+        error_reason = "worker_error"
+    # ... existing error log lines (unchanged) ...
     ProcessServices.get().usage_stats.record_stream_event(
         config_name=state.config_name,
-        event="response",
-        status_code=state.status_code,
-        error_reason=None,
-        ttfb_ms=state.ttfb * 1000 if state.ttfb is not None else None,
+        event="error",
+        status_code=None,
+        error_reason=error_reason,
+        ttfb_ms=None,
         duration_ms=(time.monotonic() - state.start_time) * 1000,
         ts=datetime.now(),
     )
-clear_request_context()
+else:
+    # ... existing success log lines (unchanged) ...
+    if state.status_code != 0:
+        ProcessServices.get().usage_stats.record_stream_event(
+            config_name=state.config_name,
+            event="response",
+            status_code=state.status_code,
+            error_reason=None,
+            ttfb_ms=state.ttfb * 1000 if state.ttfb is not None else None,
+            duration_ms=(time.monotonic() - state.start_time) * 1000,
+            ts=datetime.now(),
+        )
+clear_request_context()   # exactly one call — always runs regardless of branch
+# remove the "metrics hook (Phase 2)" stub comment that was here
 ```
 
 **`state.status_code != 0` guard**: When the OSError early-return in `_streaming_worker()` fires before the `_ResponseHeaders` pipe-notification is written, `state.status_code` remains `0` (headers never delivered to the main thread). The guard prevents a spurious `"response"` event.
 
 **`state.ttfb` units**: `state.ttfb` is stored in seconds (set as `time.monotonic() - state.start_time`). Convert to milliseconds for `record_stream_event()`.
 
-**`clear_request_context()` placement**: always called regardless of whether `record_stream_event()` fires. The `if state.status_code != 0:` guard must not skip `clear_request_context()`.
+**`clear_request_context()` placement**: always called regardless of which branch ran or whether `record_stream_event()` fired. The `if state.status_code != 0:` guard must not skip `clear_request_context()`.
 
 ### 3.5 `_reset_request_state()` Changes
 
@@ -288,6 +317,36 @@ Run `grep -n "StreamingState(" tests/test_web_server_plugin.py` before implement
 | `test_streaming_state_defaults` | Add assertions: `state.usage_queue` is a `queue.Queue`, `state.request_model == ""`, `state.usage_parser_thread is None`. |
 | `test_streaming_state_new_fields` | Rename `test_streaming_state_new_fields` → keep as-is; its `start_time=t` assertion is unchanged (clock is now monotonic but test uses an explicit float). |
 
+### 4.2.5 Patch `UsageParser` in Existing `read_from_descriptors` Tests
+
+As described in Part 1 §5.3, after the `read_from_descriptors()` change, any test that manually pre-fills `state.chunk_queue` with a `_ResponseHeaders` item and calls `read_from_descriptors()` will incidentally start a `UsageParser` thread that blocks indefinitely on `state.usage_queue.get()`. This causes join timeouts in `_reset_request_state()` (wasting 2 s per test).
+
+The following existing tests must be updated to patch `UsageParser`:
+
+```
+TestEventLoopHooks — MUST be patched (enqueue _ResponseHeaders):
+  - test_read_from_descriptors_queues_each_chunk
+  - test_read_from_descriptors_sends_headers_on_first_item
+  - test_read_from_descriptors_tracks_bytes_sent
+  - test_read_from_descriptors_returns_true_on_sentinel
+  - test_get_descriptors_empty_after_stream_finishes
+
+TestEventLoopHooks — safe, no patch needed (do NOT enqueue _ResponseHeaders):
+  - test_read_from_descriptors_noop_when_pipe_not_in_readables  (only None sentinel)
+  - test_worker_error_before_headers_sends_503  (only None sentinel)
+  - test_worker_error_after_headers_does_not_send_error_response  (only None sentinel — no _ResponseHeaders enqueued)
+```
+
+Run `grep -n "_ResponseHeaders" tests/test_web_server_plugin.py` to find all test methods that enqueue a `_ResponseHeaders` item into `chunk_queue`. Each such test needs the following patch added around the `read_from_descriptors()` call:
+
+```python
+with patch("flow_proxy_plugin.plugins.web_server_plugin.UsageParser") as mock_parser_cls:
+    mock_parser_cls.return_value.run = MagicMock()  # no-op: does not block on usage_queue
+    result = asyncio.run(plugin.read_from_descriptors([pipe_r]))
+```
+
+Tests that do **not** enqueue a `_ResponseHeaders` item (e.g. tests that only put `None` sentinel or raw bytes) do not need patching — the `UsageParser` launch only happens when `isinstance(item, _ResponseHeaders)` is `True`.
+
 ### 4.3 New Tests
 
 Add these tests to `tests/test_web_server_plugin.py`:
@@ -329,7 +388,7 @@ Before marking this spec complete, confirm:
 
 1. `grep -rn "StreamingState(" flow_proxy_plugin/ tests/` shows exactly **5** sites (1 production in `flow_proxy_plugin/plugins/web_server_plugin.py` + 4 test sites in `tests/test_web_server_plugin.py`), all with `usage_queue=`.
 2. `grep -n "time.time()" flow_proxy_plugin/plugins/web_server_plugin.py` returns no hits (all replaced with `time.monotonic()`).
-3. `grep -n "hasattr.*pricing_cache\|hasattr.*usage_stats" flow_proxy_plugin/` returns no hits (guards removed).
+3. `grep -rn "hasattr.*pricing_cache\|hasattr.*usage_stats" flow_proxy_plugin/` returns no hits (guards removed).
 4. `grep -n "metrics hook (Phase 2)" flow_proxy_plugin/` returns no hits (stub replaced).
 5. `make test` passes with no failures.
 6. `make lint` passes.

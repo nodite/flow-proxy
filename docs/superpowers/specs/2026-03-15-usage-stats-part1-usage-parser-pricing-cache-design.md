@@ -74,7 +74,7 @@ This spec covers the **data extraction and pricing layer** of the usage statisti
 
 `UsageParser.run()` receives `is_sse: bool` extracted from the `_ResponseHeaders.is_sse` field when the thread is launched in `read_from_descriptors()`.
 
-- **SSE mode (`is_sse=True`)**: Each `bytes` item in `usage_queue` is one complete SSE line (e.g. `b"data: {...}\n"` or `b"\n"`). No cross-chunk buffering needed. `UsageParser` checks for `data: ` prefix and attempts JSON parse.
+- **SSE mode (`is_sse=True`)**: Each `bytes` item in `usage_queue` is one complete SSE line produced by `_encode_sse_line()`, e.g. `b"data: {...}\n"` (with trailing `\n`) or `b"\n"` (blank separator). No cross-chunk buffering needed. `UsageParser` checks for a `data: ` prefix; after stripping the prefix it must also strip the trailing `\n` before attempting JSON parse: `line.removeprefix(b"data: ").rstrip(b"\n")`.
   - This no-buffering guarantee holds because the SSE path in `_streaming_worker` uses `response.iter_lines()`. If that path changes to `iter_bytes()`, line-buffer mode must be used regardless of `is_sse`.
 - **Non-SSE mode (`is_sse=False`)**: Worker feeds raw binary chunks of arbitrary size. `UsageParser` maintains an internal line buffer, appending each chunk and splitting on `b"\n"`.
 
@@ -241,9 +241,9 @@ Fields with `None` values are omitted (e.g. `cost_usd` omitted when pricing unav
 
 ### 4.2 New `StreamingState` fields
 
-Three new fields added to the existing `StreamingState` dataclass. The `start_time` field already exists as a required field (no change to its position). The new `usage_queue` required field is inserted **before the first existing defaulted field** (`headers_sent`).
+Three new fields added to the existing `StreamingState` dataclass. The `start_time` field already exists as a required field (no change to its position). The new `usage_queue` required field is inserted **before the first existing defaulted field** (`headers_sent`). The two new optional fields are appended at the end.
 
-Updated field order:
+**Dataclass definition field order** (the actual Python dataclass source must follow this exact order to satisfy Python's rule that required fields cannot follow fields with defaults):
 
 ```python
 @dataclass
@@ -258,7 +258,7 @@ class StreamingState:
     config_name: str
     start_time: float          # clock changed to time.monotonic() (§4.1)
     stream: bool | None
-    # --- NEW required field (inserted before first defaulted field) ---
+    # --- NEW required field (must appear before any defaulted field) ---
     usage_queue: "queue.Queue[bytes | None]"
     # --- existing defaulted fields (unchanged) ---
     headers_sent: bool = False
@@ -267,10 +267,12 @@ class StreamingState:
     error: BaseException | None = None
     ttfb: float | None = None
     bytes_sent: int = 0
-    # --- NEW optional fields (appended) ---
+    # --- NEW optional fields (appended after all existing defaulted fields) ---
     request_model: str = ""
     usage_parser_thread: "threading.Thread | None" = None
 ```
+
+**Construction sites**: all callers pass arguments as keyword arguments, so argument order in call sites does not need to match the dataclass field order. The only requirement is that `usage_queue=` is now a required keyword argument. See Part 3 §4.1 for all construction sites.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -286,7 +288,23 @@ class StreamingState:
 
 ### 5.1 `handle_request()` changes
 
-1. **Extract `request_model`** from the existing `body` variable (assigned at the `_get_request_body()` call, after the FILTER block). Do not call `_get_request_body()` again. `body` is `bytes | None`; use a `try/except` around the JSON parse:
+**Execution order in `handle_request()` (for orientation):**
+```
+1. req_id / start_time / stream parsing
+2. config_name = ""  ← Part 3 addition
+3. try: _, config_name, jwt_token = _get_config_and_token()  ← auth (may fail)
+4. body = self._get_request_body(request, filter_rule)  ← AFTER auth
+5. request_model extracted from body  ← steps below (AFTER body exists)
+6. usage_queue = queue.Queue()
+7. StreamingState(..., usage_queue=..., request_model=...)
+8. state.thread.start()
+```
+
+Steps 5–8 all take place after auth succeeds. `body` is only available at step 4 and later.
+
+**Changes for Part 1** (steps 5–7, inserting after the existing `body = self._get_request_body(...)` line):
+
+1. **Extract `request_model`** from the existing `body` variable. Do not call `_get_request_body()` again. `body` is `bytes | None`; use a `try/except` around the JSON parse:
    ```python
    request_model = ""
    if body:
@@ -339,6 +357,8 @@ except OSError:
 
 The `_ResponseHeaders` item put into `chunk_queue` at the top of the worker is **not** put into `usage_queue`.
 
+**Empty chunk filtering (non-SSE path):** The non-SSE loop already has `if not chunk: continue` which skips empty chunks before `chunk_queue.put(chunk)`. Because `usage_queue.put(chunk)` is placed immediately after `chunk_queue.put(chunk)`, empty chunks are never put into `usage_queue` either — the `continue` prevents reaching both puts. No additional guard needed.
+
 ### 5.3 `read_from_descriptors()` changes
 
 When the `_ResponseHeaders` item is first dequeued (the `isinstance(item, _ResponseHeaders)` branch), launch the `UsageParser` daemon thread after all header processing completes (i.e., after `state.headers_sent = True`):
@@ -365,7 +385,25 @@ if isinstance(item, _ResponseHeaders):
 
 The `if state.usage_parser_thread is None:` guard is a safety measure — `_ResponseHeaders` is enqueued exactly once, so the guard will never fire twice in practice. The thread is launched **after** `state.headers_sent = True` so that all header state is consistent.
 
-**Import placement**: The `from ..utils.usage_parser import UsageParser` import can be placed at the module level in `web_server_plugin.py` if it does not cause circular imports. Confirm: `usage_parser.py` → `process_services.py` (runtime, inside `run()`) — no module-level circular dependency. It is safe to import at the top of `web_server_plugin.py`.
+**Import placement**: The `from ..utils.usage_parser import UsageParser` import can be placed at the module level in `web_server_plugin.py`. Full import chain audit:
+
+- `web_server_plugin.py` → `usage_parser.py` (module level) — new
+- `usage_parser.py` → `process_services.py` (inside `run()` method body, not at module level) — no module-level cycle
+- `process_services.py` → `.pricing_cache`, `.usage_stats` (Part 3 additions) — both are new modules with no back-imports to `web_server_plugin.py` or `usage_parser.py`
+- `usage_parser.py` must **not** be imported by `process_services.py` at module level (that would create a cycle: `web_server_plugin` → `usage_parser` → `process_services` → `usage_parser`)
+
+Conclusion: module-level import of `UsageParser` in `web_server_plugin.py` is safe.
+
+**Impact on existing `TestEventLoopHooks` tests**: Several existing tests (`test_read_from_descriptors_queues_each_chunk`, `test_read_from_descriptors_sends_headers_on_first_item`, `test_read_from_descriptors_tracks_bytes_sent`, `test_read_from_descriptors_returns_true_on_sentinel`, etc.) pre-fill `state.chunk_queue` with a `_ResponseHeaders` item and then call `read_from_descriptors()`. After this change, that code path will attempt to start a `UsageParser` thread. The `UsageParser` thread will immediately block on `state.usage_queue.get()` indefinitely (because no worker is running to fill the queue), and `_reset_request_state()` will waste 2 seconds joining it on timeout.
+
+All such tests must be updated in Part 3 (§4.3) to prevent this. The fix for each test is to patch `UsageParser` so that the thread does not block:
+```python
+from unittest.mock import patch, MagicMock
+with patch("flow_proxy_plugin.plugins.web_server_plugin.UsageParser") as mock_parser_cls:
+    mock_parser_cls.return_value.run = MagicMock()   # no-op run()
+    asyncio.run(plugin.read_from_descriptors([pipe_r]))
+```
+See Part 3 §4.3 for the complete list of tests that require this patch.
 
 ### 5.4 `_reset_request_state()` changes (Part 1 portion)
 
