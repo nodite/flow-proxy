@@ -483,13 +483,6 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 follow_redirects=True,
             ) as response:
                 is_sse = "text/event-stream" in response.headers.get("content-type", "")
-                self.logger.info(
-                    "Backend response: %d %s, Transfer-Encoding: %s, Content-Length: %s",
-                    response.status_code,
-                    response.reason_phrase,
-                    response.headers.get("transfer-encoding", "none"),
-                    response.headers.get("content-length", "none"),
-                )
                 state.chunk_queue.put(
                     _ResponseHeaders(
                         status_code=response.status_code,
@@ -503,19 +496,21 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                 except OSError:
                     return  # client already disconnected
 
-                first_logged = False
                 if is_sse:
                     for line in response.iter_lines():
                         if state.cancel.is_set():
                             break
                         chunk = self._encode_sse_line(line)
                         if chunk:
-                            if not first_logged:
+                            if state.ttfb is None:
+                                state.ttfb = time.time() - state.start_time
+                                transfer = response.headers.get("transfer-encoding", "none")
                                 self.logger.info(
-                                    "Received first SSE line from backend: %d chars",
-                                    len(line),
+                                    "backend=%d transfer=%s ttfb=%.1fs",
+                                    response.status_code,
+                                    transfer,
+                                    state.ttfb,
                                 )
-                                first_logged = True
                             state.chunk_queue.put(chunk)
                             try:
                                 os.write(state.pipe_w, b"\x00")
@@ -527,12 +522,15 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                             break
                         if not chunk:
                             continue
-                        if not first_logged:
+                        if state.ttfb is None:
+                            state.ttfb = time.time() - state.start_time
+                            transfer = response.headers.get("transfer-encoding", "none")
                             self.logger.info(
-                                "Received first chunk from backend: %d bytes",
-                                len(chunk),
+                                "backend=%d transfer=%s ttfb=%.1fs",
+                                response.status_code,
+                                transfer,
+                                state.ttfb,
                             )
-                            first_logged = True
                         state.chunk_queue.put(chunk)
                         try:
                             os.write(state.pipe_w, b"\x00")
@@ -540,11 +538,11 @@ class FlowProxyWebServerPlugin(HttpWebServerBasePlugin, BaseFlowProxyPlugin):
                             return
 
         except httpx.TransportError as e:
-            self.logger.error("Transport error — marking httpx client dirty: %s", e)
+            self.logger.warning("Transport error — marking httpx client dirty: %s", e)
             ProcessServices.get().mark_http_client_dirty()
             state.error = e
         except Exception as e:
-            self.logger.error("Worker error: %s", e, exc_info=True)
+            self.logger.warning("Worker error: %s", e, exc_info=True)
             state.error = e
         finally:
             state.chunk_queue.put(None)

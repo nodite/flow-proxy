@@ -549,6 +549,68 @@ class TestStreamingWorker:
         os.close(state.pipe_r)
         os.close(state.pipe_w)
 
+    def test_worker_logs_backend_line_with_ttfb(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """Worker emits 'backend=200 transfer=chunked ttfb=Xs' on first chunk."""
+        import os
+        import time
+        state = self._make_state()
+        state.start_time = time.time() - 0.5  # simulate 500ms before first chunk
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.reason_phrase = "OK"
+        mock_response.headers = httpx.Headers({"transfer-encoding": "chunked"})
+        mock_response.iter_bytes.return_value = iter([b"hello"])
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_svc.http_client.stream.return_value = mock_response
+        plugin.logger = MagicMock()
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("POST", "https://example.com", {}, None, state)
+
+        # Find the backend= info call
+        info_calls = plugin.logger.info.call_args_list
+        backend_calls = [c for c in info_calls if c.args and str(c.args[0]).startswith("backend=")]
+        assert len(backend_calls) == 1
+        backend_str = backend_calls[0].args[0] % backend_calls[0].args[1:]
+        assert "backend=200" in backend_str
+        assert "transfer=chunked" in backend_str
+        assert "ttfb=" in backend_str
+        # Old lines must NOT appear
+        old_calls = [c for c in info_calls if c.args and "Backend response:" in str(c.args[0])]
+        assert old_calls == []
+        old_first = [c for c in info_calls if c.args and "Received first" in str(c.args[0])]
+        assert old_first == []
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)
+
+    def test_worker_sets_state_ttfb(
+        self, plugin: FlowProxyWebServerPlugin, mock_svc: MagicMock
+    ) -> None:
+        """Worker sets state.ttfb after receiving the first chunk."""
+        import os
+        import time
+        state = self._make_state()
+        state.start_time = time.time()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.reason_phrase = "OK"
+        mock_response.headers = httpx.Headers({})
+        mock_response.iter_bytes.return_value = iter([b"data"])
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_svc.http_client.stream.return_value = mock_response
+
+        with patch.object(ProcessServices, "get", return_value=mock_svc):
+            plugin._streaming_worker("GET", "https://example.com", {}, None, state)
+
+        assert state.ttfb is not None
+        assert state.ttfb >= 0.0
+        os.close(state.pipe_r)
+        os.close(state.pipe_w)
+
 
 class TestEventLoopHooks:
     """Tests for get_descriptors, read_from_descriptors, _finish_stream, _reset_request_state."""
